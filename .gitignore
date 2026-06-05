@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project-specific (runtime repo — no models/training data)
+*.pt
+*.onnx
+*.engine
+datasets/
+runs/
+log/

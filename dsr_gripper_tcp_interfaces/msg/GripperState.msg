@@ -1,0 +1,16 @@
+builtin_interfaces/Time stamp
+bool ready
+bool torque_enabled
+bool moving
+bool in_position
+bool grasp_detected
+bool object_lost
+int32 status
+int32 moving_status
+int32 present_position
+int32 goal_position
+int32 present_current
+int32 current_limit
+int32 present_velocity
+int32 present_temperature
+string status_text

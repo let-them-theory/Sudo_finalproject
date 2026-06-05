@@ -1,0 +1,5 @@
+bool force_read
+---
+bool success
+string message
+dsr_gripper_tcp_interfaces/GripperState state

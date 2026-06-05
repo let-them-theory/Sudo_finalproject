@@ -1,0 +1,6 @@
+bool enabled
+---
+bool success
+string message
+bool torque_enabled
+dsr_gripper_tcp_interfaces/GripperState state

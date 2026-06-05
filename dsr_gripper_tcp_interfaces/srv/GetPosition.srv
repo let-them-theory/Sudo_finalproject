@@ -1,0 +1,13 @@
+bool force_read
+---
+bool success
+string message
+int32 present_position
+int32 goal_position
+int32 present_current
+int32 present_velocity
+bool moving
+bool in_position
+bool torque_enabled
+bool grasp_detected
+bool object_lost

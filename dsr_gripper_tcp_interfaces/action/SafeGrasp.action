@@ -1,0 +1,19 @@
+int32 target_position
+int32 max_current
+int32 current_delta_threshold
+float32 timeout_sec
+---
+bool success
+string message
+int32 final_position
+int32 final_current
+bool grasp_detected
+bool object_lost
+dsr_gripper_tcp_interfaces/GripperState state
+---
+int32 present_position
+int32 present_current
+int32 current_delta
+bool grasp_detected
+bool object_lost
+dsr_gripper_tcp_interfaces/GripperState state

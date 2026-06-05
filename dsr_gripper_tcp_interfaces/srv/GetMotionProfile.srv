@@ -1,0 +1,6 @@
+---
+bool success
+string message
+int32 goal_current
+int32 profile_velocity
+int32 profile_acceleration

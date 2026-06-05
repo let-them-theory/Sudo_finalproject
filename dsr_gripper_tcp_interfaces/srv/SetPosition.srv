@@ -1,0 +1,12 @@
+int32 position
+float32 timeout_sec
+---
+bool success
+string message
+int32 present_position
+int32 goal_position
+int32 present_current
+bool in_position
+bool grasp_detected
+bool object_lost
+dsr_gripper_tcp_interfaces/GripperState state
