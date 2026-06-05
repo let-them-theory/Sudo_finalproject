@@ -15,7 +15,8 @@ object_detector:
 
     # --- YOLO 설정 ---
     use_yolo: true
-    yolo_model: "/home/pyw/kairos_ws/goods_yolo.pt"
+    # ⚠️ 본인 학습 모델(.pt)의 절대경로로 수정할 것. 모델 파일은 repo에 없음(SETUP.md 참고).
+    yolo_model: "/ABSOLUTE/PATH/TO/your_model.pt"
     confidence_threshold: 0.5
 
 

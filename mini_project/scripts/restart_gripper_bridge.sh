@@ -4,15 +4,22 @@
 # in-process reinitialize가 안 풀릴 때, fresh 프로세스 기동은 DrlStart가 즉시 수락돼 복구된다.
 #
 # 사용: restart_gripper_bridge.sh [로봇IP]   (기본 IP 110.120.1.50)
+#   ※ 보통 GUI(이미 워크스페이스 sourced)에서 호출된다. 단독 실행 시에는 먼저
+#     `source <ws>/install/setup.bash` 한 뒤 실행할 것.
 # 주의: set -u는 쓰지 않는다 — ROS setup.bash가 unbound 변수를 참조해 스크립트가 즉시 죽는다.
 set -o pipefail
 
 HOST="${1:-110.120.1.50}"
-PF=/home/pyw/kairos_ws/install/dsr_realsense_pick_place/share/dsr_realsense_pick_place/config/pick_place_params.yaml
 
-# ROS 환경 — GUI가 호출하면 보통 이미 sourced지만 단독 실행 대비 보강.
+# ROS base 환경 보강(워크스페이스 setup은 호출자/사용자가 이미 source한 상태를 가정).
 source /opt/ros/humble/setup.bash 2>/dev/null || true
-source /home/pyw/kairos_ws/install/setup.bash 2>/dev/null || true
+
+# 설치 경로를 하드코딩하지 않고 동적으로 산출한다(워크스페이스 setup.bash가 sourced돼 있어야 함).
+PKG_PREFIX="$(ros2 pkg prefix dsr_realsense_pick_place 2>/dev/null)"
+PF="${PKG_PREFIX}/share/dsr_realsense_pick_place/config/pick_place_params.yaml"
+if [ -z "$PKG_PREFIX" ] || [ ! -f "$PF" ]; then
+  echo "[gripper-restart] ⚠️ params yaml을 못 찾음(PF=$PF). 워크스페이스 setup.bash를 먼저 source했는지 확인." >&2
+fi
 
 echo "[gripper-restart] 기존 그리퍼 브릿지 노드 종료 (PID 기반, pkill -f 자기매칭 회피)..."
 # install lib 경로로 정밀 매칭 — 스크립트 자기 명령줄(restart_gripper_bridge.sh)과 안 겹침.
