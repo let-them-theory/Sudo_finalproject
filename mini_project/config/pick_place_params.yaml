@@ -15,7 +15,9 @@ object_detector:
 
     # --- YOLO 설정 ---
     use_yolo: true
-    yolo_model: "/home/pyw/kairos_ws/goods_yolo.pt"
+    # 런치 실행 시 launch가 패키지 내장 models/proto.pt 절대경로로 override한다(이 값보다 우선).
+    # 아래는 단독 ros2 run 시의 기본값 — 패키지 models/ 안의 학습 모델 파일명.
+    yolo_model: "proto.pt"
     confidence_threshold: 0.5
 
 
