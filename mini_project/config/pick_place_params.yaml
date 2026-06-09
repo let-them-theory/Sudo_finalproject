@@ -182,6 +182,16 @@ pick_place_node:
     gripper_close_len: 0.145        # 그리퍼 close 시 flange→손끝 길이(m). min_safe_z(손끝 최저)를 flange 좌표로 환산용. calibration과 무관.
     reach_radius_max: 0.65          # movel 하드 차단 평면반경(m). pick_place_gui와 동일 유지. 범위밖은 movel 미전송.
 
+    # --- 초음파 파지 (HC-SR04) ---
+    # use_ultrasonic_grasp: true 면 PICK 하강 시 초음파 거리 기반으로 파지점 결정.
+    # false 면 카메라 Z 좌표로 바로 하강 (기본값).
+    use_ultrasonic_grasp: false
+    grasp_distance_m: 0.07          # 70mm 이하 감지 시 파지
+    ultrasonic_step_m: 0.01         # 1회 하강 스텝(m)
+    ultrasonic_settle_sec: 0.15     # 스텝 후 센서 갱신 대기(s)
+    ultrasonic_range_topic: "/ultrasonic_range"
+    ultrasonic_max_age_sec: 0.5     # 이보다 오래된 거리값은 무효 처리
+
     # --- Pick 파라미터 ---
     pre_pick_z_offset: 0.14         # Pick 위 대기 높이 오프셋 (m)
     pick_z_offset: 0.015            # 실제 픽 높이 보정 (m)

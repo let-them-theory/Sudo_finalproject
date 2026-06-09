@@ -51,6 +51,12 @@ ARGUMENTS = [
                           description='Fallback: launch에서 set_robot_mode service call 실행 여부'),
     DeclareLaunchArgument('gripper_tcp_port', default_value='20002',
                           description='컨트롤러 DRL 그리퍼 TCP 서버 포트'),
+    DeclareLaunchArgument('use_ultrasonic', default_value='true',
+                          description='아두이노 HC-SR04 초음파 거리 노드 실행 여부'),
+    DeclareLaunchArgument('ultrasonic_port', default_value='/dev/ttyACM0',
+                          description='아두이노 시리얼 포트'),
+    DeclareLaunchArgument('ultrasonic_baudrate', default_value='9600',
+                          description='아두이노 시리얼 baudrate'),
 ]
 
 
@@ -204,6 +210,18 @@ def generate_launch_description():
         ]
     )
 
+    ultrasonic = Node(
+        package='dsr_realsense_pick_place',
+        executable='ultrasonic_node',
+        name='ultrasonic_node',
+        output='screen',
+        parameters=[{
+            'port': LaunchConfiguration('ultrasonic_port'),
+            'baudrate': LaunchConfiguration('ultrasonic_baudrate'),
+        }],
+        condition=IfCondition(LaunchConfiguration('use_ultrasonic')),
+    )
+
     return LaunchDescription(ARGUMENTS + [
         doosan_bringup,
         set_robot_mode,
@@ -211,6 +229,7 @@ def generate_launch_description():
         static_tf,
         object_detector,
         gui_node,
+        ultrasonic,
         gripper,
         pick_place,
     ])

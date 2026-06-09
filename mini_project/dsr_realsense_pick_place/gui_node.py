@@ -88,7 +88,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtGui import QPalette, QFont
 from PyQt5.QtCore import QLibraryInfo
 from rclpy.node import Node
-from sensor_msgs.msg import Image, JointState
+from sensor_msgs.msg import Image, JointState, Range
 
 from rcl_interfaces.msg import Parameter as RclParameter, ParameterType, ParameterValue
 from rcl_interfaces.srv import GetParameters, SetParameters
@@ -324,6 +324,9 @@ class PickPlaceGuiNode(Node):
             self.create_subscription(String, '/detected_objects', self._cb_objects, 10)
         self.create_subscription(String, '/pick_place_state', self._cb_state, 10)
         self.create_subscription(String, '/pick_place_error', self._cb_error, 10)
+        self.last_ultrasonic_time = 0.0
+        self.ultrasonic_range_m: float | None = None
+        self.create_subscription(Range, '/ultrasonic_range', self._cb_ultrasonic, 10)
 
     def _cb_gripper_joint_state(self, msg: JointState):
         target_name = None
@@ -734,6 +737,11 @@ class PickPlaceGuiNode(Node):
         # ERROR 진입 시 분류된 에러 사유 — _update_ui에서 좌상단 배너에 표시(GUI 스레드 안전).
         self.last_error_text = msg.data
 
+    def _cb_ultrasonic(self, msg: Range):
+        if msg.range is not None and msg.range > 0.0:
+            self.ultrasonic_range_m = float(msg.range)
+            self.last_ultrasonic_time = time.monotonic()
+
     def _cb_gripper_service_state(self, msg: GripperState):
         self.gripper_hw_ready = msg.ready
 
@@ -795,12 +803,13 @@ class PickPlaceGuiNode(Node):
             else ('warn' if fresh(self.gripper_init_progress_t, 30.0) else 'bad')
         )
         self.system_status_items = [
-            ('HW', 'ok' if fresh(self.last_hw_state_time) else 'warn'),
+            ('HW',   'ok' if fresh(self.last_hw_state_time) else 'warn'),
             ('GRIP', grip_state),
-            ('CAM', 'ok' if fresh(self.last_image_time) else 'bad'),
-            ('DET', 'ok' if fresh(self.last_objects_time) else 'bad'),
+            ('CAM',  'ok' if fresh(self.last_image_time) else 'bad'),
+            ('DET',  'ok' if fresh(self.last_objects_time) else 'bad'),
             ('PICK', 'ok' if ready(self.cli_run_once) and fresh(self.last_state_time) else 'bad'),
-            ('SPD', 'ok' if fresh(self.last_speed_mode_time) else 'warn'),
+            ('ARD',  'ok' if fresh(self.last_ultrasonic_time) else 'bad'),
+            ('SPD',  'ok' if fresh(self.last_speed_mode_time) else 'warn'),
         ]
 
 
@@ -877,11 +886,11 @@ class PickPlaceGui(QWidget):
         # 각 그룹은 op_right(운전)/grip_col(gripper)/set_col(수동·설정)에 직접 추가한다
         self.system_status_labels = {}
         self.system_status_bar = QWidget()
-        self.system_status_bar.setFixedSize(276, 24)
+        self.system_status_bar.setFixedSize(318, 24)
         status_bar_layout = QHBoxLayout(self.system_status_bar)
         status_bar_layout.setContentsMargins(0, 0, 0, 4)
         status_bar_layout.setSpacing(4)
-        for key in ('HW', 'GRIP', 'CAM', 'DET', 'PICK', 'SPD'):  # 기동 순서대로 표시
+        for key in ('HW', 'GRIP', 'CAM', 'DET', 'PICK', 'ARD', 'SPD'):  # 기동 순서대로 표시
             label = QLabel(key)
             label.setAlignment(Qt.AlignCenter)
             label.setFixedSize(42, 20)
@@ -1243,6 +1252,14 @@ class PickPlaceGui(QWidget):
         )
         self.gripper_status_label.setAlignment(Qt.AlignCenter)
         self.gripper_status_label.setMaximumHeight(22)  # 폰트 한 줄 높이만큼만 — 두껍지 않게
+
+        self.ultrasonic_status_label = QLabel('초음파 거리: -- mm')
+        self.ultrasonic_status_label.setStyleSheet(
+            'color: #66ccff; font-weight: bold; background-color: #1e1e1e;'
+            ' padding: 1px 4px; border-radius: 4px; font-family: monospace;'
+        )
+        self.ultrasonic_status_label.setAlignment(Qt.AlignCenter)
+        self.ultrasonic_status_label.setMaximumHeight(22)
 
         # 실시간 전류 모니터링 그래프 추가
         self.realtime_graph = RealTimeGraphWidget(self)
@@ -1696,6 +1713,7 @@ class PickPlaceGui(QWidget):
         cam_col.addWidget(status_group)
         # 그 자리(카메라-그래프 사이)에 실시간 전류/위치 한 줄.
         cam_col.addWidget(self.gripper_status_label)
+        cam_col.addWidget(self.ultrasonic_status_label)
         # 실시간 전류 그래프: 전류값 바로 아래, 모든 탭 상시(가로 길게)
         cam_col.addWidget(self.realtime_graph)
         body.addLayout(cam_col, 2)
@@ -2809,6 +2827,17 @@ class PickPlaceGui(QWidget):
         pres_curr = self.ros_node.gripper_present_current
         pres_pos = self.ros_node.gripper_present_position
         self.gripper_status_label.setText(f'실시간 - 전류: {pres_curr:.0f} mA | 위치: {pres_pos:.0f}')
+
+        now_mono = time.monotonic()
+        us_fresh = (
+            self.ros_node.last_ultrasonic_time > 0.0
+            and now_mono - self.ros_node.last_ultrasonic_time <= 3.0
+        )
+        if us_fresh and self.ros_node.ultrasonic_range_m is not None:
+            self.ultrasonic_status_label.setText(
+                f'초음파 거리: {self.ros_node.ultrasonic_range_m * 1000:.0f} mm')
+        else:
+            self.ultrasonic_status_label.setText('초음파 거리: -- mm')
 
         # 그리퍼 INIT/REINIT 라벨 — 진행 중이면 "INIT 5/15 | 47s | trying", 막힌 듯하면 stale 표시
         prog = self.ros_node.gripper_init_progress
