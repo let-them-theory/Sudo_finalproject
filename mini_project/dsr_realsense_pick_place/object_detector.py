@@ -237,6 +237,73 @@ def _dist3(a: tuple[float, float, float], b: tuple[float, float, float]) -> floa
     return math.sqrt(dx * dx + dy * dy + dz * dz)
 
 
+# FastSAM unknown 시각화용 색상 팔레트 (BGR). realsense_fastsam_segment.py와 동일.
+UNKNOWN_PALETTE = [
+    (255,  60,  60),
+    ( 60,  60, 255),
+    (255, 160,   0),
+    (160,   0, 200),
+    (  0, 200, 200),
+    (200, 200,   0),
+    (  0, 200,  80),
+    (200,  80, 160),
+]
+
+
+class UnknownTracker:
+    """프레임 간 unknown 물체 ID를 유지하는 centroid 트래커.
+
+    FastSAM이 매 프레임 내놓는 마스크에는 일관된 ID가 없으므로,
+    이전 프레임 중심점과 가장 가까운 새 마스크를 같은 물체로 보고 ID를 잇는다.
+    (realsense_fastsam_segment.py의 동일 클래스를 ROS 노드용으로 가져옴.)
+    """
+
+    def __init__(self, max_dist: int = 80, max_age: int = 12):
+        self.max_dist = max_dist   # 같은 물체로 볼 최대 중심점 거리 (px)
+        self.max_age = max_age     # 감지 안 돼도 ID 유지할 프레임 수
+        self._tracks: dict = {}    # id → {cx, cy, age, color_idx}
+        self._next_id = 1
+
+    def update(self, segs: list) -> list:
+        """segs: unknown bool 마스크 리스트. 반환: (id, color_idx) 리스트 (segs와 순서 동일)."""
+        centroids = []
+        for seg in segs:
+            ys, xs = np.where(seg)
+            if xs.size == 0:
+                centroids.append((0, 0))
+            else:
+                centroids.append((int(xs.mean()), int(ys.mean())))
+
+        for tid in list(self._tracks):
+            self._tracks[tid]['age'] += 1
+            if self._tracks[tid]['age'] > self.max_age:
+                del self._tracks[tid]
+
+        used = set()
+        assignments = []
+        for cx, cy in centroids:
+            best_tid, best_dist = None, self.max_dist
+            for tid, tr in self._tracks.items():
+                if tid in used:
+                    continue
+                dist = ((cx - tr['cx']) ** 2 + (cy - tr['cy']) ** 2) ** 0.5
+                if dist < best_dist:
+                    best_dist, best_tid = dist, tid
+            if best_tid is not None:
+                self._tracks[best_tid].update(cx=cx, cy=cy, age=0)
+                used.add(best_tid)
+                assignments.append((best_tid, self._tracks[best_tid]['color_idx']))
+            else:
+                new_id = self._next_id
+                self._next_id += 1
+                self._tracks[new_id] = dict(
+                    cx=cx, cy=cy, age=0,
+                    color_idx=(new_id - 1) % len(UNKNOWN_PALETTE))
+                used.add(new_id)
+                assignments.append((new_id, self._tracks[new_id]['color_idx']))
+        return assignments
+
+
 class ObjectDetectorNode(Node):
     def __init__(self):
         super().__init__('object_detector')
@@ -316,6 +383,32 @@ class ObjectDetectorNode(Node):
         # False면 기존처럼 TF 카메라→베이스 변환을 사용한다.
         self.declare_parameter('use_manual_absolute_origin', True)
 
+        # ── FastSAM unknown 검출 ─────────────────────────────────────────
+        # proto.pt(YOLO)가 못 잡는(학습 안 된) 물체를 FastSAM 세그멘테이션으로
+        # 잡아 'unknown_N'으로 표시한다. (realsense_fastsam_segment.py 방식)
+        self.declare_parameter('use_fastsam_unknown', True)
+        self.declare_parameter('fastsam_weights', 'FastSAM-s.pt')
+        self.declare_parameter('fastsam_conf', 0.5)
+        self.declare_parameter('fastsam_iou', 0.7)
+        self.declare_parameter('fastsam_imgsz', 640)
+        # FastSAM은 무거우므로 매 프레임이 아니라 N프레임마다 1회만 실행하고
+        # 그 사이 프레임은 직전 마스크를 재사용한다(표시는 카메라 fps 유지, 부하 1/N).
+        # 1 = 매 프레임(최대 부하), 3 = 3프레임마다(권장). FPS 더 필요하면 키우세요.
+        self.declare_parameter('fastsam_every_n', 3)
+        # FastSAM 마스크가 YOLO bbox와 이 IoU 이상 겹치면 known(이미 잡힘)으로 보고 제외.
+        self.declare_parameter('unknown_match_iou', 0.15)
+        # unknown 마스크 픽셀 면적 필터. ROI(360x240=86400px) 기준 값 (realsense_fastsam_segment.py와 동일).
+        self.declare_parameter('unknown_min_area', 500)
+        self.declare_parameter('unknown_max_area', 10000)
+        # ── unknown 검출 ROI (realsense_fastsam_segment.py와 동일) ───────
+        # ROI 안에서만 FastSAM을 돌리고 unknown을 표시한다(성능↑, 작업영역 한정).
+        # 화면 중앙에서 우측 shift_x, 아래 shift_y 이동한 곳에 roi_w x roi_h 박스.
+        self.declare_parameter('unknown_roi_enable', True)
+        self.declare_parameter('unknown_roi_w', 360)
+        self.declare_parameter('unknown_roi_h', 240)
+        self.declare_parameter('unknown_roi_shift_x', 74)
+        self.declare_parameter('unknown_roi_shift_y', 10)
+
         p = self.get_parameter
         # 자주 쓰는 파라미터는 멤버 변수로 꺼내 두고 이후 계산에 재사용한다.
         self.camera_frame = p('camera_frame').value
@@ -391,6 +484,29 @@ class ObjectDetectorNode(Node):
             self._load_yolo()
         # 모델 로드 후, known_classes와 model.names가 어긋났는지 안내 (안전망)
         self._warn_class_alignment()
+
+        # ── FastSAM unknown 검출 설정/로드 ───────────────────────────────
+        self.use_fastsam = bool(p('use_fastsam_unknown').value)
+        self.fastsam_conf = float(p('fastsam_conf').value)
+        self.fastsam_iou = float(p('fastsam_iou').value)
+        self.fastsam_imgsz = int(p('fastsam_imgsz').value)
+        self.fastsam_every_n = max(1, int(p('fastsam_every_n').value))
+        self._fastsam_counter = 0
+        self._sam_masks_cache = []   # 직전 FastSAM 마스크(ROI-local) 캐시 — 스킵 프레임 재사용
+        self.unknown_match_iou = float(p('unknown_match_iou').value)
+        self.unknown_min_area = int(p('unknown_min_area').value)
+        self.unknown_max_area = int(p('unknown_max_area').value)
+        self.unknown_roi_enable = bool(p('unknown_roi_enable').value)
+        self.unknown_roi_w = int(p('unknown_roi_w').value)
+        self.unknown_roi_h = int(p('unknown_roi_h').value)
+        self.unknown_roi_shift_x = int(p('unknown_roi_shift_x').value)
+        self.unknown_roi_shift_y = int(p('unknown_roi_shift_y').value)
+        self.fastsam = None
+        self.fastsam_device = 'cpu'
+        self._unknown_tracker = UnknownTracker(max_dist=80, max_age=12)
+        if self.use_fastsam:
+            self._load_fastsam()
+
         self.add_on_set_parameters_callback(self._on_parameters_changed)
 
         # ── TF2 ─────────────────────────────────────────────────────────
@@ -529,6 +645,240 @@ class ObjectDetectorNode(Node):
             if p.is_file():
                 return str(p.resolve())
         return None
+
+    def _resolve_weights(self, name: str) -> str:
+        """가중치 파일 경로 해석. 파일이면 그대로, 아니면 후보 루트에서 파일명으로 검색.
+        못 찾으면 원래 이름 반환(ultralytics가 캐시/다운로드 처리)."""
+        name = str(name).strip()
+        cand = Path(name).expanduser()
+        if cand.is_file():
+            return str(cand.resolve())
+        for root in self._candidate_search_roots():
+            direct = root / cand.name
+            if direct.is_file():
+                return str(direct.resolve())
+            try:
+                for m in root.rglob(cand.name):
+                    if m.is_file():
+                        return str(m.resolve())
+            except OSError:
+                pass
+        return name
+
+    def _load_fastsam(self) -> bool:
+        """FastSAM 세그멘테이션 모델 로드. 실패 시 unknown 검출만 비활성화(노드는 계속)."""
+        weights = self._resolve_weights(self.get_parameter('fastsam_weights').value)
+        try:
+            from ultralytics import FastSAM
+            self.fastsam = FastSAM(weights)
+            try:
+                import torch
+                self.fastsam_device = 0 if torch.cuda.is_available() else 'cpu'
+            except Exception:
+                self.fastsam_device = 'cpu'
+            self.get_logger().info(
+                f'FastSAM 로드 완료: {weights} (device={self.fastsam_device}) — unknown 검출 ON')
+            return True
+        except Exception as e:
+            self.fastsam = None
+            self.use_fastsam = False
+            self.get_logger().warn(f'FastSAM 로드 실패 — unknown 검출 비활성화: {e}')
+            return False
+
+    def _roi_rect(self, frame_w: int, frame_h: int) -> tuple:
+        """unknown 검출 ROI 사각형 (x1,y1,x2,y2). realsense_fastsam_segment.py와 동일 로직."""
+        cx = frame_w // 2 + self.unknown_roi_shift_x
+        cy = frame_h // 2 + self.unknown_roi_shift_y
+        x1 = max(0, cx - self.unknown_roi_w // 2)
+        y1 = max(0, cy - self.unknown_roi_h // 2)
+        x2 = min(frame_w, x1 + self.unknown_roi_w)
+        y2 = min(frame_h, y1 + self.unknown_roi_h)
+        return x1, y1, x2, y2
+
+    @staticmethod
+    def _mask_box_iou(seg: np.ndarray, box: tuple) -> float:
+        """FastSAM 마스크(bool)와 YOLO bbox(x1,y1,x2,y2)의 IoU."""
+        x1, y1, x2, y2 = box
+        h, w = seg.shape[:2]
+        x1 = max(0, int(x1)); y1 = max(0, int(y1))
+        x2 = min(w, int(x2)); y2 = min(h, int(y2))
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+        bbox_mask = np.zeros(seg.shape, np.uint8)
+        bbox_mask[y1:y2, x1:x2] = 1
+        seg_bin = seg.astype(np.uint8)
+        inter = int(np.count_nonzero(seg_bin & bbox_mask))
+        union = int(np.count_nonzero(seg_bin | bbox_mask))
+        return inter / union if union > 0 else 0.0
+
+    def _render_scene(self, color_img, depth_img, yolo_dets, candidates):
+        """GUI 카메라 화면(debug 이미지)을 realsense_fastsam_segment.py 스타일로 구성.
+
+        - ROI 밖은 어둡게(0.35), ROI 안만 오버레이
+        - FastSAM 세그를 YOLO bbox와 매칭 → known(초록 마스크), 나머지 → unknown(컬러 마스크)
+        - 윤곽선 + 라벨 + ROI 박스 + HUD(FPS/known/unknown 수)
+        - unknown은 3D 좌표를 계산해 candidates에도 추가(클릭 선택 가능)
+
+        반환: 합성된 debug 이미지(BGR).
+        """
+        H, W = color_img.shape[:2]
+        if self.unknown_roi_enable:
+            rx1, ry1, rx2, ry2 = self._roi_rect(W, H)
+        else:
+            rx1, ry1, rx2, ry2 = 0, 0, W, H
+        roi = color_img[ry1:ry2, rx1:rx2]
+        RH, RW = roi.shape[:2]
+
+        # YOLO bbox를 ROI-local 좌표로 변환 (마스크 매칭/그리기는 ROI 안에서 수행)
+        known_boxes = []   # (x1, y1, x2, y2, cls, conf)
+        for (u, v, w, h, cls, conf, *_r) in yolo_dets:
+            known_boxes.append((u - w // 2 - rx1, v - h // 2 - ry1,
+                                u + w // 2 - rx1, v + h // 2 - ry1, cls, conf))
+
+        # ── FastSAM 세그 (ROI) — N프레임마다만 실행, 그 외엔 직전 마스크 재사용 ──
+        sam_masks = self._sam_masks_cache
+        if self.use_fastsam and self.fastsam is not None:
+            self._fastsam_counter += 1
+            run_now = (self._fastsam_counter % self.fastsam_every_n == 0
+                       or not self._sam_masks_cache)
+            if run_now:
+                try:
+                    res = self.fastsam(
+                        roi, imgsz=self.fastsam_imgsz, conf=self.fastsam_conf,
+                        iou=self.fastsam_iou, retina_masks=True,
+                        device=self.fastsam_device, verbose=False)[0]
+                    fresh = []
+                    if res.masks is not None:
+                        for m in res.masks.data.cpu().numpy():
+                            if m.shape[:2] != (RH, RW):
+                                m = cv2.resize(m, (RW, RH), interpolation=cv2.INTER_NEAREST)
+                            fresh.append(m > 0.5)
+                    sam_masks = fresh
+                    self._sam_masks_cache = fresh
+                except Exception as e:
+                    self.get_logger().warn(f'FastSAM 추론 실패: {e}', throttle_duration_sec=5.0)
+                    sam_masks = self._sam_masks_cache
+
+        # ── YOLO bbox ↔ FastSAM 매칭: known / unknown 분리 ──
+        known_segs = []     # (mask_local, cls, conf)
+        matched = set()
+        for (x1, y1, x2, y2, cls, conf) in known_boxes:
+            best_iou, best_idx = 0.0, -1
+            for i, seg in enumerate(sam_masks):
+                if i in matched:
+                    continue
+                iou = self._mask_box_iou(seg, (x1, y1, x2, y2))
+                if iou > best_iou:
+                    best_iou, best_idx = iou, i
+            if best_iou >= self.unknown_match_iou and best_idx >= 0:
+                known_segs.append((sam_masks[best_idx], cls, conf))
+                matched.add(best_idx)
+            else:
+                # FastSAM 매칭 실패 시 bbox 자체를 마스크로 사용
+                bm = np.zeros((RH, RW), dtype=bool)
+                xa, ya = max(0, x1), max(0, y1)
+                xb, yb = min(RW, x2), min(RH, y2)
+                if xb > xa and yb > ya:
+                    bm[ya:yb, xa:xb] = True
+                known_segs.append((bm, cls, conf))
+
+        unknown_masks = []
+        for i, seg in enumerate(sam_masks):
+            if i in matched:
+                continue
+            area = int(np.count_nonzero(seg))
+            if area < self.unknown_min_area or area > self.unknown_max_area:
+                continue
+            unknown_masks.append(seg)
+
+        track_ids = self._unknown_tracker.update(unknown_masks)
+
+        # ── unknown 3D 좌표 계산 + candidates 추가 ──
+        unknown_draw = []   # (mask_local, uid, cidx)
+        for seg, (uid, cidx) in zip(unknown_masks, track_ids):
+            ys, xs = np.where(seg)
+            if xs.size == 0:
+                continue
+            lx1, lx2 = int(xs.min()), int(xs.max())
+            ly1, ly2 = int(ys.min()), int(ys.max())
+            u = (lx1 + lx2) // 2 + rx1     # ROI-local → full
+            v = (ly1 + ly2) // 2 + ry1
+            w = max(1, lx2 - lx1)
+            h = max(1, ly2 - ly1)
+
+            depth_m = self._estimate_depth_m(depth_img, u, v)
+            if depth_m is None:
+                continue
+            pose_optical = self._pixel_to_optical_pose(u, v, depth_m)
+            pose_abs = self._to_absolute_pose(pose_optical)
+            if pose_abs is None:
+                continue
+            yaw_deg = None
+            if self.use_object_yaw_for_grasp:
+                yaw_deg = self._estimate_object_yaw_deg(depth_img, u, v, w, h, depth_m)
+                if yaw_deg is not None and self.use_manual_absolute_origin:
+                    self._set_pose_yaw_deg(pose_abs, yaw_deg)
+            pos = pose_abs.pose.position
+
+            candidates.append({
+                'label': f'unknown_{uid}',
+                'class_name': 'object',
+                'tracker_id': None,
+                'display_num': uid,
+                'confidence': 1.0,
+                'depth_m': depth_m,
+                'pixel_u': u,
+                'pixel_v': v,
+                'pose': pose_abs,
+                'pose_dict': {'x': pos.x, 'y': pos.y, 'z': pos.z, 'yaw_deg': yaw_deg},
+            })
+            unknown_draw.append((seg, uid, cidx))
+
+        # ── 시각화 합성 (realsense_fastsam_segment.py 스타일) ──
+        vis = (color_img.astype(np.float32) * 0.35).astype(np.uint8)
+        roi_base = color_img[ry1:ry2, rx1:rx2].copy()
+        roi_overlay = roi_base.copy()
+        for seg, uid, cidx in unknown_draw:
+            roi_overlay[seg] = UNKNOWN_PALETTE[cidx]
+        for seg, cls, conf in known_segs:
+            roi_overlay[seg] = (0, 220, 0)
+        roi_vis = cv2.addWeighted(roi_base, 0.45, roi_overlay, 0.55, 0)
+
+        for seg, uid, cidx in unknown_draw:
+            contours, _ = cv2.findContours(seg.astype(np.uint8),
+                                           cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(roi_vis, contours, -1, UNKNOWN_PALETTE[cidx], 2)
+            if contours:
+                x, y, _w, _h = cv2.boundingRect(contours[0])
+                cv2.putText(roi_vis, f'unknown{uid}', (x, max(y - 6, 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                            UNKNOWN_PALETTE[cidx], 1, cv2.LINE_AA)
+        for seg, cls, conf in known_segs:
+            contours, _ = cv2.findContours(seg.astype(np.uint8),
+                                           cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(roi_vis, contours, -1, (0, 220, 0), 2)
+            if contours:
+                x, y, _w, _h = cv2.boundingRect(contours[0])
+                cv2.putText(roi_vis, f'{cls} {conf:.2f}', (x, max(y - 6, 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 0), 1, cv2.LINE_AA)
+
+        vis[ry1:ry2, rx1:rx2] = roi_vis
+        cv2.rectangle(vis, (rx1, ry1), (rx2 - 1, ry2 - 1), (255, 255, 0), 2)
+
+        # HUD (FPS / known / unknown / ROI)
+        now = time.perf_counter()
+        last = getattr(self, '_render_last_t', None)
+        if last is not None:
+            dt = now - last
+            inst = 1.0 / dt if dt > 0 else 0.0
+            self._render_fps = 0.9 * getattr(self, '_render_fps', inst) + 0.1 * inst
+        self._render_last_t = now
+        hud = (f'FPS {getattr(self, "_render_fps", 0.0):.1f}  '
+               f'known:{len(known_segs)}  unknown:{len(unknown_draw)}  '
+               f'ROI({rx1},{ry1})-({rx2},{ry2})')
+        cv2.putText(vis, hud, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    (255, 255, 0), 2, cv2.LINE_AA)
+        return vis
 
     # ────────────────────────────────────────────────────────────────────
     # YOLO 로드
@@ -742,7 +1092,14 @@ class ObjectDetectorNode(Node):
         detections = (self._detect_yolo(color_img) if self.use_yolo and self.model
                       else self._detect_color(color_img))
 
-        debug_img = color_img.copy()
+        # ROI가 켜져 있으면 known 검출도 ROI 안으로 제한한다.
+        # (이게 없으면 YOLO가 전체 프레임에서 돌아 ROI 밖 물체까지 인식됨)
+        if self.unknown_roi_enable:
+            Hh, Ww = color_img.shape[:2]
+            _rx1, _ry1, _rx2, _ry2 = self._roi_rect(Ww, Hh)
+            detections = [d for d in detections
+                          if _rx1 <= d[0] < _rx2 and _ry1 <= d[1] < _ry2]
+
         candidates = []
         now_t = time.monotonic()
 
@@ -782,16 +1139,6 @@ class ObjectDetectorNode(Node):
             prefix = label_class if is_known else 'unknown'
             display_label = f'{prefix}_{display_num}' if display_num is not None else prefix
 
-            # 디버그 영상은 표시 번호 기반으로 그린다 (사용자가 보는 번호와 일치)
-            cv2.rectangle(debug_img,
-                          (u - w // 2, v - h // 2),
-                          (u + w // 2, v + h // 2),
-                          (0, 255, 0), 2)
-            cv2.putText(debug_img,
-                        f'{display_label} {label_class} {conf:.2f} | {depth_m:.3f}m',
-                        (u - w // 2, v - h // 2 - 6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
             candidate = {
                 'label': display_label,      # GUI 표시 + _choose_target 필터용 (count 보고 아래에서 재확정)
                 'class_name': label_class,   # 원본 yolo 클래스 (그리퍼 강도 룩업)
@@ -814,11 +1161,10 @@ class ObjectDetectorNode(Node):
             if tid is not None:
                 self._track_manager.set_payload(tid, candidate)
 
-            if yaw_deg is not None:
-                cv2.putText(debug_img,
-                            f'yaw {yaw_deg:+.1f} deg',
-                            (u - w // 2, v + h // 2 + 18),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 255), 2)
+        # ── 화면 구성 (realsense_fastsam_segment.py 스타일) ───────────────
+        # ROI 밖은 어둡게, ROI 안은 known(초록 마스크)+unknown(컬러 마스크)을
+        # FastSAM 세그로 그린다. unknown 후보도 여기서 candidates에 추가된다.
+        debug_img = self._render_scene(color_img, depth_img, detections, candidates)
 
         # 이번 프레임에 검출 안 됐지만 grace 안이라 GUI엔 유지해야 하는 트랙들을 추가 발행.
         # _choose_target에도 같이 넘겨, 사용자가 그 사이 클릭해도 마지막 좌표로 처리 가능.
@@ -1278,11 +1624,12 @@ class ObjectDetectorNode(Node):
 
 
 def main(args=None):
+    from rclpy.executors import ExternalShutdownException
     rclpy.init(args=args)
     node = ObjectDetectorNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         if rclpy.ok():

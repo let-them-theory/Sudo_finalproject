@@ -16,7 +16,7 @@ object_detector:
     # --- YOLO 설정 ---
     use_yolo: true
     # ⚠️ 본인 학습 모델(.pt)의 절대경로로 수정할 것. 모델 파일은 repo에 없음(SETUP.md 참고).
-    yolo_model: "/ABSOLUTE/PATH/TO/your_model.pt"
+    yolo_model: "/home/user/Sudo_finalproject-main/proto.pt"
     confidence_threshold: 0.5
 
 
@@ -30,6 +30,26 @@ object_detector:
     # pick_place_node의 grip_class_names와 동일 값으로 유지해야 한다. 어긋나면 시작 시 warn 발행.
     # GUI 강도 편집기에서 저장 누르면 이 줄도 자동 동기화됨.
     known_classes: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "box", "can", "boxsnack", "wafers"]
+
+    # --- FastSAM unknown 검출 ---
+    # proto.pt(YOLO)가 못 잡는(학습 안 된) 물체를 FastSAM 세그멘테이션으로 잡아
+    # GUI 카메라 화면에 'unknown_N'(컬러 마스크)으로 표시한다.
+    # (realsense_fastsam_segment.py와 동일 방식). 끄려면 use_fastsam_unknown: false.
+    use_fastsam_unknown: true
+    fastsam_weights: "/home/user/Sudo_finalproject-main/FastSAM-s.pt"
+    fastsam_conf: 0.5
+    fastsam_iou: 0.7
+    fastsam_imgsz: 640           # FastSAM 입력 크기. 낮추면(416/320) 더 빠름
+    fastsam_every_n: 3           # N프레임마다 FastSAM 실행(부하 1/N). 1=매프레임, 키울수록 FPS↑
+    unknown_match_iou: 0.15      # YOLO bbox와 이 IoU 이상 겹친 마스크는 known으로 보고 제외
+    unknown_min_area: 500        # unknown 마스크 최소 픽셀 면적 (ROI 360x240 기준)
+    unknown_max_area: 10000      # unknown 마스크 최대 픽셀 면적 (ROI 360x240 기준)
+    # unknown 검출 ROI (realsense_fastsam_segment.py와 동일). 이 영역 안에서만 FastSAM 동작.
+    unknown_roi_enable: true
+    unknown_roi_w: 360
+    unknown_roi_h: 240
+    unknown_roi_shift_x: 74      # 화면 중앙에서 우측으로
+    unknown_roi_shift_y: 10      # 화면 중앙에서 아래로
 
     # --- 추적/디바운스 (검출 안정화: tracker ID 기반 표시 번호 [1],[2],...) ---
     tracker_type: "botsort_custom.yaml"  # 패키지 share/config 안의 파일명. 없으면 ultralytics 기본 사용
@@ -47,7 +67,8 @@ object_detector:
     depth_center_ratio: 0.6         # 샘플링 반경 내 사용 비율 (0~1)
     depth_outlier_mad_scale: 2.5    # MAD 이상치 제거 스케일 팩터
     selected_object_topic: "/selected_object_label"
-    use_object_yaw_for_grasp: True
+    # 마스크 기반 축(yaw) 추정 비활성화 — FastSAM 마스크 화면과 혼용 방지.
+    use_object_yaw_for_grasp: False
     yaw_axis_reference: "long"
     yaw_depth_band_m: 0.03
     yaw_min_mask_pixels: 40
@@ -133,7 +154,8 @@ pick_place_node:
     # --- 로봇 설정 ---
     robot_namespace: "dsr01"
     robot_base_frame: "base_link"
-    use_target_pose_yaw: True
+    # 축(yaw) 기반 파지 비활성화 — 고정 자세(grasp_rpy)로 파지.
+    use_target_pose_yaw: False
     grasp_yaw_offset_deg: 0.0
 
     # --- 속도/가속도 ---
@@ -144,6 +166,16 @@ pick_place_node:
 
     # --- 홈 포지션 (관절 각도, deg) ---
     home_joints: [0.0, 0.0, 90.0, 0.0, 90.0, 0.0]
+
+    # --- 아두이노(HC-SR04) 초음파 거리 기반 파지 ---
+    # PICK 하강 중 초음파 거리가 grasp_distance_m 이하가 되면 그 자리에서 파지.
+    # 센서 미연결/임계 미달 시 카메라 기반 안전바닥(pose.z + pick_z_offset)에서 파지.
+    use_ultrasonic_grasp: true
+    grasp_distance_m: 0.07          # 70mm 이하 감지 시 파지
+    ultrasonic_step_m: 0.01         # 1회 하강 스텝(m) — 작을수록 정밀/느림
+    ultrasonic_settle_sec: 0.15     # 스텝 후 센서 갱신 대기(s)
+    ultrasonic_range_topic: "/ultrasonic_range"
+    ultrasonic_max_age_sec: 0.5     # 이보다 오래된 거리값은 무효 처리
 
     # --- 그리퍼 설정 ---
     # gripper_node의 motion_wait(1.5s)보다 길게 설정해야

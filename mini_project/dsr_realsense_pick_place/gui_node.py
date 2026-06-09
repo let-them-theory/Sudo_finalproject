@@ -88,7 +88,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtGui import QPalette, QFont
 from PyQt5.QtCore import QLibraryInfo
 from rclpy.node import Node
-from sensor_msgs.msg import Image, JointState
+from sensor_msgs.msg import Image, JointState, Range
 
 from rcl_interfaces.msg import Parameter as RclParameter, ParameterType, ParameterValue
 from rcl_interfaces.srv import GetParameters, SetParameters
@@ -249,6 +249,8 @@ class PickPlaceGuiNode(Node):
         self.last_state_time = 0.0
         self.last_hw_state_time = 0.0
         self.last_speed_mode_time = 0.0
+        self.last_ultrasonic_time = 0.0
+        self.ultrasonic_range_m = None   # 최근 HC-SR04 거리(m), 무효 시 None
         self.system_status_items = []
         self._last_system_status_check = 0.0
 
@@ -320,6 +322,8 @@ class PickPlaceGuiNode(Node):
                 )
             self.create_subscription(Image, '/detection_debug_image', self._cb_image, qos_profile_sensor_data)
             self.create_subscription(String, '/detected_objects', self._cb_objects, 10)
+        # 아두이노 HC-SR04 초음파 거리 (ultrasonic_node → /ultrasonic_range)
+        self.create_subscription(Range, '/ultrasonic_range', self._cb_ultrasonic, 10)
         self.create_subscription(String, '/pick_place_state', self._cb_state, 10)
 
     def _cb_gripper_joint_state(self, msg: JointState):
@@ -743,6 +747,12 @@ class PickPlaceGuiNode(Node):
         self.speed_mode = msg.data
         self.last_speed_mode_time = time.monotonic()
 
+    def _cb_ultrasonic(self, msg: Range):
+        # 아두이노 HC-SR04 거리(m). range<=0 이면 측정 실패.
+        if msg.range is not None and msg.range > 0.0:
+            self.ultrasonic_range_m = float(msg.range)
+            self.last_ultrasonic_time = time.monotonic()
+
     def publish_selected_label(self, label: str):
         # 빈 문자열은 "자동 선택" 모드로 해석된다.
         self.selected_label = label
@@ -785,6 +795,7 @@ class PickPlaceGuiNode(Node):
             ('DET', 'ok' if fresh(self.last_objects_time) else 'bad'),
             ('PICK', 'ok' if ready(self.cli_run_once) and fresh(self.last_state_time) else 'bad'),
             ('GRIP', 'ok' if self.gripper_hw_ready else 'bad'),
+            ('ARD', 'ok' if fresh(self.last_ultrasonic_time) else 'bad'),
             ('HW', 'ok' if fresh(self.last_hw_state_time) else 'warn'),
             ('SPD', 'ok' if fresh(self.last_speed_mode_time) else 'warn'),
         ]
@@ -863,11 +874,11 @@ class PickPlaceGui(QWidget):
         # 각 그룹은 op_right(운전)/grip_col(gripper)/set_col(수동·설정)에 직접 추가한다
         self.system_status_labels = {}
         self.system_status_bar = QWidget()
-        self.system_status_bar.setFixedSize(276, 24)
+        self.system_status_bar.setFixedSize(320, 24)
         status_bar_layout = QHBoxLayout(self.system_status_bar)
         status_bar_layout.setContentsMargins(0, 0, 0, 4)
         status_bar_layout.setSpacing(4)
-        for key in ('CAM', 'DET', 'PICK', 'GRIP', 'HW', 'SPD'):
+        for key in ('CAM', 'DET', 'PICK', 'GRIP', 'ARD', 'HW', 'SPD'):
             label = QLabel(key)
             label.setAlignment(Qt.AlignCenter)
             label.setFixedSize(42, 20)
@@ -1188,6 +1199,13 @@ class PickPlaceGui(QWidget):
         gripper_ctrl_layout.addLayout(acc_row)
 
         # 모니터링 레이블
+        self.ultrasonic_status_label = QLabel('초음파 거리: -- mm')
+        self.ultrasonic_status_label.setStyleSheet(
+            'color: #66ccff; font-weight: bold; background-color: #1e1e1e;'
+            ' padding: 4px; border-radius: 4px; font-family: monospace;'
+        )
+        self.ultrasonic_status_label.setAlignment(Qt.AlignCenter)
+
         self.gripper_status_label = QLabel('실시간 - 전류: -- mA | 위치: ----')
         self.gripper_status_label.setStyleSheet(
             'color: #33ff33; font-weight: bold; background-color: #1e1e1e; padding: 4px; border-radius: 4px; font-family: monospace;'
@@ -1597,7 +1615,8 @@ class PickPlaceGui(QWidget):
         op_right.addWidget(emergency_group)
         op_right.addWidget(detect_tune_group)
         op_right.addWidget(object_group)
-        # 검출 물체 선택 아래: 실시간 전류값 한 줄
+        # 검출 물체 선택 아래: 초음파 거리 → 실시간 전류값
+        op_right.addWidget(self.ultrasonic_status_label)
         op_right.addWidget(self.gripper_status_label)
         op_right.addStretch(1)
 
@@ -2289,7 +2308,7 @@ class PickPlaceGui(QWidget):
             pkg_share = get_package_share_directory('dsr_realsense_pick_place')
             shutdown_script = os.path.join(pkg_share, 'scripts', 'shutdown_nodes.sh')
             self._system_reset_proc = subprocess.Popen(
-                ['bash', shutdown_script],
+                ['bash', shutdown_script, '--kill-launch'],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -2496,7 +2515,6 @@ class PickPlaceGui(QWidget):
                             'mode:=real',
                             'host:=110.120.1.50',
                             'gui:=false',
-                            'pre_cleanup:=false',
                         ],
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
@@ -2529,7 +2547,10 @@ class PickPlaceGui(QWidget):
         # 카메라 영상은 최신 프레임이 있을 때만 갱신한다.
         if self.ros_node.latest_qimage is not None:
             pixmap = QPixmap.fromImage(self.ros_node.latest_qimage)
-            self._draw_object_frames_on_pixmap(pixmap, detected_snapshot)
+            # 카메라는 object_detector의 debug 영상(realsense_fastsam_segment.py 스타일)을
+            # 그대로 표시한다. 축(LONG/Z)·태그 오버레이는 FastSAM 마스크와 혼용돼 비활성화.
+            # (재활성화: 아래 호출 복원 + yaml use_object_yaw_for_grasp: true)
+            # self._draw_object_frames_on_pixmap(pixmap, detected_snapshot)
             scaled = pixmap.scaled(
                 self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
             )
@@ -2648,6 +2669,26 @@ class PickPlaceGui(QWidget):
         self.exposure_apply_button.setEnabled(manual_exp_enabled)
 
         # ── 그리퍼 정밀 제어 상태 및 활성화 제어 ─────────────────────────────
+        # 아두이노 초음파 거리 레이블 (전류값 위)
+        now = time.monotonic()
+        us_fresh = (
+            self.ros_node.last_ultrasonic_time > 0.0
+            and now - self.ros_node.last_ultrasonic_time <= 3.0
+        )
+        if us_fresh and self.ros_node.ultrasonic_range_m is not None:
+            us_mm = self.ros_node.ultrasonic_range_m * 1000.0
+            self.ultrasonic_status_label.setText(f'초음파 거리: {us_mm:.0f} mm')
+            self.ultrasonic_status_label.setStyleSheet(
+                'color: #33ff33; font-weight: bold; background-color: #003a00;'
+                ' padding: 4px; border-radius: 4px; font-family: monospace;'
+            )
+        else:
+            self.ultrasonic_status_label.setText('초음파 거리: -- mm (아두이노 미연결)')
+            self.ultrasonic_status_label.setStyleSheet(
+                'color: #ff6666; font-weight: bold; background-color: #4a0000;'
+                ' padding: 4px; border-radius: 4px; font-family: monospace;'
+            )
+
         # 실시간 상태 레이블 업데이트
         pres_curr = self.ros_node.gripper_present_current
         pres_pos = self.ros_node.gripper_present_position

@@ -75,6 +75,10 @@ source install/setup.bash      # 매 터미널에서 source (또는 ~/.bashrc �
 ## 6. 실행
 ```bash
 export QT_QPA_PLATFORM=xcb        # Wayland에서 Qt GUI 안 뜰 때
+# 권장: 종료(Ctrl+C) 시 DRCF/DRL 자동 해제
+bash $(ros2 pkg prefix dsr_realsense_pick_place)/share/dsr_realsense_pick_place/scripts/run_pick_place_real.sh
+
+# 또는 직접 launch (종료 시 shutdown_nodes.sh 수동 실행 필요)
 ros2 launch dsr_realsense_pick_place pick_place.launch.py \
   mode:=real host:=<로봇IP> use_realsense:=true gui:=true
 ```
@@ -91,9 +95,9 @@ bash $(ros2 pkg prefix dsr_realsense_pick_place)/share/dsr_realsense_pick_place/
 
 ## 8. 종료
 ```bash
-bash $(ros2 pkg prefix dsr_realsense_pick_place)/share/dsr_realsense_pick_place/scripts/shutdown_nodes.sh
+bash $(ros2 pkg prefix dsr_realsense_pick_place)/share/dsr_realsense_pick_place/scripts/shutdown_nodes.sh --kill-launch
 ```
-DRCF authority를 순서대로 해제(ros2_control 먼저)해, 다음 기동 시 joint 활성화가 바로 됩니다.
+순서: DrlStop → gripper 정리 → ros2_control(DRCF 해제). `pkill -9` 대신 이 스크립트를 사용하면 재연결 시 로봇 전원 사이클이 대부분 불필요합니다.
 
 ---
 ### repo에 없는 것 (의도적 제외)
