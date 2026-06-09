@@ -1,43 +1,138 @@
 #!/usr/bin/env bash
-# shutdown_nodes.sh — GUI를 제외한 모든 ROS2 노드를 순서대로 정상 종료한다.
+# shutdown_nodes.sh — DRCF authority / DRL 그리퍼 세션을 정상 해제한 뒤 노드를 종료한다.
 #
-# SIGTERM 순서:
-#   1. ros2_control_node (DRCF 연결 해제 — 가장 중요, 충분한 대기 필요)
-#   2. gripper_service_node / gripper_node
-#   3. pick_place_node / object_detector / realsense / static_tf
+# 종료 순서 (재연결 실패 방지):
+#   0. pick_place 정지
+#   1. DrlStop 서비스 (ros2_control 살아있을 때 — 플랜지 RS-485 해제)
+#   2. gripper_service / gripper_node SIGTERM (bridge.close → DrlStop 재시도)
+#   3. vision·보조 노드
+#   4. ros2_control_node SIGTERM (Drfl.close_connection — DRCF authority 해제)
+#   5. 나머지 + (--kill-launch 시 launch 부모)
+#   6. 잔여만 SIGKILL
 #
-# 종료 후 재실행 시 DRCF authority가 정상 해제되어 있으므로
-# joint 활성화가 즉시 성공한다.
+# 사용:
+#   bash shutdown_nodes.sh
+#   bash shutdown_nodes.sh --kill-launch
+#   ROBOT_NS=dsr01 DRCF_GRACE=20 bash shutdown_nodes.sh
 
-set -euo pipefail
+set -o pipefail
 
-echo "[shutdown] ===== 노드 정상 종료 시작 ====="
+ROBOT_NS="${ROBOT_NS:-dsr01}"
+DRL_STOP_SVC="/${ROBOT_NS}/drl/drl_stop"
+TERM_GRACE="${TERM_GRACE:-12}"
+DRCF_GRACE="${DRCF_GRACE:-15}"
+KILL_LAUNCH=0
 
-# ── 1. ros2_control_node — DRCF 연결 해제를 위해 먼저, 충분한 대기 ───────
-echo "[shutdown] [1/3] ros2_control_node SIGTERM (DRCF 해제)..."
-pkill -TERM -f "ros2_control_node" 2>/dev/null || true
-sleep 6   # DRCF가 연결 해제를 처리할 시간 충분히 확보
+for arg in "$@"; do
+  case "$arg" in
+    --kill-launch) KILL_LAUNCH=1 ;;
+  esac
+done
 
-# ── 2. 그리퍼 관련 노드 ───────────────────────────────────────────────────
-echo "[shutdown] [2/3] gripper 노드 SIGTERM..."
-pkill -TERM -f "gripper_service_node" 2>/dev/null || true
-pkill -TERM -f "gripper_node" 2>/dev/null || true
+source /opt/ros/"${ROS_DISTRO:-humble}"/setup.bash 2>/dev/null || true
+for _ws in \
+  "${SUDO_WS_SETUP:-}" \
+  "/home/user/Sudo_finalproject-main/install/setup.bash" \
+  "/home/user/doosan_ws/install/setup.bash"; do
+  if [ -n "$_ws" ] && [ -f "$_ws" ]; then
+    # shellcheck disable=SC1090
+    source "$_ws" 2>/dev/null || true
+    break
+  fi
+done
+
+wait_gone() {
+  local pattern="$1"
+  local timeout="$2"
+  local i=0
+  while pgrep -f "$pattern" >/dev/null 2>&1 && [ "$i" -lt "$timeout" ]; do
+    sleep 1
+    i=$((i + 1))
+  done
+  if pgrep -f "$pattern" >/dev/null 2>&1; then
+    return 1
+  fi
+  return 0
+}
+
+term_pattern() {
+  pkill -TERM -f "$1" 2>/dev/null || true
+}
+
+kill_pattern() {
+  pkill -KILL -f "$1" 2>/dev/null || true
+}
+
+echo "[shutdown] ===== 정상 종료 시작 (ns=${ROBOT_NS}) ====="
+
+echo "[shutdown] [0/6] pick_place_node 정지..."
+term_pattern "lib/dsr_realsense_pick_place/pick_place_node"
+term_pattern "pick_place_node"
+sleep 1
+
+echo "[shutdown] [1/6] DRL 정지 (${DRL_STOP_SVC})..."
+if timeout 8 ros2 service call "$DRL_STOP_SVC" dsr_msgs2/srv/DrlStop "{stop_mode: 1}" 2>/dev/null; then
+  echo "[shutdown]     drl_stop 완료"
+else
+  echo "[shutdown]     drl_stop 미응답 (이미 정지 또는 ros2_control 미기동)"
+fi
 sleep 2
 
-# ── 3. 나머지 노드 ────────────────────────────────────────────────────────
-echo "[shutdown] [3/3] 나머지 노드 SIGTERM..."
-pkill -TERM -f "pick_place_node" 2>/dev/null || true
-pkill -TERM -f "object_detector" 2>/dev/null || true
-pkill -TERM -f "realsense2_camera_node" 2>/dev/null || true
-pkill -TERM -f "static_transform_publisher" 2>/dev/null || true
-pkill -TERM -f "robot_state_publisher" 2>/dev/null || true
-pkill -TERM -f "dsr_controller2" 2>/dev/null || true
+echo "[shutdown] [2/6] gripper 노드 SIGTERM (grace ${TERM_GRACE}s)..."
+term_pattern "lib/dsr_gripper_tcp/gripper_service_node"
+term_pattern "lib/dsr_realsense_pick_place/gripper_node"
+if ! wait_gone "lib/dsr_gripper_tcp/gripper_service_node" "$TERM_GRACE"; then
+  echo "[shutdown]     gripper_service 아직 실행 중"
+fi
+if ! wait_gone "lib/dsr_realsense_pick_place/gripper_node" 5; then
+  echo "[shutdown]     gripper_node 아직 실행 중"
+fi
+
+echo "[shutdown] [3/6] vision·보조 노드 SIGTERM..."
+term_pattern "lib/dsr_realsense_pick_place/object_detector"
+term_pattern "lib/dsr_realsense_pick_place/ultrasonic_node"
+term_pattern "object_detector"
+term_pattern "ultrasonic_node"
+term_pattern "realsense2_camera_node"
+term_pattern "static_transform_publisher"
 sleep 2
 
-# ── 4. 잔여 프로세스 SIGKILL (ros2_control_node 제외 — 이미 충분히 대기함) ─
-echo "[shutdown] 잔여 프로세스 정리..."
-pkill -KILL -f "gripper_service_node|gripper_node|pick_place_node|object_detector|realsense2_camera_node|robot_state_publisher|static_transform_publisher|dsr_controller2" 2>/dev/null || true
-# ros2_control_node는 마지막에 SIGKILL (이미 6초 대기했으므로 DRCF는 해제됨)
-pkill -KILL -f "ros2_control_node" 2>/dev/null || true
+echo "[shutdown] [4/6] ros2_control_node SIGTERM (DRCF 해제, grace ${DRCF_GRACE}s)..."
+term_pattern "ros2_control_node"
+if ! wait_gone "ros2_control_node" "$DRCF_GRACE"; then
+  echo "[shutdown]     ros2_control_node 아직 실행 중 (DRCF 해제 지연 가능)"
+fi
+
+echo "[shutdown] [5/6] 나머지 노드 SIGTERM..."
+term_pattern "robot_state_publisher"
+term_pattern "controller_manager/spawner"
+term_pattern "rviz2"
+term_pattern "run_emulator"
+term_pattern "dsr_controller2"
+sleep 2
+
+if [ "$KILL_LAUNCH" -eq 1 ]; then
+  echo "[shutdown]     pick_place.launch 부모 SIGTERM..."
+  term_pattern "pick_place.launch.py"
+  wait_gone "pick_place.launch.py" 8 || true
+fi
+
+echo "[shutdown] [6/6] 잔여 프로세스 SIGKILL..."
+for pat in \
+  gripper_service_node \
+  gripper_node \
+  pick_place_node \
+  object_detector \
+  ultrasonic_node \
+  realsense2_camera_node \
+  static_transform_publisher \
+  robot_state_publisher \
+  ros2_control_node \
+  pick_place.launch.py; do
+  if pgrep -f "$pat" >/dev/null 2>&1; then
+    echo "[shutdown]     SIGKILL: ${pat}"
+    kill_pattern "$pat"
+  fi
+done
 
 echo "[shutdown] ===== 종료 완료 ====="

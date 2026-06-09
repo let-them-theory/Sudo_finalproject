@@ -29,7 +29,7 @@ from enum import Enum, auto
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
-from sensor_msgs.msg import JointState
+from sensor_msgs.msg import JointState, Range
 from std_msgs.msg import Int32, String
 from dsr_gripper_tcp_interfaces.msg import GripperState
 from rcl_interfaces.srv import SetParameters
@@ -140,6 +140,15 @@ class PickPlaceNode(Node):
         # 격리 토글: false면 _apply_grip_current()를 완전 우회. 이전 세션 close 동작과 동일하게 되돌림.
         # close 실패가 우리 신규 코드 때문인지 격리 검증용. true(default)로 두면 신규 코드 정상 작동.
         self.declare_parameter('enable_dynamic_grip_current',  True)
+        # ── 아두이노(HC-SR04) 초음파 거리 기반 파지 ──────────────────────
+        # PICK 하강 시 초음파 거리가 grasp_distance_m 이하가 되면 그 자리에서 파지한다.
+        # 센서값이 없거나(미연결) 임계 미달이면 카메라 기반 안전바닥(pose.z+pick_z_offset)에서 파지.
+        self.declare_parameter('use_ultrasonic_grasp',        True)
+        self.declare_parameter('grasp_distance_m',            0.07)   # 70mm 이하면 파지
+        self.declare_parameter('ultrasonic_step_m',           0.01)   # 1회 하강 스텝(m)
+        self.declare_parameter('ultrasonic_settle_sec',       0.15)   # 스텝 후 센서 갱신 대기(s)
+        self.declare_parameter('ultrasonic_range_topic',      '/ultrasonic_range')
+        self.declare_parameter('ultrasonic_max_age_sec',      0.5)    # 이보다 오래된 값은 무효
 
         ns = self.get_parameter('robot_namespace').value
         self.jvel         = self.get_parameter('joint_vel').value
@@ -163,6 +172,15 @@ class PickPlaceNode(Node):
             'object_lost_current_threshold').value
         self.object_lost_debounce_frames = self.get_parameter(
             'object_lost_debounce_frames').value
+
+        # 초음파 거리 기반 파지 파라미터/상태
+        self.use_ultrasonic_grasp = bool(self.get_parameter('use_ultrasonic_grasp').value)
+        self.grasp_distance_m = float(self.get_parameter('grasp_distance_m').value)
+        self.ultrasonic_step_m = float(self.get_parameter('ultrasonic_step_m').value)
+        self.ultrasonic_settle_sec = float(self.get_parameter('ultrasonic_settle_sec').value)
+        self.ultrasonic_max_age_sec = float(self.get_parameter('ultrasonic_max_age_sec').value)
+        self._latest_range_m = None     # 최근 초음파 거리(m), 무효 시 None
+        self._latest_range_t = 0.0      # 최근 수신 시각(monotonic)
 
         # 물체별 파지 전류 맵 구성 (names ↔ currents 1:1). 길이 불일치 시 안전하게 무시.
         self.grip_current_default = int(self.get_parameter('grip_current_default').value)
@@ -297,6 +315,10 @@ class PickPlaceNode(Node):
         self.create_subscription(String, '/selected_object_class', self._cb_selected_class, 10)
         # 사용자가 GUI에서 클릭한 라벨 — pose race 방지 검증용 (사용자 선택과 일관된 pose만 채택)
         self.create_subscription(String, '/selected_object_label', self._cb_selected_label, 10)
+        # 아두이노 초음파 거리 — PICK 하강 시 파지 트리거에 사용
+        self.create_subscription(
+            Range, self.get_parameter('ultrasonic_range_topic').value,
+            self._cb_ultrasonic, 10)
         self.create_service(Trigger, '/pick_place/run_once',       self._srv_run_once)
         self.create_service(Trigger, '/pick_place/go_home',        self._srv_go_home)
         self.create_service(Trigger, '/pick_place/e_stop',         self._srv_e_stop)
@@ -458,6 +480,20 @@ class PickPlaceNode(Node):
     def _cb_selected_class(self, msg: String):
         # object_detector가 선택된 물체 좌표와 함께 발행하는 클래스명. 파지 강도 룩업에 쓴다.
         self._target_object_class = msg.data.strip()
+
+    def _cb_ultrasonic(self, msg: Range):
+        # 아두이노 HC-SR04 거리(m). range<0(=측정 실패)은 무효 처리.
+        if msg.range is not None and msg.range > 0.0:
+            self._latest_range_m = float(msg.range)
+            self._latest_range_t = time.monotonic()
+
+    def _fresh_range(self):
+        """유효하고 최신인 초음파 거리(m)를 반환. 값이 없거나 오래됐으면 None."""
+        if self._latest_range_m is None:
+            return None
+        if time.monotonic() - self._latest_range_t > self.ultrasonic_max_age_sec:
+            return None
+        return self._latest_range_m
 
     def _rebuild_grip_current_map(self, names, currents) -> bool:
         """클래스명↔전류 두 배열로 self.grip_current_map을 재구성한다.
@@ -717,12 +753,41 @@ class PickPlaceNode(Node):
                 elif current == State.PICK:
                     # 충돌 위험이 가장 큰 구간 → 저속(50mm/s) 접근
                     pose = self.target_pose
-                    self.get_logger().info('Pick 위치로 하강')
-                    self._move_to_cart(
-                        pose.pose.position.x,
-                        pose.pose.position.y,
-                        pose.pose.position.z + self.pick_dz,
-                        self._grasp_rpy_for_pose(pose), vel=50.0, acc=100.0)
+                    rpy = self._grasp_rpy_for_pose(pose)
+                    x = pose.pose.position.x
+                    y = pose.pose.position.y
+                    # 카메라 기반 최저 높이 = 안전 바닥. 초음파가 안 잡혀도 이 밑으론 안 내려감.
+                    z_floor = pose.pose.position.z + self.pick_dz
+
+                    if not self.use_ultrasonic_grasp:
+                        # 기존 방식: 카메라 z로 바로 하강
+                        self.get_logger().info('Pick 위치로 하강 (카메라 z)')
+                        self._move_to_cart(x, y, z_floor, rpy, vel=50.0, acc=100.0)
+                    else:
+                        # 초음파 거리 기반: grasp_distance_m 이하 도달 시 그 자리에서 파지
+                        self.get_logger().info(
+                            f'Pick 하강 — 초음파 {self.grasp_distance_m*1000:.0f}mm 도달 시 파지 '
+                            f'(안전바닥 z={z_floor:.3f}m)')
+                        z = pose.pose.position.z + self.pre_pick_dz   # 프리픽 높이에서 시작
+                        while rclpy.ok() and self.state == State.PICK:
+                            rng = self._fresh_range()
+                            if rng is not None and rng <= self.grasp_distance_m:
+                                self.get_logger().info(
+                                    f'초음파 {rng*1000:.0f}mm ≤ '
+                                    f'{self.grasp_distance_m*1000:.0f}mm → 파지')
+                                break
+                            if z <= z_floor + 1e-6:
+                                if rng is None:
+                                    self.get_logger().warn(
+                                        '초음파 값 없음(센서 미연결?) — 안전바닥에서 파지')
+                                else:
+                                    self.get_logger().warn(
+                                        f'안전바닥 도달(초음파 {rng*1000:.0f}mm) — 여기서 파지')
+                                break
+                            z = max(z_floor, z - self.ultrasonic_step_m)
+                            self._move_to_cart(x, y, z, rpy, vel=50.0, acc=100.0)
+                            time.sleep(self.ultrasonic_settle_sec)
+
                     self._gripper_close()
                     self._set_state(State.LIFT)
 
@@ -1596,18 +1661,48 @@ class PickPlaceNode(Node):
         msg.data = 'pick_place_node'
         self.pub_heartbeat.publish(msg)
 
+    def shutdown_safe(self, executor, timeout_sec: float = 3.0):
+        """종료 시 진행 중 모션을 멈춘다 (DRCF 세션 정리 전 best-effort)."""
+        try:
+            if not self.cli_move_stop.service_is_ready():
+                self.get_logger().warning('종료 — move_stop 서비스 미연결')
+                return
+            req = MoveStop.Request()
+            req.stop_mode = 0
+            future = self.cli_move_stop.call_async(req)
+            executor.spin_until_future_complete(future, timeout_sec=timeout_sec)
+            res = future.result() if future.done() else None
+            if res is not None and res.success:
+                self.get_logger().info('종료 — move_stop 완료')
+            else:
+                self.get_logger().warning('종료 — move_stop 응답 없음/실패')
+        except Exception as e:  # noqa: BLE001
+            self.get_logger().warning(f'종료 move_stop 실패: {e}')
+
+
 def main(args=None):
+    import signal
+
     rclpy.init(args=args)
-    from rclpy.executors import MultiThreadedExecutor
+    from rclpy.executors import MultiThreadedExecutor, ExternalShutdownException
     node = PickPlaceNode()
     executor = MultiThreadedExecutor()
     executor.add_node(node)
+
+    def _request_shutdown(signum, _frame):  # noqa: ARG001
+        node.get_logger().info(f'종료 신호 수신 (signum={signum}) — pick_place 정리 중...')
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _request_shutdown)
+    signal.signal(signal.SIGINT, _request_shutdown)
+
     try:
         executor.spin()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         if rclpy.ok():
+            node.shutdown_safe(executor)
             node.destroy_node()
             rclpy.shutdown()
 

@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 # Doosan-E0509-ROBOTIS-RH-P12-RN-TCP-Bridge 패키지의 서비스를 래핑하는 ROS 2 그리퍼 제어 래퍼 노드.
 
+import os
 import threading
 import time
 
 import rclpy
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
-from rclpy.executors import MultiThreadedExecutor
+from rclpy.executors import MultiThreadedExecutor, ExternalShutdownException
 
 from std_srvs.srv import SetBool, Trigger
 from sensor_msgs.msg import JointState
@@ -355,14 +356,34 @@ class GripperNode(Node):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def main(args=None):
+    import signal
+
     rclpy.init(args=args)
     executor = MultiThreadedExecutor(num_threads=4)
     node = None
+
+    def _request_shutdown(signum, _frame):  # noqa: ARG001
+        if node is not None:
+            node.get_logger().info(f'종료 신호 수신 (signum={signum}) — gripper 즉시 정리')
+            try:
+                node.shutdown_safe(executor)
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            if rclpy.ok():
+                rclpy.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, _request_shutdown)
+    signal.signal(signal.SIGINT, _request_shutdown)
+
     try:
         node = GripperNode()
         executor.add_node(node)
         executor.spin()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         if node is not None and rclpy.ok():

@@ -1,13 +1,15 @@
 # 그리퍼 TCP 브릿지를 ROS 서비스와 액션으로 노출하는 단일 소유 노드
 from __future__ import annotations
 
+import os
+import signal
 import threading
 import time
 
 import rclpy
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
-from rclpy.executors import MultiThreadedExecutor
+from rclpy.executors import MultiThreadedExecutor, ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 
@@ -663,6 +665,24 @@ def main(args=None) -> None:
     rclpy.init(args=args)
     node = GripperServiceNode()
     executor = MultiThreadedExecutor(num_threads=4)
+
+    def _request_shutdown(signum, _frame):  # noqa: ARG001
+        # boot_bridge() 블로킹 중 KeyboardInterrupt가 늦게 처리되면 launch가 고아로 남긴다.
+        node.get_logger().info(f'종료 신호 수신 (signum={signum}) — gripper bridge 즉시 정리')
+        try:
+            node.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if rclpy.ok():
+                rclpy.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, _request_shutdown)
+    signal.signal(signal.SIGINT, _request_shutdown)
+
     try:
         node.boot_bridge()
         executor.add_node(node)
@@ -670,13 +690,14 @@ def main(args=None) -> None:
         # 경로를 써야 한다. boot_bridge는 위에서 spin 전 컨텍스트(직접 spin)로 이미 끝났다.
         node._bridge._executor_active = True
         executor.spin()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         executor.shutdown()
         node.shutdown()
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

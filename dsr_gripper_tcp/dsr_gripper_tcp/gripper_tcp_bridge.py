@@ -242,15 +242,25 @@ class DoosanGripperTcpBridge:
 
     def close(self, shutdown_remote: bool = True) -> None:
         try:
-            if shutdown_remote and self._socket is not None:
+            if shutdown_remote:
+                if self._socket is not None:
+                    try:
+                        self._send_request(Command.SHUTDOWN, b"", timeout_sec=2.0)
+                    except Exception as exc:  # noqa: BLE001
+                        self._node.get_logger().warning(
+                            f"Failed to send gripper TCP shutdown packet: {exc}"
+                        )
+                # 소켓이 이미 끊겨도 DRL이 플랜지 RS-485를 쥔 채 남을 수 있으므로
+                # ros2_control이 살아있을 때 DrlStop을 반드시 시도한다.
                 try:
-                    self._send_request(Command.SHUTDOWN, b"", timeout_sec=2.0)
+                    if self.stop_drl(self._config.drl_stop_mode):
+                        settle = min(float(self._config.drl_stop_settle_sec), 5.0)
+                        if settle > 0:
+                            self._wait_for_drl_idle(settle)
                 except Exception as exc:  # noqa: BLE001
-                    self._node.get_logger().warning(f"Failed to send shutdown packet: {exc}")
+                    self._node.get_logger().warning(f"Failed to stop DRL on bridge close: {exc}")
         finally:
-            if self._socket is not None:
-                self._socket.close()
-                self._socket = None
+            self._reset_socket()
 
     def reset_connection(self) -> None:
         self._reset_socket()
