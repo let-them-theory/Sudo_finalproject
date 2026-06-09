@@ -65,6 +65,7 @@ def generate_launch_description():
     pkg_this = get_package_share_directory('dsr_realsense_pick_place')
     params_file = os.path.join(pkg_this, 'config', 'pick_place_params.yaml')
     yolo_model_path = os.path.join(pkg_this, 'models', 'proto.pt')
+    fastsam_weights_path = os.path.join(pkg_this, 'models', 'FastSAM-s.pt')
 
     doosan_bringup = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([
@@ -136,6 +137,7 @@ def generate_launch_description():
         parameters=[params_file, {
             'robot_base_frame': LaunchConfiguration('robot_base_frame'),
             'yolo_model': yolo_model_path,
+            'fastsam_weights': fastsam_weights_path,
         }],
     )
 

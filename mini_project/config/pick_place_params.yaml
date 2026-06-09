@@ -32,6 +32,24 @@ object_detector:
     # GUI 강도 편집기에서 저장 누르면 이 줄도 자동 동기화됨.
     known_classes: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "box", "can", "boxsnack", "wafers"]
 
+    # --- FastSAM unknown(미학습) 물체 검출 ---
+    # known_classes 밖의 물체를 FastSAM 마스크로 잡아 'unknown_N'으로 표시.
+    # launch 실행 시 fastsam_weights는 패키지 내장 models/FastSAM-s.pt 절대경로로 override된다.
+    use_fastsam_unknown: true
+    fastsam_weights: "FastSAM-s.pt"   # 단독 ros2 run 시 기본 — 패키지 models/ 안의 파일명
+    fastsam_conf: 0.5
+    fastsam_iou: 0.7
+    fastsam_imgsz: 640                # FastSAM 입력 크기. 낮추면(416/320) 더 빠름
+    fastsam_every_n: 3                # N프레임마다 FastSAM 실행(부하 1/N)
+    unknown_match_iou: 0.15           # YOLO bbox와 이 IoU 이상 겹친 마스크는 known으로 보고 제외
+    unknown_min_area: 500             # unknown 마스크 최소 픽셀 면적 (ROI 360x240 기준)
+    unknown_max_area: 10000           # unknown 마스크 최대 픽셀 면적
+    unknown_roi_enable: true
+    unknown_roi_w: 360
+    unknown_roi_h: 240
+    unknown_roi_shift_x: 74           # 화면 중앙에서 우측으로
+    unknown_roi_shift_y: 10           # 화면 중앙에서 아래로
+
     # --- 추적/디바운스 (검출 안정화: tracker ID 기반 표시 번호 [1],[2],...) ---
     tracker_type: "botsort_custom.yaml"  # 패키지 share/config 안의 파일명. 없으면 ultralytics 기본 사용
     debounce_appear_sec: 0.0             # 0 = 첫 프레임부터 즉시 노출(검출률 우선). false-positive↑면 0.05~0.15로
