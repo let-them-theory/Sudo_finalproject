@@ -219,6 +219,7 @@ __marimo__/
 
 # Project-specific (runtime repo — no models/training data)
 *.pt
+!mini_project/models/*.pt
 *.onnx
 *.engine
 datasets/
