@@ -29,8 +29,8 @@ from enum import Enum, auto
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
-from sensor_msgs.msg import JointState, Range
-from std_msgs.msg import Int32, String
+from sensor_msgs.msg import JointState
+from std_msgs.msg import Int32, String, Bool
 from dsr_gripper_tcp_interfaces.msg import GripperState
 from rcl_interfaces.srv import SetParameters
 from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType, SetParametersResult
@@ -53,6 +53,11 @@ class _MotionInterrupt(Exception):
     def __init__(self, mode: str):  # 'e_stop' | 'cancel' | 'object_lost'
         super().__init__(mode)
         self.mode = mode
+
+
+class _Unreachable(Exception):
+    """movel이 NOT REACHABLE(도달 불가)로 거부됐을 때 발생 — ERROR가 아닌 '물체 건너뛰기' 신호.
+    잡기 전이면 그리퍼를 일절 안 건드리고 HOME으로(도달불가 후 그리퍼 close → status3 cascade 회피)."""
 
 
 # Doosan 로봇 하드웨어 상태 코드 → 표시 문자열
@@ -114,16 +119,21 @@ class PickPlaceNode(Node):
         self.declare_parameter('workspace_y_max',             0.60)
         self.declare_parameter('workspace_z_min',             0.0)
         self.declare_parameter('workspace_z_max',             0.60)
+        self.declare_parameter('reach_radius_max',            0.65)   # 평면 reach 하드 차단(movel을 범위밖에 안 보냄 → status3 source 차단)
         # TCP Z 절대 하한 (base_link 기준, m). 모든 직교 이동이 이 값보다 낮게 내려가지 못하도록
         # _move_to_cart에서 강제 클램프한다. 검출 오차·잘못된 place 좌표 등 경로와 무관하게 작동.
         # 기본 0.0 = base_link 평면(현재 동작과 동일). 실제 테이블/안전 높이를 알면 그 값으로 올린다.
         self.declare_parameter('min_safe_z',                  0.0)
+        self.declare_parameter('gripper_close_len',           0.145)  # RH-P12-RN close 시 flange→손끝(m). min_safe_z를 flange로 환산.
         self.declare_parameter('robot_base_frame',            'base_link')
         self.declare_parameter('target_pose_topic',           '/selected_object_pose')
         self.declare_parameter('selected_object_topic',       '/selected_object_label')
         self.declare_parameter('use_target_pose_yaw',         True)
         self.declare_parameter('grasp_yaw_offset_deg',        0.0)
         self.declare_parameter('max_grip_pos',                700)
+        # grasp_min_pos: LIFT 후 파지 판정 하한. 이하면 close 명령이 안 먹어 그리퍼가
+        # 거의 열린 상태(안 닫힘) → 파지 실패. (max_grip_pos 초과 = 빈손 완전닫힘)
+        self.declare_parameter('grasp_min_pos',               50)
         # 낙하 감지 절대임계(mA): present_current 크기가 이보다 낮으면 물체 빠짐으로 본다.
         # "전류 0 근처 = 낙하"는 물체·모션 무관한 보편 신호라 절대임계가 견고하다. 가벼운 물체
         # 유지전류(~17mA) 아래, 빠졌을 때(~0mA) 위. 디바운스로 짧은 진동 흡수. (상대 baseline
@@ -135,20 +145,11 @@ class PickPlaceNode(Node):
         self.declare_parameter('grip_current_default',         300)
         self.declare_parameter('grip_class_names',             [''])
         self.declare_parameter('grip_class_currents',          [0])
-        self.declare_parameter('grip_current_min',             100)
+        self.declare_parameter('grip_current_min',             80)
         self.declare_parameter('grip_current_max',             500)
         # 격리 토글: false면 _apply_grip_current()를 완전 우회. 이전 세션 close 동작과 동일하게 되돌림.
         # close 실패가 우리 신규 코드 때문인지 격리 검증용. true(default)로 두면 신규 코드 정상 작동.
         self.declare_parameter('enable_dynamic_grip_current',  True)
-        # ── 아두이노(HC-SR04) 초음파 거리 기반 파지 ──────────────────────
-        # PICK 하강 시 초음파 거리가 grasp_distance_m 이하가 되면 그 자리에서 파지한다.
-        # 센서값이 없거나(미연결) 임계 미달이면 카메라 기반 안전바닥(pose.z+pick_z_offset)에서 파지.
-        self.declare_parameter('use_ultrasonic_grasp',        True)
-        self.declare_parameter('grasp_distance_m',            0.07)   # 70mm 이하면 파지
-        self.declare_parameter('ultrasonic_step_m',           0.01)   # 1회 하강 스텝(m)
-        self.declare_parameter('ultrasonic_settle_sec',       0.15)   # 스텝 후 센서 갱신 대기(s)
-        self.declare_parameter('ultrasonic_range_topic',      '/ultrasonic_range')
-        self.declare_parameter('ultrasonic_max_age_sec',      0.5)    # 이보다 오래된 값은 무효
 
         ns = self.get_parameter('robot_namespace').value
         self.jvel         = self.get_parameter('joint_vel').value
@@ -160,6 +161,7 @@ class PickPlaceNode(Node):
         self.pre_pick_dz  = self.get_parameter('pre_pick_z_offset').value
         self.pick_dz      = self.get_parameter('pick_z_offset').value
         self.min_safe_z   = float(self.get_parameter('min_safe_z').value)
+        self.gripper_close_len = float(self.get_parameter('gripper_close_len').value)
         self.grasp_rpy    = self.get_parameter('grasp_rpy').value
         self.place_pos    = self.get_parameter('place_position').value
         self.pre_place_dz = self.get_parameter('pre_place_z_offset').value
@@ -168,19 +170,11 @@ class PickPlaceNode(Node):
         self.use_target_pose_yaw = self.get_parameter('use_target_pose_yaw').value
         self.grasp_yaw_offset_deg = self.get_parameter('grasp_yaw_offset_deg').value
         self.max_grip_pos = self.get_parameter('max_grip_pos').value
+        self.grasp_min_pos = self.get_parameter('grasp_min_pos').value
         self.object_lost_current_threshold = self.get_parameter(
             'object_lost_current_threshold').value
         self.object_lost_debounce_frames = self.get_parameter(
             'object_lost_debounce_frames').value
-
-        # 초음파 거리 기반 파지 파라미터/상태
-        self.use_ultrasonic_grasp = bool(self.get_parameter('use_ultrasonic_grasp').value)
-        self.grasp_distance_m = float(self.get_parameter('grasp_distance_m').value)
-        self.ultrasonic_step_m = float(self.get_parameter('ultrasonic_step_m').value)
-        self.ultrasonic_settle_sec = float(self.get_parameter('ultrasonic_settle_sec').value)
-        self.ultrasonic_max_age_sec = float(self.get_parameter('ultrasonic_max_age_sec').value)
-        self._latest_range_m = None     # 최근 초음파 거리(m), 무효 시 None
-        self._latest_range_t = 0.0      # 최근 수신 시각(monotonic)
 
         # 물체별 파지 전류 맵 구성 (names ↔ currents 1:1). 길이 불일치 시 안전하게 무시.
         self.grip_current_default = int(self.get_parameter('grip_current_default').value)
@@ -236,6 +230,8 @@ class PickPlaceNode(Node):
         self._last_alarm_signature = None
         self.cli_gripper_open  = self.create_client(Trigger, '/gripper/open')
         self.cli_gripper_close = self.create_client(Trigger, '/gripper/close')
+        self.cli_gripper_hold_transport = self.create_client(Trigger, '/gripper/hold_transport')
+        self.cli_gripper_hold_idle = self.create_client(Trigger, '/gripper/hold_idle')
         # 그리퍼 런타임 리셋(재초기화) — 에러 복구 시 그리퍼 stuck을 함께 푼다.
         self.cli_gripper_reinit = self.create_client(Trigger, '/gripper_service/reinitialize')
         # 긴급정지(EMO) 시 그리퍼 토크를 끊기 위한 클라이언트. /gripper/stop = torque OFF.
@@ -285,6 +281,7 @@ class PickPlaceNode(Node):
         # status3(STATUS_IO_ERROR) false-positive 차단용 — 직전 GripperState.status 캐시.
         # 0이 아니면 그리퍼 통신 일시 장애 상태이므로 낙하 판정을 보류한다.
         self._gripper_last_status: int = 0
+        self._gripper_last_pos: float = 0.0  # 최근 그리퍼 위치(present_position) — LIFT 후 파지 판정용
         # 그리퍼 준비 상태(=torque_enabled). False면 새 픽 사이클 거절 — 에러 해제 직후 reinit
         # 진행 중일 때 run_once가 들어와 TCP race가 나는 시나리오 차단.
         self._gripper_ready: bool = False
@@ -294,6 +291,8 @@ class PickPlaceNode(Node):
 
         # ── 퍼블리셔 / 구독 ─────────────────────────────────────────────
         self.pub_state       = self.create_publisher(String,          '/pick_place_state', 10)
+        self.pub_error       = self.create_publisher(String,          '/pick_place_error', 10)
+        self.pub_motion_active = self.create_publisher(Bool, '/gripper_service/motion_active', 10)
         self.pub_hw_state    = self.create_publisher(Int32,           '/robot_hw_state', 10)
         self.pub_speed_mode  = self.create_publisher(Int32,           '/robot_speed_mode', 10)
         self.pub_torque_rt   = self.create_publisher(TorqueRtStream,  f'{prefix}/torque_rt_stream', 10)
@@ -315,10 +314,6 @@ class PickPlaceNode(Node):
         self.create_subscription(String, '/selected_object_class', self._cb_selected_class, 10)
         # 사용자가 GUI에서 클릭한 라벨 — pose race 방지 검증용 (사용자 선택과 일관된 pose만 채택)
         self.create_subscription(String, '/selected_object_label', self._cb_selected_label, 10)
-        # 아두이노 초음파 거리 — PICK 하강 시 파지 트리거에 사용
-        self.create_subscription(
-            Range, self.get_parameter('ultrasonic_range_topic').value,
-            self._cb_ultrasonic, 10)
         self.create_service(Trigger, '/pick_place/run_once',       self._srv_run_once)
         self.create_service(Trigger, '/pick_place/go_home',        self._srv_go_home)
         self.create_service(Trigger, '/pick_place/e_stop',         self._srv_e_stop)
@@ -481,20 +476,6 @@ class PickPlaceNode(Node):
         # object_detector가 선택된 물체 좌표와 함께 발행하는 클래스명. 파지 강도 룩업에 쓴다.
         self._target_object_class = msg.data.strip()
 
-    def _cb_ultrasonic(self, msg: Range):
-        # 아두이노 HC-SR04 거리(m). range<0(=측정 실패)은 무효 처리.
-        if msg.range is not None and msg.range > 0.0:
-            self._latest_range_m = float(msg.range)
-            self._latest_range_t = time.monotonic()
-
-    def _fresh_range(self):
-        """유효하고 최신인 초음파 거리(m)를 반환. 값이 없거나 오래됐으면 None."""
-        if self._latest_range_m is None:
-            return None
-        if time.monotonic() - self._latest_range_t > self.ultrasonic_max_age_sec:
-            return None
-        return self._latest_range_m
-
     def _rebuild_grip_current_map(self, names, currents) -> bool:
         """클래스명↔전류 두 배열로 self.grip_current_map을 재구성한다.
         길이가 다르면 기존 맵을 유지하고 False를 반환(설정 거부 용)."""
@@ -581,6 +562,7 @@ class PickPlaceNode(Node):
     def _cb_gripper_status(self, msg: GripperState):
         # status는 낙하 판정 게이트, ready는 신규 픽 사이클 게이트로 사용.
         self._gripper_last_status = int(msg.status)
+        self._gripper_last_pos = float(msg.present_position)
         self._gripper_ready = bool(msg.ready)
 
     def _cb_gripper_state(self, msg: JointState):
@@ -588,11 +570,10 @@ class PickPlaceNode(Node):
             return
 
         idx = msg.name.index('gripper_joint')
-        if idx >= len(msg.position) or idx >= len(msg.effort):
+        if idx >= len(msg.position):
             return
 
         pos = float(msg.position[idx])
-        curr = float(msg.effort[idx])
 
         with self.state_lock:
             current_state = self.state
@@ -603,26 +584,21 @@ class PickPlaceNode(Node):
             self._object_lost_debounce_count = 0
             return
 
-        # 전류(effort)는 부호 있음(닫는 방향에 따라 음수 가능) → 크기로 본다. (H1)
-        mag = abs(curr)
-
-        # 통신 장애(status3 등) 또는 폴링 실패(stale curr=0)면 낙하 판정 보류.
-        gripper_status_bad = (self._gripper_last_status != 0)
-        curr_stale = (curr == 0.0)
-        if gripper_status_bad or curr_stale:
+        # 통신 장애(status3 등)면 위치도 못 믿으니 낙하 판정 보류.
+        if self._gripper_last_status != 0:
             return
 
-        # 낙하 판정: 전류가 거의 0(절대임계 미만)이면 물체가 빠진 것(반력 사라짐). "0 근처 = 낙하"는
-        # 물체·모션과 무관한 보편 신호다. (상대 baseline 방식은 모션 전류 변동(정적31↔동적150mA)에
-        # 취약해 폐기.) 보조: 위치가 완전히 닫힘(pos>max)이면 물체 없음.
-        object_lost_condition = (mag < self.object_lost_current_threshold) or (pos > self.max_grip_pos)
+        # 낙하 판정: 위치 기반. 물체를 쥐면 pos가 물체 두께(<max)에서 멈추고, 빠지면
+        # 그리퍼가 완전닫힘(>max)으로 더 닫힌다(goal=1000 유지). 저전류 운영 시 전류 기반은
+        # 정지구간 present_current가 낮아 상시 오탐이라 폐기하고 위치로 전환했다.
+        object_lost_condition = (pos > self.max_grip_pos)
 
         if object_lost_condition:
             self._object_lost_debounce_count += 1
             if self._object_lost_debounce_count >= self.object_lost_debounce_frames:
                 self.get_logger().error(
                     f'물체 탈조 낙하 감지 ({self._object_lost_debounce_count}프레임 지속): '
-                    f'전류={mag:.1f}mA < 임계{self.object_lost_current_threshold}mA, 위치={pos:.1f}')
+                    f'위치={pos:.1f} > max_grip_pos {self.max_grip_pos}')
                 self._object_lost_debounce_count = 0
                 self._trigger_object_lost_stop()
         else:
@@ -651,6 +627,7 @@ class PickPlaceNode(Node):
         if self.cli_move_stop.service_is_ready():
             req = MoveStop.Request()
             req.stop_mode = 1  # QUICK_STOP
+            self._set_motion_active(True)  # move_stop도 컨트롤러 점유 → 폴링 조율(타임아웃 가드가 재개)
             self.cli_move_stop.call_async(req)
         else:
             self.get_logger().warn('move_stop 서비스 미연결. 인터럽트로만 모션을 중단합니다.')
@@ -716,6 +693,7 @@ class PickPlaceNode(Node):
                         self._finish_cycle()
                 except Exception as e:
                     self.get_logger().error(f'수동 명령 예외({command}): {e}')
+                    self._publish_error(str(e))
                     self._set_state(State.ERROR)
                 continue
 
@@ -753,41 +731,12 @@ class PickPlaceNode(Node):
                 elif current == State.PICK:
                     # 충돌 위험이 가장 큰 구간 → 저속(50mm/s) 접근
                     pose = self.target_pose
-                    rpy = self._grasp_rpy_for_pose(pose)
-                    x = pose.pose.position.x
-                    y = pose.pose.position.y
-                    # 카메라 기반 최저 높이 = 안전 바닥. 초음파가 안 잡혀도 이 밑으론 안 내려감.
-                    z_floor = pose.pose.position.z + self.pick_dz
-
-                    if not self.use_ultrasonic_grasp:
-                        # 기존 방식: 카메라 z로 바로 하강
-                        self.get_logger().info('Pick 위치로 하강 (카메라 z)')
-                        self._move_to_cart(x, y, z_floor, rpy, vel=50.0, acc=100.0)
-                    else:
-                        # 초음파 거리 기반: grasp_distance_m 이하 도달 시 그 자리에서 파지
-                        self.get_logger().info(
-                            f'Pick 하강 — 초음파 {self.grasp_distance_m*1000:.0f}mm 도달 시 파지 '
-                            f'(안전바닥 z={z_floor:.3f}m)')
-                        z = pose.pose.position.z + self.pre_pick_dz   # 프리픽 높이에서 시작
-                        while rclpy.ok() and self.state == State.PICK:
-                            rng = self._fresh_range()
-                            if rng is not None and rng <= self.grasp_distance_m:
-                                self.get_logger().info(
-                                    f'초음파 {rng*1000:.0f}mm ≤ '
-                                    f'{self.grasp_distance_m*1000:.0f}mm → 파지')
-                                break
-                            if z <= z_floor + 1e-6:
-                                if rng is None:
-                                    self.get_logger().warn(
-                                        '초음파 값 없음(센서 미연결?) — 안전바닥에서 파지')
-                                else:
-                                    self.get_logger().warn(
-                                        f'안전바닥 도달(초음파 {rng*1000:.0f}mm) — 여기서 파지')
-                                break
-                            z = max(z_floor, z - self.ultrasonic_step_m)
-                            self._move_to_cart(x, y, z, rpy, vel=50.0, acc=100.0)
-                            time.sleep(self.ultrasonic_settle_sec)
-
+                    self.get_logger().info('Pick 위치로 하강')
+                    self._move_to_cart(
+                        pose.pose.position.x,
+                        pose.pose.position.y,
+                        pose.pose.position.z + self.pick_dz,
+                        self._grasp_rpy_for_pose(pose), vel=50.0, acc=100.0)
                     self._gripper_close()
                     self._set_state(State.LIFT)
 
@@ -800,7 +749,23 @@ class PickPlaceNode(Node):
                         pose.pose.position.y,
                         pose.pose.position.z + self.pre_pick_dz,
                         self._grasp_rpy_for_pose(pose))
-                    self._set_state(State.MOVE_TO_PLACE)
+                    # 파지 확정 판정 — 들어올린 후(중력 테스트)에 위치로 판단.
+                    # close 순간의 지터·통신노이즈를 피해 안정된 시점에 판정한다.
+                    grasp_pos = self._gripper_last_pos
+                    if grasp_pos <= self.grasp_min_pos:
+                        self.get_logger().error(
+                            f'파지 실패 — 그리퍼 안 닫힘 (pos={grasp_pos:.0f} ≤ {self.grasp_min_pos}). HOME 복귀.')
+                        self._set_state(State.HOME)
+                    elif grasp_pos > self.max_grip_pos:
+                        self.get_logger().error(
+                            f'파지 실패 — 빈손 완전닫힘 (pos={grasp_pos:.0f} > {self.max_grip_pos}). HOME 복귀.')
+                        self._set_state(State.HOME)
+                    else:
+                        self.get_logger().info(f'파지 확정 (pos={grasp_pos:.0f}).')
+                        # 파지 확정 → 이송 전류로 낮춰 들고 이동 (발열·과압착 완화, self-locking이 유지)
+                        self._call_service(self.cli_gripper_hold_transport, Trigger.Request(),
+                                           'gripper/hold_transport', timeout=5.0)
+                        self._set_state(State.MOVE_TO_PLACE)
 
                 elif current == State.MOVE_TO_PLACE:
                     # Place 위치 상단으로 수평 이동 후 최종 하강
@@ -864,8 +829,22 @@ class PickPlaceNode(Node):
                     self.get_logger().info('태스크 취소: 모션 정지, 현 위치 유지 (HOME/그리퍼는 사용자 명령으로)')
                     self._finish_cycle()
 
+            except _Unreachable as ue:
+                self.get_logger().warn(f'🔴 도달 불가 — 물체 건너뜀: {ue}')
+                self._publish_error(str(ue))
+                with self.state_lock:
+                    st = self.state
+                if st in (State.LIFT, State.MOVE_TO_PLACE, State.PLACE):
+                    # 이미 파지한 뒤 → 허공 낙하 방지 위해 그리퍼 안 건드리고 ERROR(수동 복구)
+                    self.get_logger().warn('이미 파지 상태 — 안전하게 ERROR로 정지(물체 든 채).')
+                    self._set_state(State.ERROR)
+                else:
+                    # 잡기 전(접근 중) → 그리퍼 일절 안 건드리고 HOME로 (도달불가 후 close → status3 cascade 회피)
+                    self._set_state(State.HOME)
+
             except Exception as e:
                 self.get_logger().error(f'상태머신 예외: {e}')
+                self._publish_error(str(e))
                 self._set_state(State.ERROR)
 
     def _set_state(self, s: State):
@@ -941,6 +920,12 @@ class PickPlaceNode(Node):
         self._clear_target()
         self._clear_selected_label()
         self._set_state(State.IDLE)
+        # idle 위치락 — 작업 완료 후 전류 튐/채터링 완화 (best-effort, 실패해도 무방)
+        if self.cli_gripper_hold_idle.service_is_ready():
+            try:
+                self.cli_gripper_hold_idle.call_async(Trigger.Request())
+            except Exception:
+                pass
 
     def _clear_selected_label(self):
         msg = String()
@@ -1026,6 +1011,7 @@ class PickPlaceNode(Node):
         if self.cli_move_stop.service_is_ready():
             req = MoveStop.Request()
             req.stop_mode = 2  # DR_SSTOP (Soft Stop — 부드러운 감속, 서보 유지)
+            self._set_motion_active(True)  # move_stop도 컨트롤러 점유 → 폴링 조율(타임아웃 가드가 재개)
             self.cli_move_stop.call_async(req)
         else:
             self.get_logger().warn('move_stop 서비스 미연결. 인터럽트로만 모션을 중단합니다.')
@@ -1384,7 +1370,12 @@ class PickPlaceNode(Node):
             return
         req = MoveStop.Request()
         req.stop_mode = stop_mode
-        self._call_service(self.cli_move_stop, req, f'move_stop(mode={stop_mode})', timeout=5.0)
+        # move_stop도 컨트롤러를 점유 → 진행 중 그리퍼 통신과 경합(소켓 오염). 폴링 조율로 감싼다.
+        self._set_motion_active(True)
+        try:
+            self._call_service(self.cli_move_stop, req, f'move_stop(mode={stop_mode})', timeout=5.0)
+        finally:
+            self._set_motion_active(False)
 
     def _poll_hw_state(self):
         if self.cli_get_robot_state.service_is_ready():
@@ -1440,6 +1431,35 @@ class PickPlaceNode(Node):
         msg.data = name
         self.pub_state.publish(msg)
 
+    def _classify_error(self, text: str) -> str:
+        """에러 메시지를 카테고리로 분류 — GUI status 바에 '어떤 에러인지' 표기용."""
+        t = (text or '').lower()
+        if 'reachable' in t or '1206' in t:
+            return '🔴 도달 불가 — 작업영역/IK 밖 (물체 위치 조정)'
+        if 'singular' in t or '3205' in t or '3206' in t:
+            return '🟠 특이점 영역 — 경로/자세 회피 필요'
+        if 'status 3' in t or 'io_error' in t or 'io error' in t or 'status3' in t:
+            return '🔴 그리퍼 통신 끊김 (status3) — 재시작 필요'
+        if 'gripper/close' in t or '파지' in t or 'grasp' in t:
+            return '🟠 파지 실패 — 빈손/안닫힘'
+        if 'robot_mode' in t or 'auto 준비' in t or 'standby' in t:
+            return '⏳ 로봇 모드 준비 전 — 잠시 후 재시도'
+        if 'collision' in t or '충돌' in t:
+            return '🔴 충돌 감지 — 정지'
+        return f'⚠ 에러: {text[:60]}'
+
+    def _publish_error(self, text: str):
+        """ERROR 진입 시 분류된 에러 사유를 발행 (GUI status 바 표기)."""
+        msg = String()
+        msg.data = self._classify_error(text)
+        self.pub_error.publish(msg)
+
+    def _set_motion_active(self, active: bool):
+        """모션(movel/movej/move_stop) 진행을 그리퍼 폴링에 알림 → 모션 중 폴링 skip(컨트롤러 경합·소켓 오염 회피)."""
+        msg = Bool()
+        msg.data = active
+        self.pub_motion_active.publish(msg)
+
     def _check_motion_alarm(self, move_name: str) -> None:
         """movel/movej 호출 후 controller alarm 발생 여부 즉시 점검.
         새 알람이고 level >= 2(Error) 이면 RuntimeError 발생 → 상태머신이 ERROR로 전환.
@@ -1476,8 +1496,12 @@ class PickPlaceNode(Node):
             f'🚨 모션 알람 감지 ({move_name}): level={a.level}, group={a.group}, '
             f'index={a.index} | {params}'
         )
-        # level 2+(Error)면 ERROR 상태로 전환 (RuntimeError → 상태머신 outer try가 잡음)
+        # level 2+(Error)면 상태머신으로 신호.
         if int(a.level) >= 2:
+            # NOT REACHABLE(도달 불가, index 1206)은 ERROR가 아닌 '물체 건너뛰기'로 분기.
+            # (잡기 전이면 그리퍼 안 건드리고 HOME → 도달불가 후 close 시도 status3 cascade 회피)
+            if int(a.index) == 1206 or 'reachable' in params.lower():
+                raise _Unreachable(f'{move_name} 도달 불가 (alarm {a.index})')
             raise RuntimeError(
                 f'controller alarm {a.index} (level {a.level}) — {move_name} 실패'
             )
@@ -1492,17 +1516,32 @@ class PickPlaceNode(Node):
         req.mode      = 0
         req.blend_type = 0
         req.sync_type  = 0
-        self._call_service(self.cli_movej, req, 'move_joint(home)', timeout=30.0)
-        self._check_motion_alarm('movej(home)')
+        self._set_motion_active(True)
+        try:
+            self._call_service(self.cli_movej, req, 'move_joint(home)', timeout=30.0)
+            self._check_motion_alarm('movej(home)')
+        finally:
+            self._set_motion_active(False)
 
     def _move_to_cart(self, x, y, z, rpy, vel=None, acc=None):
+        # ★ 범위 밖 좌표는 movel을 아예 보내지 않는다(source 차단). movel NOT REACHABLE 알람이
+        # 컨트롤러를 교란해 그리퍼 RS-485 폴링을 죽이므로(status3), 평면 reach 밖이면 여기서 막는다.
+        _r = math.hypot(x, y)
+        _reach_max = self.get_parameter('reach_radius_max').value
+        if _r > _reach_max:
+            raise _Unreachable(
+                f'범위 밖 차단 — 평면반경 {_r:.3f}m > reach {_reach_max:.3f}m (movel 미전송)')
         # TCP Z 절대 하한 강제. 모든 직교 이동이 이 함수를 거치므로 여기 한 곳에서 막으면
         # 검출 오차·잘못된 목표 좌표 등 어떤 경로로 들어온 값이든 하한 아래로는 못 내려간다.
-        if z < self.min_safe_z:
+        # min_safe_z = 그리퍼 close 손끝이 닿으면 안 되는 최저 Z(테이블/지그). calibration과 무관.
+        # movel z는 flange 좌표(TCP 미설정)라, close 길이만큼 빼야 실제 손끝 높이가 된다.
+        fingertip_z = z - self.gripper_close_len
+        if fingertip_z < self.min_safe_z:
+            new_z = self.min_safe_z + self.gripper_close_len
             self.get_logger().warn(
-                f'Z 하한 클램프: 요청 z={z:.3f}m < min_safe_z={self.min_safe_z:.3f}m. '
-                f'{self.min_safe_z:.3f}m로 제한합니다.')
-            z = self.min_safe_z
+                f'Z 하한 클램프: 손끝 z={fingertip_z:.3f}m < min_safe_z={self.min_safe_z:.3f}m '
+                f'(close 길이 {self.gripper_close_len:.3f}m). flange z {z:.3f}→{new_z:.3f}m로 올림.')
+            z = new_z
         req = MoveLine.Request()
         req.pos       = [x * 1000.0, y * 1000.0, z * 1000.0,
                          float(rpy[0]), float(rpy[1]), float(rpy[2])]
@@ -1514,9 +1553,13 @@ class PickPlaceNode(Node):
         req.mode      = 0
         req.blend_type = 0
         req.sync_type  = 0
-        self._call_service(self.cli_movel, req,
-                           f'move_line({x:.3f},{y:.3f},{z:.3f})', timeout=30.0)
-        self._check_motion_alarm(f'movel({x:.3f},{y:.3f},{z:.3f})')
+        self._set_motion_active(True)
+        try:
+            self._call_service(self.cli_movel, req,
+                               f'move_line({x:.3f},{y:.3f},{z:.3f})', timeout=30.0)
+            self._check_motion_alarm(f'movel({x:.3f},{y:.3f},{z:.3f})')
+        finally:
+            self._set_motion_active(False)
 
     def _grasp_rpy_for_pose(self, pose: PoseStamped):
         rpy = [float(v) for v in self.grasp_rpy]
@@ -1661,48 +1704,18 @@ class PickPlaceNode(Node):
         msg.data = 'pick_place_node'
         self.pub_heartbeat.publish(msg)
 
-    def shutdown_safe(self, executor, timeout_sec: float = 3.0):
-        """종료 시 진행 중 모션을 멈춘다 (DRCF 세션 정리 전 best-effort)."""
-        try:
-            if not self.cli_move_stop.service_is_ready():
-                self.get_logger().warning('종료 — move_stop 서비스 미연결')
-                return
-            req = MoveStop.Request()
-            req.stop_mode = 0
-            future = self.cli_move_stop.call_async(req)
-            executor.spin_until_future_complete(future, timeout_sec=timeout_sec)
-            res = future.result() if future.done() else None
-            if res is not None and res.success:
-                self.get_logger().info('종료 — move_stop 완료')
-            else:
-                self.get_logger().warning('종료 — move_stop 응답 없음/실패')
-        except Exception as e:  # noqa: BLE001
-            self.get_logger().warning(f'종료 move_stop 실패: {e}')
-
-
 def main(args=None):
-    import signal
-
     rclpy.init(args=args)
-    from rclpy.executors import MultiThreadedExecutor, ExternalShutdownException
+    from rclpy.executors import MultiThreadedExecutor
     node = PickPlaceNode()
     executor = MultiThreadedExecutor()
     executor.add_node(node)
-
-    def _request_shutdown(signum, _frame):  # noqa: ARG001
-        node.get_logger().info(f'종료 신호 수신 (signum={signum}) — pick_place 정리 중...')
-        raise KeyboardInterrupt
-
-    signal.signal(signal.SIGTERM, _request_shutdown)
-    signal.signal(signal.SIGINT, _request_shutdown)
-
     try:
         executor.spin()
-    except (KeyboardInterrupt, ExternalShutdownException):
+    except KeyboardInterrupt:
         pass
     finally:
         if rclpy.ok():
-            node.shutdown_safe(executor)
             node.destroy_node()
             rclpy.shutdown()
 

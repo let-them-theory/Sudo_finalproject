@@ -242,25 +242,15 @@ class DoosanGripperTcpBridge:
 
     def close(self, shutdown_remote: bool = True) -> None:
         try:
-            if shutdown_remote:
-                if self._socket is not None:
-                    try:
-                        self._send_request(Command.SHUTDOWN, b"", timeout_sec=2.0)
-                    except Exception as exc:  # noqa: BLE001
-                        self._node.get_logger().warning(
-                            f"Failed to send gripper TCP shutdown packet: {exc}"
-                        )
-                # 소켓이 이미 끊겨도 DRL이 플랜지 RS-485를 쥔 채 남을 수 있으므로
-                # ros2_control이 살아있을 때 DrlStop을 반드시 시도한다.
+            if shutdown_remote and self._socket is not None:
                 try:
-                    if self.stop_drl(self._config.drl_stop_mode):
-                        settle = min(float(self._config.drl_stop_settle_sec), 5.0)
-                        if settle > 0:
-                            self._wait_for_drl_idle(settle)
+                    self._send_request(Command.SHUTDOWN, b"", timeout_sec=2.0)
                 except Exception as exc:  # noqa: BLE001
-                    self._node.get_logger().warning(f"Failed to stop DRL on bridge close: {exc}")
+                    self._node.get_logger().warning(f"Failed to send shutdown packet: {exc}")
         finally:
-            self._reset_socket()
+            if self._socket is not None:
+                self._socket.close()
+                self._socket = None
 
     def reset_connection(self) -> None:
         self._reset_socket()
@@ -484,14 +474,39 @@ class DoosanGripperTcpBridge:
             self._sequence = 1
 
         if response_command != int(command):
+            self._flush_socket()   # desync: 소켓에 남은 stale 응답 비워 연쇄 오염 차단
             raise UnexpectedResponseError(
                 f"Unexpected response command {response_command}, expected {int(command)}."
             )
         if response_sequence != expected_sequence:
+            self._flush_socket()
             raise UnexpectedResponseError(
                 f"Unexpected response sequence {response_sequence}, expected {expected_sequence}."
             )
         return response_payload
+
+    def _flush_socket(self) -> None:
+        """desync 감지 시 소켓 버퍼에 남은 stale 응답을 모두 비운다(소켓 오염 연쇄 차단).
+        막혔던/늦은 응답이 다음 read로 새지 않게 — '철저하게 소켓 오염 방지'의 핵심."""
+        sock = self._socket
+        if sock is None:
+            return
+        try:
+            sock.setblocking(False)
+            while True:
+                try:
+                    data = sock.recv(4096)
+                except (BlockingIOError, InterruptedError):
+                    break
+                if not data:
+                    break
+        except OSError:
+            pass
+        finally:
+            try:
+                sock.setblocking(True)
+            except OSError:
+                pass
 
     def _is_recoverable_exception(self, exc: Exception) -> bool:
         return isinstance(
@@ -829,6 +844,7 @@ class DoosanGripperTcpBridge:
                 # 이전 DRL 세션이 stop됐어도 플랜지 RS-485 핸들을 쥔 채 남는 경우가 있어
                 # 그러면 새 open이 무응답으로 막힘 → PC 40s timeout 폭포처럼 발생.
                 # close → open으로 명시적 cycle하면 첫 attempt부터 깨끗한 상태 보장.
+                # [검증완료 2026-06-09] recycle 제거해도 INITIALIZE 156s로 안 빨라짐 → recycle은 속도 원인 아님. 복원.
                 try:
                     flange_serial_close()
                 except:
@@ -848,7 +864,7 @@ class DoosanGripperTcpBridge:
                 # ※ host의 init_timeout_sec(>=40s)가 이 윈도우보다 커야 함.
                 attempts = 0
                 enable_ok = False
-                while attempts < 24:
+                while attempts < 10:  # [검증] 토크enable 10회(~15s 블로킹). DRL 안 죽을 정도 + 모터 흡수 충분한 중간값 탐색.
                     try:
                         flange_serial_write(modbus_fc06(ADDR_TORQUE_ENABLE, 1))
                         ok, val = recv_modbus_response(1.0, 8)

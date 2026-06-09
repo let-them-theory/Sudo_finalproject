@@ -7,11 +7,9 @@ from launch.actions import (
     DeclareLaunchArgument,
     ExecuteProcess,
     IncludeLaunchDescription,
-    RegisterEventHandler,
     TimerAction,
 )
 from launch.conditions import IfCondition
-from launch.event_handlers import OnProcessExit, OnProcessStart, OnShutdown
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -53,16 +51,6 @@ ARGUMENTS = [
                           description='Fallback: launch에서 set_robot_mode service call 실행 여부'),
     DeclareLaunchArgument('gripper_tcp_port', default_value='20002',
                           description='컨트롤러 DRL 그리퍼 TCP 서버 포트'),
-    DeclareLaunchArgument('use_ultrasonic', default_value='true',
-                          description='아두이노 HC-SR04 초음파 거리 노드 실행 여부'),
-    DeclareLaunchArgument('ultrasonic_port', default_value='/dev/ttyACM0',
-                          description='아두이노 시리얼 포트 (보통 /dev/ttyACM0 또는 /dev/ttyUSB0)'),
-    DeclareLaunchArgument('ultrasonic_baudrate', default_value='9600',
-                          description='아두이노 시리얼 baudrate (현장 스케치: 9600)'),
-    DeclareLaunchArgument('robot_ready_timeout_sec', default_value='120',
-                          description='ros2_control/DRL 서비스 대기 최대 시간(초)'),
-    DeclareLaunchArgument('gripper_ready_timeout_sec', default_value='90',
-                          description='gripper_service ready 대기 최대 시간(초)'),
 ]
 
 
@@ -70,9 +58,6 @@ def generate_launch_description():
 
     pkg_this = get_package_share_directory('dsr_realsense_pick_place')
     params_file = os.path.join(pkg_this, 'config', 'pick_place_params.yaml')
-    wait_robot_script = os.path.join(pkg_this, 'scripts', 'wait_for_robot_ready.sh')
-    wait_gripper_script = os.path.join(pkg_this, 'scripts', 'wait_for_gripper_ready.py')
-    launch_cleanup_script = os.path.join(pkg_this, 'scripts', 'launch_cleanup.sh')
 
     doosan_bringup = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([
@@ -160,121 +145,61 @@ def generate_launch_description():
         ],
     )
 
-    # ── 이벤트 기반 그리퍼 / pick_place 기동 ─────────────────────────────
-    # 1) wait_for_robot_ready (drl_start) → 2) gripper 노드 →
-    # 3) wait_for_gripper_ready (state.ready) → 4) pick_place_node
-
-    wait_robot_ready = ExecuteProcess(
-        cmd=[
-            'bash', wait_robot_script,
-            LaunchConfiguration('robot_name'),
-            LaunchConfiguration('robot_ready_timeout_sec'),
-        ],
-        output='screen',
-        name='wait_for_robot_ready',
+    gripper = TimerAction(
+        period=10.0,
+        actions=[
+            Node(
+                package='dsr_gripper_tcp',
+                executable='gripper_service_node',
+                name='gripper_service',
+                output='screen',
+                parameters=[{
+                    'controller_host': LaunchConfiguration('host'),
+                    'tcp_port': LaunchConfiguration('gripper_tcp_port'),
+                    'namespace': LaunchConfiguration('robot_name'),
+                    'goal_current': 400,
+                    'profile_velocity': 1500,
+                    'profile_acceleration': 1000,
+                    'connect_timeout_sec': 60.0,
+                    'post_drl_start_sleep_sec': 2.0,
+                    'drl_idle_stable_sec': 2.0,
+                    'tcp_server_open_retry_sec': 0.5,
+                    'poll_rate_hz': 10.0,          # RS-485 폴링 20→10Hz. 부하 절반으로 모션 경합 시 status3 회피(stroke 시절 10Hz). 실험중.
+                    # DRL이 시작 즉시 시리얼 포트를 강제 recycle하므로 첫 시도에 성공 가능성 높음.
+                    # 그래도 cold-boot/motor stuck 대비 PC 재시도는 남겨둔다.
+                    'init_attempts': 20,           # [검증] 콜드부팅 흡수 보험(토크10 × host 20회)
+                                                   #   대비한 보험. 3회로 줄였다가 final_failed 빈발 → 8회로 강화.
+                    'init_timeout_sec': 22.0,      # [검증] 토크 10회(~15s)+여유
+                                                   #   단 timeout만으론 부족 — DRL이 죽으면(reset by peer) attempts로 버틴다.
+                    'init_retry_delay_sec': 0.3,   # [검증] 빠른 반복
+                }]
+            ),
+            Node(
+                package='dsr_realsense_pick_place',
+                executable='gripper_node',
+                name='rh_p12_rna_gripper',
+                output='screen',
+                parameters=[params_file, {
+                    'robot_ns': LaunchConfiguration('robot_name'),
+                }],
+            )
+        ]
     )
 
-    gripper_service_node = Node(
-        package='dsr_gripper_tcp',
-        executable='gripper_service_node',
-        name='gripper_service',
-        output='screen',
-        parameters=[{
-            'controller_host': LaunchConfiguration('host'),
-            'tcp_port': LaunchConfiguration('gripper_tcp_port'),
-            'namespace': LaunchConfiguration('robot_name'),
-            'goal_current': 400,
-            'profile_velocity': 1500,
-            'profile_acceleration': 1000,
-            'connect_timeout_sec': 60.0,
-            'post_drl_start_sleep_sec': 2.0,
-            'drl_idle_stable_sec': 2.0,
-            'tcp_server_open_retry_sec': 0.5,
-            'init_attempts': 5,
-            'init_timeout_sec': 20.0,
-            'init_retry_delay_sec': 1.0,
-        }],
-        # boot_bridge(최대 수십 초) 동안 DrlStop 정리 시간 확보
-        sigterm_timeout='20',
-        sigkill_timeout='5',
-    )
-
-    gripper_wrapper_node = Node(
-        package='dsr_realsense_pick_place',
-        executable='gripper_node',
-        name='rh_p12_rna_gripper',
-        output='screen',
-        parameters=[params_file, {
-            'robot_ns': LaunchConfiguration('robot_name'),
-        }],
-        sigterm_timeout='10',
-        sigkill_timeout='3',
-    )
-
-    wait_gripper_ready = ExecuteProcess(
-        cmd=[
-            'python3', wait_gripper_script,
-            LaunchConfiguration('gripper_ready_timeout_sec'),
-        ],
-        output='screen',
-        name='wait_for_gripper_ready',
-    )
-
-    pick_place_node = Node(
-        package='dsr_realsense_pick_place',
-        executable='pick_place_node',
-        name='pick_place_node',
-        output='screen',
-        parameters=[params_file, {
-            'robot_namespace': LaunchConfiguration('robot_name'),
-            'robot_base_frame': LaunchConfiguration('robot_base_frame'),
-        }],
-    )
-
-    start_gripper_after_robot_ready = RegisterEventHandler(
-        event_handler=OnProcessExit(
-            target_action=wait_robot_ready,
-            on_exit=[gripper_service_node, gripper_wrapper_node],
-        ),
-    )
-
-    start_gripper_ready_wait = RegisterEventHandler(
-        event_handler=OnProcessStart(
-            target_action=gripper_service_node,
-            on_start=[wait_gripper_ready],
-        ),
-    )
-
-    start_pick_place_after_gripper_ready = RegisterEventHandler(
-        event_handler=OnProcessExit(
-            target_action=wait_gripper_ready,
-            on_exit=[pick_place_node],
-        ),
-    )
-
-    # Ctrl+C 시 이벤트로 기동된 gripper/pick_place가 고아 프로세스로 남는 문제 방지
-    cleanup_on_shutdown = RegisterEventHandler(
-        event_handler=OnShutdown(
-            on_shutdown=[
-                ExecuteProcess(
-                    cmd=['bash', launch_cleanup_script],
-                    output='screen',
-                    name='launch_cleanup',
-                ),
-            ],
-        ),
-    )
-
-    ultrasonic = Node(
-        package='dsr_realsense_pick_place',
-        executable='ultrasonic_node',
-        name='ultrasonic_node',
-        output='screen',
-        parameters=[{
-            'port': LaunchConfiguration('ultrasonic_port'),
-            'baudrate': LaunchConfiguration('ultrasonic_baudrate'),
-        }],
-        condition=IfCondition(LaunchConfiguration('use_ultrasonic')),
+    pick_place = TimerAction(
+        period=12.0,
+        actions=[
+            Node(
+                package='dsr_realsense_pick_place',
+                executable='pick_place_node',
+                name='pick_place_node',
+                output='screen',
+                parameters=[params_file, {
+                    'robot_namespace': LaunchConfiguration('robot_name'),
+                    'robot_base_frame': LaunchConfiguration('robot_base_frame'),
+                }],
+            )
+        ]
     )
 
     return LaunchDescription(ARGUMENTS + [
@@ -284,10 +209,6 @@ def generate_launch_description():
         static_tf,
         object_detector,
         gui_node,
-        ultrasonic,
-        wait_robot_ready,
-        start_gripper_after_robot_ready,
-        start_gripper_ready_wait,
-        start_pick_place_after_gripper_ready,
-        cleanup_on_shutdown,
+        gripper,
+        pick_place,
     ])

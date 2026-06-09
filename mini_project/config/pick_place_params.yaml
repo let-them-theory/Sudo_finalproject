@@ -15,8 +15,7 @@ object_detector:
 
     # --- YOLO 설정 ---
     use_yolo: true
-    # ⚠️ 본인 학습 모델(.pt)의 절대경로로 수정할 것. 모델 파일은 repo에 없음(SETUP.md 참고).
-    yolo_model: "/home/user/Sudo_finalproject-main/proto.pt"
+    yolo_model: "/home/pyw/kairos_ws/goods_yolo.pt"
     confidence_threshold: 0.5
 
 
@@ -30,26 +29,6 @@ object_detector:
     # pick_place_node의 grip_class_names와 동일 값으로 유지해야 한다. 어긋나면 시작 시 warn 발행.
     # GUI 강도 편집기에서 저장 누르면 이 줄도 자동 동기화됨.
     known_classes: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "box", "can", "boxsnack", "wafers"]
-
-    # --- FastSAM unknown 검출 ---
-    # proto.pt(YOLO)가 못 잡는(학습 안 된) 물체를 FastSAM 세그멘테이션으로 잡아
-    # GUI 카메라 화면에 'unknown_N'(컬러 마스크)으로 표시한다.
-    # (realsense_fastsam_segment.py와 동일 방식). 끄려면 use_fastsam_unknown: false.
-    use_fastsam_unknown: true
-    fastsam_weights: "/home/user/Sudo_finalproject-main/FastSAM-s.pt"
-    fastsam_conf: 0.5
-    fastsam_iou: 0.7
-    fastsam_imgsz: 640           # FastSAM 입력 크기. 낮추면(416/320) 더 빠름
-    fastsam_every_n: 3           # N프레임마다 FastSAM 실행(부하 1/N). 1=매프레임, 키울수록 FPS↑
-    unknown_match_iou: 0.15      # YOLO bbox와 이 IoU 이상 겹친 마스크는 known으로 보고 제외
-    unknown_min_area: 500        # unknown 마스크 최소 픽셀 면적 (ROI 360x240 기준)
-    unknown_max_area: 10000      # unknown 마스크 최대 픽셀 면적 (ROI 360x240 기준)
-    # unknown 검출 ROI (realsense_fastsam_segment.py와 동일). 이 영역 안에서만 FastSAM 동작.
-    unknown_roi_enable: true
-    unknown_roi_w: 360
-    unknown_roi_h: 240
-    unknown_roi_shift_x: 74      # 화면 중앙에서 우측으로
-    unknown_roi_shift_y: 10      # 화면 중앙에서 아래로
 
     # --- 추적/디바운스 (검출 안정화: tracker ID 기반 표시 번호 [1],[2],...) ---
     tracker_type: "botsort_custom.yaml"  # 패키지 share/config 안의 파일명. 없으면 ultralytics 기본 사용
@@ -67,8 +46,7 @@ object_detector:
     depth_center_ratio: 0.6         # 샘플링 반경 내 사용 비율 (0~1)
     depth_outlier_mad_scale: 2.5    # MAD 이상치 제거 스케일 팩터
     selected_object_topic: "/selected_object_label"
-    # 마스크 기반 축(yaw) 추정 비활성화 — FastSAM 마스크 화면과 혼용 방지.
-    use_object_yaw_for_grasp: False
+    use_object_yaw_for_grasp: True
     yaw_axis_reference: "long"
     yaw_depth_band_m: 0.03
     yaw_min_mask_pixels: 40
@@ -117,8 +95,10 @@ rh_p12_rna_gripper:
     svc_timeout: 10.0
     state_hz: 20.0
     # --- 그리퍼 동작 전류 (mA) — gripper_node가 실제로 읽는 이름 ---
-    open_current: 400           # 열기 전류 한계 (구 init_current)
-    close_current: 300          # 닫기/파지 전류 한계 (구 cube_current)
+    open_current: 200           # 열기 전류 한계 — open 직전 goal_current 급등(물체 압착) 방지 위해 낮춤
+    close_current: 200          # 닫기/파지 전류 한계 (구 cube_current)
+    transport_current: 80      # 이송 전류 — 파지 후 들고 이동 시 (낮으면 발열↓, 너무 낮으면 이송 중 낙하)
+    idle_current: 50            # idle 위치락 전류 — 작업완료(IDLE) 시 현재위치 락+낮은전류로 유지 (전류 튐 완화)
     # --- 모터 속도/가속도 프로파일 ---
     profile_velocity: 1500      # 구동 속도(레지스터 280). 너무 높이면 물체 접촉 시 과부하 위험
     profile_acceleration: 1000  # 구동 가속도(레지스터 278)
@@ -147,15 +127,14 @@ pick_place_gui:
     workspace_y_max: 0.60
     workspace_z_min: 0.0
     workspace_z_max: 0.60
-    reach_radius_max: 0.80
+    reach_radius_max: 0.65
 
 pick_place_node:
   ros__parameters:
     # --- 로봇 설정 ---
     robot_namespace: "dsr01"
     robot_base_frame: "base_link"
-    # 축(yaw) 기반 파지 비활성화 — 고정 자세(grasp_rpy)로 파지.
-    use_target_pose_yaw: False
+    use_target_pose_yaw: True
     grasp_yaw_offset_deg: 0.0
 
     # --- 속도/가속도 ---
@@ -167,20 +146,16 @@ pick_place_node:
     # --- 홈 포지션 (관절 각도, deg) ---
     home_joints: [0.0, 0.0, 90.0, 0.0, 90.0, 0.0]
 
-    # --- 아두이노(HC-SR04) 초음파 거리 기반 파지 ---
-    # PICK 하강 중 초음파 거리가 grasp_distance_m 이하가 되면 그 자리에서 파지.
-    # 센서 미연결/임계 미달 시 카메라 기반 안전바닥(pose.z + pick_z_offset)에서 파지.
-    use_ultrasonic_grasp: true
-    grasp_distance_m: 0.07          # 70mm 이하 감지 시 파지
-    ultrasonic_step_m: 0.01         # 1회 하강 스텝(m) — 작을수록 정밀/느림
-    ultrasonic_settle_sec: 0.15     # 스텝 후 센서 갱신 대기(s)
-    ultrasonic_range_topic: "/ultrasonic_range"
-    ultrasonic_max_age_sec: 0.5     # 이보다 오래된 거리값은 무효 처리
-
     # --- 그리퍼 설정 ---
     # gripper_node의 motion_wait(1.5s)보다 길게 설정해야
     # 그리퍼 동작 완료 후 다음 로봇 모션이 시작됩니다.
     gripper_wait_sec: 1.7           # 그리퍼 동작 대기 시간 (s)
+
+    # --- LIFT 후 파지 판정 경계 (그리퍼 위치 pos, 0=열림 1000=닫힘) ---
+    # 들어올린 뒤 pos로 파지 성공/실패 판정. pos<=grasp_min_pos = close 안 먹음(실패),
+    # pos>max_grip_pos = 빈손 완전닫힘(실패), 그 사이 = 파지 성공.
+    grasp_min_pos: 50               # 이하면 그리퍼가 안 닫힘(파지 실패)
+    max_grip_pos: 700               # 초과면 빈손 완전닫힘(파지 실패)
 
     # --- 물체별 파지 전류(강도) (mA) ---
     # 파지 직전, 선택된 물체 클래스(/selected_object_class)에 따라
@@ -189,10 +164,10 @@ pick_place_node:
     # grip_class_names ↔ grip_class_currents 는 같은 순서로 1:1 대응.
     # 아래 값은 현장 튜닝 시작값 — 실기에서 물체별로 미끄러짐/손상 보며 조정할 것.
     # 강성 기준 추정 시작값. 봉지/웨하스 등 잘 찌그러지는 것은 낮게, 캔/병/박스 등 단단한 것은 높게.
-    grip_current_default: 200
+    grip_current_default: 100
     grip_class_names: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "box", "can", "boxsnack", "wafers"]
-    grip_class_currents: [150, 150, 150, 120, 180, 140, 180, 200, 170, 150]
-    grip_current_min: 100           # 안전 clamp 하한
+    grip_class_currents: [100, 100, 150, 100, 100, 100, 100, 100, 100, 100]
+    grip_current_min: 80            # 안전 clamp 하한 (free-run ~68mA보단 위, 그 아래는 파지감지 불안정)
     grip_current_max: 500           # 안전 clamp 상한
 
     # 격리 토글 — false로 두면 close 직전 SetParameters 호출 우회 (이전 세션 동작).
@@ -203,7 +178,9 @@ pick_place_node:
     # --- 안전 하한 ---
     # TCP가 이 높이(base_link 기준, m) 아래로는 절대 못 내려가게 _move_to_cart에서 강제 클램프.
     # 0.0 = base_link 평면(클램프 사실상 비활성). 실제 테이블/지그 높이에 맞춰 올려서 충돌 방지.
-    min_safe_z: 0.0
+    min_safe_z: 0.005
+    gripper_close_len: 0.145        # 그리퍼 close 시 flange→손끝 길이(m). min_safe_z(손끝 최저)를 flange 좌표로 환산용. calibration과 무관.
+    reach_radius_max: 0.65          # movel 하드 차단 평면반경(m). pick_place_gui와 동일 유지. 범위밖은 movel 미전송.
 
     # --- Pick 파라미터 ---
     pre_pick_z_offset: 0.14         # Pick 위 대기 높이 오프셋 (m)

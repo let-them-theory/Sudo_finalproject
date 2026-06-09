@@ -88,7 +88,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtGui import QPalette, QFont
 from PyQt5.QtCore import QLibraryInfo
 from rclpy.node import Node
-from sensor_msgs.msg import Image, JointState, Range
+from sensor_msgs.msg import Image, JointState
 
 from rcl_interfaces.msg import Parameter as RclParameter, ParameterType, ParameterValue
 from rcl_interfaces.srv import GetParameters, SetParameters
@@ -243,14 +243,13 @@ class PickPlaceGuiNode(Node):
         self._last_nonempty_objects_time = 0.0
         self.selected_label = ''
         self.pick_place_state = 'IDLE'
+        self.last_error_text = ''
         self._latest_raw_detections = []
         self.last_image_time = 0.0
         self.last_objects_time = 0.0
         self.last_state_time = 0.0
         self.last_hw_state_time = 0.0
         self.last_speed_mode_time = 0.0
-        self.last_ultrasonic_time = 0.0
-        self.ultrasonic_range_m = None   # 최근 HC-SR04 거리(m), 무효 시 None
         self.system_status_items = []
         self._last_system_status_check = 0.0
 
@@ -303,9 +302,10 @@ class PickPlaceGuiNode(Node):
         self.create_subscription(
             GripperState, '/gripper_service/state', self._cb_gripper_service_state, 10)
 
-        # 실시간 그리퍼 상태 수신 구독 (기존 토픽 및 브릿지 노드용 토픽 모두 수신 가능하도록 다중 등록)
+        # 실시간 그리퍼 상태 수신 — /gripper/state(raw 0~1000)만 구독한다.
+        # /gripper_service/joint_state는 정규화 스케일(예: 0.327)이라 둘 다 받으면 위치/전류가
+        # raw↔정규화로 깜빡인다(0↔값). raw 토픽 하나만 쓴다.
         self.create_subscription(JointState, '/gripper/state', self._cb_gripper_joint_state, 10)
-        self.create_subscription(JointState, '/gripper_service/joint_state', self._cb_gripper_joint_state, 10)
         # 그리퍼 INIT/REINIT 진행 상황 — 시간이 카운트되면 진행 중, 멈춰있으면 막힘.
         self.gripper_init_progress = ''       # 최근 메시지
         self.gripper_init_progress_t = 0.0    # 마지막 수신 시각 (GUI에서 stale 판정)
@@ -322,9 +322,8 @@ class PickPlaceGuiNode(Node):
                 )
             self.create_subscription(Image, '/detection_debug_image', self._cb_image, qos_profile_sensor_data)
             self.create_subscription(String, '/detected_objects', self._cb_objects, 10)
-        # 아두이노 HC-SR04 초음파 거리 (ultrasonic_node → /ultrasonic_range)
-        self.create_subscription(Range, '/ultrasonic_range', self._cb_ultrasonic, 10)
         self.create_subscription(String, '/pick_place_state', self._cb_state, 10)
+        self.create_subscription(String, '/pick_place_error', self._cb_error, 10)
 
     def _cb_gripper_joint_state(self, msg: JointState):
         target_name = None
@@ -731,6 +730,10 @@ class PickPlaceGuiNode(Node):
         self.pick_place_state = msg.data
         self.last_state_time = time.monotonic()
 
+    def _cb_error(self, msg: String):
+        # ERROR 진입 시 분류된 에러 사유 — _update_ui에서 좌상단 배너에 표시(GUI 스레드 안전).
+        self.last_error_text = msg.data
+
     def _cb_gripper_service_state(self, msg: GripperState):
         self.gripper_hw_ready = msg.ready
 
@@ -746,12 +749,6 @@ class PickPlaceGuiNode(Node):
     def _cb_speed_mode(self, msg: Int32):
         self.speed_mode = msg.data
         self.last_speed_mode_time = time.monotonic()
-
-    def _cb_ultrasonic(self, msg: Range):
-        # 아두이노 HC-SR04 거리(m). range<=0 이면 측정 실패.
-        if msg.range is not None and msg.range > 0.0:
-            self.ultrasonic_range_m = float(msg.range)
-            self.last_ultrasonic_time = time.monotonic()
 
     def publish_selected_label(self, label: str):
         # 빈 문자열은 "자동 선택" 모드로 해석된다.
@@ -790,13 +787,19 @@ class PickPlaceGuiNode(Node):
         def ready(client) -> bool:
             return client.service_is_ready()
 
+        # 기동 순서대로 표시 (HW=로봇 먼저 → 그리퍼 → 카메라/검출 → pick).
+        # GRIP은 3단 구분: ok(준비완료) / warn(초기화 중 — init_progress 수신) / bad(무응답·죽음).
+        # 콜드부팅 INITIALIZE 동안엔 죽은(빨강) 게 아니라 깨우는 중(노랑)으로 보이게 한다.
+        grip_state = (
+            'ok' if self.gripper_hw_ready
+            else ('warn' if fresh(self.gripper_init_progress_t, 30.0) else 'bad')
+        )
         self.system_status_items = [
+            ('HW', 'ok' if fresh(self.last_hw_state_time) else 'warn'),
+            ('GRIP', grip_state),
             ('CAM', 'ok' if fresh(self.last_image_time) else 'bad'),
             ('DET', 'ok' if fresh(self.last_objects_time) else 'bad'),
             ('PICK', 'ok' if ready(self.cli_run_once) and fresh(self.last_state_time) else 'bad'),
-            ('GRIP', 'ok' if self.gripper_hw_ready else 'bad'),
-            ('ARD', 'ok' if fresh(self.last_ultrasonic_time) else 'bad'),
-            ('HW', 'ok' if fresh(self.last_hw_state_time) else 'warn'),
             ('SPD', 'ok' if fresh(self.last_speed_mode_time) else 'warn'),
         ]
 
@@ -874,11 +877,11 @@ class PickPlaceGui(QWidget):
         # 각 그룹은 op_right(운전)/grip_col(gripper)/set_col(수동·설정)에 직접 추가한다
         self.system_status_labels = {}
         self.system_status_bar = QWidget()
-        self.system_status_bar.setFixedSize(320, 24)
+        self.system_status_bar.setFixedSize(276, 24)
         status_bar_layout = QHBoxLayout(self.system_status_bar)
         status_bar_layout.setContentsMargins(0, 0, 0, 4)
         status_bar_layout.setSpacing(4)
-        for key in ('CAM', 'DET', 'PICK', 'GRIP', 'ARD', 'HW', 'SPD'):
+        for key in ('HW', 'GRIP', 'CAM', 'DET', 'PICK', 'SPD'):  # 기동 순서대로 표시
             label = QLabel(key)
             label.setAlignment(Qt.AlignCenter)
             label.setFixedSize(42, 20)
@@ -888,7 +891,29 @@ class PickPlaceGui(QWidget):
             )
             self.system_status_labels[key] = label
             status_bar_layout.addWidget(label)
-        root.addWidget(self.system_status_bar, 0, Qt.AlignLeft)
+
+        # status 점들(좌) + 현재 동작/단계 텍스트(우)를 한 줄에 배치.
+        self.activity_label = QLabel('⚙️ 시스템 시작 중...')
+        self.activity_label.setStyleSheet(
+            'background-color: #1a2a3a; color: #cfe8ff; border-radius: 3px;'
+            ' padding: 2px 8px; font-size: 12px; font-weight: bold;'
+        )
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 4)
+        top_row.setSpacing(8)
+        top_row.addWidget(self.system_status_bar)
+        top_row.addWidget(self.activity_label, 1)
+        root.addLayout(top_row)
+
+        # 🔴 에러 배너 — ERROR 시 '어떤 에러인지' 좌상단 status 바 바로 아래에 명확히 표기
+        self.error_banner_label = QLabel('')
+        self.error_banner_label.setStyleSheet(
+            'color: #ff5555; font-weight: bold; font-size: 12px;'
+            'background-color: #2a1010; border-radius: 3px; padding: 2px 6px;'
+        )
+        self.error_banner_label.setWordWrap(True)
+        self.error_banner_label.setVisible(False)
+        root.addWidget(self.error_banner_label, 0, Qt.AlignLeft)
 
         # 상태 그룹박스 — 카메라와 그래프 사이(cam_col)에 배치. 카메라 폭에 맞춰 클램프.
         status_group = QGroupBox('상태')
@@ -1100,12 +1125,8 @@ class PickPlaceGui(QWidget):
         self.gripper_close_button.setMinimumHeight(32)
         self.gripper_close_button.clicked.connect(self._gripper_close)
 
-        # 그리퍼 런타임 리셋(재초기화) — 로봇 상태와 무관하게 단독 동작.
-        # 그리퍼가 에러/무응답(status 3)으로 멈췄을 때 로봇 재부팅 없이 복구 시도.
-        self.gripper_reset_button = QPushButton('그리퍼 리셋 (재초기화)')
-        self.gripper_reset_button.setMinimumHeight(32)
-        self.gripper_reset_button.clicked.connect(self._gripper_reset)
-
+        # [2026-06-09] 그리퍼 리셋(재초기화) 버튼 제거 — in-process reinit이 DrlStart 실패로
+        # 오히려 status3를 유발(복구 불가)해 무용+위험. status3는 start_clean 전체 재시작이 답.
         self.gripper_torque_on_button = QPushButton('토크 ON')
         self.gripper_torque_on_button.setMinimumHeight(32)
         self.gripper_torque_on_button.clicked.connect(self._gripper_torque_on)
@@ -1116,9 +1137,8 @@ class PickPlaceGui(QWidget):
 
         gripper_action_grid.addWidget(self.gripper_open_button, 0, 0)
         gripper_action_grid.addWidget(self.gripper_close_button, 0, 1)
-        gripper_action_grid.addWidget(self.gripper_reset_button, 1, 0, 1, 2)
-        gripper_action_grid.addWidget(self.gripper_torque_on_button, 2, 0)
-        gripper_action_grid.addWidget(self.gripper_torque_off_button, 2, 1)
+        gripper_action_grid.addWidget(self.gripper_torque_on_button, 1, 0)
+        gripper_action_grid.addWidget(self.gripper_torque_off_button, 1, 1)
 
         # ── 그리퍼 정밀 전류 및 속도/가속도 제어 패널 ───────────────────────
         self.gripper_ctrl_group = QGroupBox('그리퍼 정밀 전류 제어')
@@ -1162,6 +1182,24 @@ class PickPlaceGui(QWidget):
         open_curr_row.addWidget(self.open_curr_spin)
         gripper_ctrl_layout.addLayout(open_curr_row)
 
+        # 이송 전류 (파지 후 들고 이동 시 — 낮으면 발열↓, 너무 낮으면 이송 중 낙하)
+        transport_curr_row = QHBoxLayout()
+        transport_curr_label = QLabel('이송 전류:')
+        transport_curr_label.setFixedWidth(64)
+        self.transport_curr_slider = QSlider(Qt.Horizontal)
+        self.transport_curr_slider.setRange(50, 800)
+        self.transport_curr_slider.setValue(150)
+        self.transport_curr_spin = QSpinBox()
+        self.transport_curr_spin.setRange(50, 800)
+        self.transport_curr_spin.setValue(150)
+        self.transport_curr_spin.setFixedWidth(54)
+        self.transport_curr_slider.valueChanged.connect(self.transport_curr_spin.setValue)
+        self.transport_curr_spin.valueChanged.connect(self.transport_curr_slider.setValue)
+        transport_curr_row.addWidget(transport_curr_label)
+        transport_curr_row.addWidget(self.transport_curr_slider)
+        transport_curr_row.addWidget(self.transport_curr_spin)
+        gripper_ctrl_layout.addLayout(transport_curr_row)
+
         # 속도
         vel_row = QHBoxLayout()
         vel_label = QLabel('구동 속도:')
@@ -1199,19 +1237,12 @@ class PickPlaceGui(QWidget):
         gripper_ctrl_layout.addLayout(acc_row)
 
         # 모니터링 레이블
-        self.ultrasonic_status_label = QLabel('초음파 거리: -- mm')
-        self.ultrasonic_status_label.setStyleSheet(
-            'color: #66ccff; font-weight: bold; background-color: #1e1e1e;'
-            ' padding: 4px; border-radius: 4px; font-family: monospace;'
-        )
-        self.ultrasonic_status_label.setAlignment(Qt.AlignCenter)
-
         self.gripper_status_label = QLabel('실시간 - 전류: -- mA | 위치: ----')
         self.gripper_status_label.setStyleSheet(
-            'color: #33ff33; font-weight: bold; background-color: #1e1e1e; padding: 4px; border-radius: 4px; font-family: monospace;'
+            'color: #33ff33; font-weight: bold; background-color: #1e1e1e; padding: 1px 4px; border-radius: 4px; font-family: monospace;'
         )
         self.gripper_status_label.setAlignment(Qt.AlignCenter)
-        # 실시간 전류/위치 텍스트 한 줄은 운전 탭 우측 "검출 물체 선택" 아래에 배치(아래 조립부)
+        self.gripper_status_label.setMaximumHeight(22)  # 폰트 한 줄 높이만큼만 — 두껍지 않게
 
         # 실시간 전류 모니터링 그래프 추가
         self.realtime_graph = RealTimeGraphWidget(self)
@@ -1231,6 +1262,28 @@ class PickPlaceGui(QWidget):
             'QPushButton:disabled { background-color: #444; color: #888; }'
         )
         gripper_ctrl_layout.addWidget(self.gripper_apply_button)
+
+        # 📂 불러오기 — yaml의 현재 값을 슬라이더로 로드 (적용/저장 전 기준값 복원)
+        self.gripper_load_button = QPushButton('📂 불러오기')
+        self.gripper_load_button.setMinimumHeight(28)
+        self.gripper_load_button.clicked.connect(self._gripper_ctrl_load)
+        self.gripper_load_button.setStyleSheet(
+            'QPushButton { background-color: #3a3a3a; color: white;'
+            '  font-weight: bold; border-radius: 5px; }'
+            'QPushButton:hover { background-color: #505050; }'
+        )
+        gripper_ctrl_layout.addWidget(self.gripper_load_button)
+
+        # 💾 yaml 저장 — GUI 튜닝을 파일에 영구 반영(yaml 공유로 다른 PC에서 동일 튜닝 재현)
+        self.gripper_save_button = QPushButton('💾 yaml 저장')
+        self.gripper_save_button.setMinimumHeight(28)
+        self.gripper_save_button.clicked.connect(self._gripper_ctrl_save)
+        self.gripper_save_button.setStyleSheet(
+            'QPushButton { background-color: #2a5a2a; color: white;'
+            '  font-weight: bold; border-radius: 5px; }'
+            'QPushButton:hover { background-color: #3a803a; }'
+        )
+        gripper_ctrl_layout.addWidget(self.gripper_save_button)
 
         # ── 물체별 파지 강도 (gripper 탭) ───────────────────────────────
         # config(pick_place_params.yaml)에서 클래스↔전류를 읽어 슬라이더 행을 동적 생성.
@@ -1615,9 +1668,6 @@ class PickPlaceGui(QWidget):
         op_right.addWidget(emergency_group)
         op_right.addWidget(detect_tune_group)
         op_right.addWidget(object_group)
-        # 검출 물체 선택 아래: 초음파 거리 → 실시간 전류값
-        op_right.addWidget(self.ultrasonic_status_label)
-        op_right.addWidget(self.gripper_status_label)
         op_right.addStretch(1)
 
         # 탭2 "gripper": 그리퍼 동작 + 정밀 전류 제어 + 물체별 강도
@@ -1639,9 +1689,14 @@ class PickPlaceGui(QWidget):
         body = QHBoxLayout()
         cam_col = QVBoxLayout()
         cam_col.addWidget(self.image_label)
-        # 상태창: 카메라와 그래프 사이 — 모든 탭에서 상시 노출
+        # status_group은 좌상단 activity 라벨과 중복 → 숨김(setVisible False)만 한다.
+        # ★ 레이아웃에서 빼면(addWidget 안 하면) 자식 라벨(state_label 등)이 C++에서 삭제돼
+        #   _update_ui의 setText가 RuntimeError로 죽고 UI가 통째로 멈춘다. 반드시 객체는 유지.
+        status_group.setVisible(False)
         cam_col.addWidget(status_group)
-        # 실시간 전류 그래프: 상태 바로 아래, 모든 탭 상시(가로 길게)
+        # 그 자리(카메라-그래프 사이)에 실시간 전류/위치 한 줄.
+        cam_col.addWidget(self.gripper_status_label)
+        # 실시간 전류 그래프: 전류값 바로 아래, 모든 탭 상시(가로 길게)
         cam_col.addWidget(self.realtime_graph)
         body.addLayout(cam_col, 2)
         body.addWidget(self.tabs, 3)
@@ -1710,19 +1765,6 @@ class PickPlaceGui(QWidget):
             min_busy_sec=self._gripper_feedback_hold_sec,
         )
 
-    def _gripper_reset(self):
-        # 로봇 상태와 무관한 그리퍼 단독 리셋(재초기화). 재초기화는 DRL 재시작 +
-        # 시리얼 recycle을 포함해 최대 수십 초 걸릴 수 있어 타임아웃을 길게 잡는다.
-        self._call_manual_command(
-            key='gripper_reset',
-            client=self.ros_node.cli_gripper_reinit,
-            service_label='gripper_service/reinitialize',
-            progress_text='그리퍼 리셋(재초기화) 중...',
-            done_text='그리퍼 리셋 완료',
-            timeout_sec=90.0,
-            wait_for_state=False,
-        )
-
     def _gripper_torque_on(self):
         self._call_gripper_torque(True)
 
@@ -1773,6 +1815,7 @@ class PickPlaceGui(QWidget):
         params = [
             ('open_current', ParameterType.PARAMETER_INTEGER, int(self.open_curr_spin.value())),
             ('close_current', ParameterType.PARAMETER_INTEGER, int(self.close_curr_spin.value())),
+            ('transport_current', ParameterType.PARAMETER_INTEGER, int(self.transport_curr_spin.value())),
             ('profile_velocity', ParameterType.PARAMETER_INTEGER, int(self.vel_spin.value())),
             ('profile_acceleration', ParameterType.PARAMETER_INTEGER, int(self.acc_spin.value()))
         ]
@@ -1969,6 +2012,65 @@ class PickPlaceGui(QWidget):
         except Exception as e:
             self.ros_node.get_logger().error(f'yaml 저장 실패: {e}')
             self.grip_strength_status_label.setText(f'⚠ 저장 실패: {e}')
+
+    def _gripper_ctrl_save(self):
+        """그리퍼 정밀 전류/속도 슬라이더 값을 yaml 해당 라인만 교체해 저장(값만 바꾸고 주석 보존).
+        GUI 튜닝을 yaml에 영구 반영 → yaml 파일 공유로 다른 PC에서 동일 튜닝 재현."""
+        path = self._find_params_yaml()
+        if path is None:
+            self.ros_node.get_logger().warn('⚠ config yaml 파일을 찾지 못함 (그리퍼 전류 저장)')
+            return
+        patterns = {
+            'open_current': str(int(self.open_curr_spin.value())),
+            'close_current': str(int(self.close_curr_spin.value())),
+            'transport_current': str(int(self.transport_curr_spin.value())),
+            'profile_velocity': str(int(self.vel_spin.value())),
+            'profile_acceleration': str(int(self.acc_spin.value())),
+        }
+        try:
+            with open(path, 'r') as f:
+                lines = f.readlines()
+            replaced = {k: False for k in patterns}
+            for i, line in enumerate(lines):
+                for key, new_val in patterns.items():
+                    # 값만 교체하고 인라인 주석(#...)은 보존
+                    m = re.match(rf'^(\s*){key}\s*:\s*[^#\n]*?(\s*#.*)?$', line)
+                    if m and not replaced[key]:
+                        comment = m.group(2) or ''
+                        lines[i] = f'{m.group(1)}{key}: {new_val}{comment}\n'
+                        replaced[key] = True
+            missing = [k for k, v in replaced.items() if not v]
+            if missing:
+                self.ros_node.get_logger().warn(f'⚠ 그리퍼 전류 yaml 저장 — 키 누락: {missing}')
+                return
+            with open(path, 'w') as f:
+                f.writelines(lines)
+            self.ros_node.get_logger().info(f'💾 그리퍼 전류/프로파일 yaml 저장 완료: {path}')
+        except Exception as e:
+            self.ros_node.get_logger().error(f'그리퍼 전류 yaml 저장 실패: {e}')
+
+    def _gripper_ctrl_load(self):
+        """yaml의 그리퍼 전류/속도 값을 슬라이더로 불러온다(현재 파일값으로 복원)."""
+        path = self._find_params_yaml()
+        if path is None:
+            self.ros_node.get_logger().warn('⚠ config yaml 파일을 찾지 못함 (그리퍼 전류 불러오기)')
+            return
+        try:
+            import yaml
+            with open(path) as f:
+                data = yaml.safe_load(f)
+            p = (data or {}).get('rh_p12_rna_gripper', {}).get('ros__parameters', {})
+            mapping = {
+                'open_current': self.open_curr_spin,
+                'close_current': self.close_curr_spin,
+                'transport_current': self.transport_curr_spin,
+                'profile_velocity': self.vel_spin,
+                'profile_acceleration': self.acc_spin,
+            }
+            loaded = [k for k, spin in mapping.items() if k in p and (spin.setValue(int(p[k])) or True)]
+            self.ros_node.get_logger().info(f'📂 그리퍼 전류 yaml 불러오기: {loaded}')
+        except Exception as e:
+            self.ros_node.get_logger().error(f'그리퍼 전류 yaml 불러오기 실패: {e}')
 
     # ── TCP Z 안전 하한 (min_safe_z) ────────────────────────────────────
     def _load_min_safe_z(self) -> float:
@@ -2308,7 +2410,7 @@ class PickPlaceGui(QWidget):
             pkg_share = get_package_share_directory('dsr_realsense_pick_place')
             shutdown_script = os.path.join(pkg_share, 'scripts', 'shutdown_nodes.sh')
             self._system_reset_proc = subprocess.Popen(
-                ['bash', shutdown_script, '--kill-launch'],
+                ['bash', shutdown_script],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -2515,6 +2617,7 @@ class PickPlaceGui(QWidget):
                             'mode:=real',
                             'host:=110.120.1.50',
                             'gui:=false',
+                            'pre_cleanup:=false',
                         ],
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
@@ -2535,6 +2638,35 @@ class PickPlaceGui(QWidget):
                 self._system_reset_phase_until = 0.0
                 self.system_reset_button.setEnabled(True)
 
+    def _update_activity_label(self):
+        # status 점(색)만으론 "뭘 하는지" 모름 → 현재 동작/단계를 한 줄로. 그리퍼 초기화 중이면 우선 표시.
+        st = self.ros_node.pick_place_state
+        prog = self.ros_node.gripper_init_progress
+        if not self.ros_node.gripper_hw_ready:
+            # 그리퍼가 준비 안 됨 = 초기화 중. 진행 메시지(init_progress)가 끊겨도 "초기화 중" 유지.
+            label = f'⚙️ 그리퍼 초기화 중 — {prog}' if prog else '⚙️ 그리퍼 초기화 중...'
+            text, bg, fg = label, '#1a2a3a', '#cfe8ff'
+        else:
+            mp = {
+                'IDLE':          ('🟢 대기 — 물체 선택 가능', '#0f2a0f', '#bfe8bf'),
+                'HOME':          ('🏠 HOME 복귀 중...', '#1a2a3a', '#cfe8ff'),
+                'DETECTING':     ('🔍 물체 검출 중...', '#1a2a3a', '#cfe8ff'),
+                'PRE_PICK':      ('✋ 집기 준비 — 접근 중...', '#1a2a3a', '#cfe8ff'),
+                'PICK':          ('✋ 물체 집는 중...', '#1a2a3a', '#cfe8ff'),
+                'LIFT':          ('⬆ 들어올리는 중...', '#1a2a3a', '#cfe8ff'),
+                'MOVE_TO_PLACE': ('→ 배치 위치로 이동 중...', '#1a2a3a', '#cfe8ff'),
+                'PLACE':         ('🤝 내려놓는 중...', '#1a2a3a', '#cfe8ff'),
+                'POST_PLACE':    ('🏠 복귀 중...', '#1a2a3a', '#cfe8ff'),
+                'ERROR':         (f'🔴 에러 — {self.ros_node.last_error_text or "확인 필요"}', '#3a1010', '#ff9999'),
+                'EMERGENCY_STOP':('🛑 긴급정지', '#3a1010', '#ff9999'),
+            }
+            text, bg, fg = mp.get(st, (f'• {st}', '#2a2a2a', '#cccccc'))
+        self.activity_label.setText(text)
+        self.activity_label.setStyleSheet(
+            f'background-color: {bg}; color: {fg}; border-radius: 3px;'
+            ' padding: 2px 8px; font-size: 12px; font-weight: bold;'
+        )
+
     def _update_ui(self):
         # 시스템 리셋 진행 상태 폴링
         self._poll_system_reset()
@@ -2547,10 +2679,7 @@ class PickPlaceGui(QWidget):
         # 카메라 영상은 최신 프레임이 있을 때만 갱신한다.
         if self.ros_node.latest_qimage is not None:
             pixmap = QPixmap.fromImage(self.ros_node.latest_qimage)
-            # 카메라는 object_detector의 debug 영상(realsense_fastsam_segment.py 스타일)을
-            # 그대로 표시한다. 축(LONG/Z)·태그 오버레이는 FastSAM 마스크와 혼용돼 비활성화.
-            # (재활성화: 아래 호출 복원 + yaml use_object_yaw_for_grasp: true)
-            # self._draw_object_frames_on_pixmap(pixmap, detected_snapshot)
+            self._draw_object_frames_on_pixmap(pixmap, detected_snapshot)
             scaled = pixmap.scaled(
                 self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
             )
@@ -2560,6 +2689,13 @@ class PickPlaceGui(QWidget):
         # 선택 라벨이 비어 있으면 자동 선택 상태로 표현한다.
         selected_text = self.ros_node.selected_label or '자동 선택'
         self.state_label.setText(f'Pick & Place 상태: {self.ros_node.pick_place_state}')
+        # 에러 배너 — ERROR 상태에서만 '어떤 에러인지' 좌상단에 표시 (복구되면 자동 숨김)
+        if self.ros_node.pick_place_state == 'ERROR' and self.ros_node.last_error_text:
+            self.error_banner_label.setText(self.ros_node.last_error_text)
+            self.error_banner_label.setVisible(True)
+        else:
+            self.error_banner_label.setVisible(False)
+        self._update_activity_label()
         self.selection_label.setText(f'선택 물체: {selected_text}')
         self.selection_status_label.setText(self._build_selection_status())
 
@@ -2638,8 +2774,8 @@ class PickPlaceGui(QWidget):
         gripper_cmd_ok = command_enabled and gripper_hw_ready
         self.gripper_open_button.setEnabled(gripper_cmd_ok and gripper_open_svc)
         self.gripper_close_button.setEnabled(gripper_cmd_ok and gripper_close_svc)
-        # 그리퍼 리셋(재초기화): 그리퍼가 죽었을 때 복구용이므로 gripper_hw_ready를 요구하지 않는다.
-        self.gripper_reset_button.setEnabled(command_enabled and gripper_reinit_svc)
+        # [2026-06-09] 그리퍼 리셋 버튼 제거됨 — 여기서 참조하면 AttributeError로 _update_ui 전체가
+        #   죽어 UI(전류/위치/물체버튼)가 통째로 멈춘다. 절대 되살리지 말 것.
         # 토크 ON/OFF: 초기화 완료 + 비활성(IDLE/DETECTING/ERROR) 상태에서만.
         #   모션 중(PICK/LIFT/MOVE)엔 command_enabled=False라 자동 차단 → 모션 중 토크 OFF 사고 방지.
         self.gripper_torque_on_button.setEnabled(gripper_cmd_ok and gripper_enable_svc)
@@ -2669,26 +2805,6 @@ class PickPlaceGui(QWidget):
         self.exposure_apply_button.setEnabled(manual_exp_enabled)
 
         # ── 그리퍼 정밀 제어 상태 및 활성화 제어 ─────────────────────────────
-        # 아두이노 초음파 거리 레이블 (전류값 위)
-        now = time.monotonic()
-        us_fresh = (
-            self.ros_node.last_ultrasonic_time > 0.0
-            and now - self.ros_node.last_ultrasonic_time <= 3.0
-        )
-        if us_fresh and self.ros_node.ultrasonic_range_m is not None:
-            us_mm = self.ros_node.ultrasonic_range_m * 1000.0
-            self.ultrasonic_status_label.setText(f'초음파 거리: {us_mm:.0f} mm')
-            self.ultrasonic_status_label.setStyleSheet(
-                'color: #33ff33; font-weight: bold; background-color: #003a00;'
-                ' padding: 4px; border-radius: 4px; font-family: monospace;'
-            )
-        else:
-            self.ultrasonic_status_label.setText('초음파 거리: -- mm (아두이노 미연결)')
-            self.ultrasonic_status_label.setStyleSheet(
-                'color: #ff6666; font-weight: bold; background-color: #4a0000;'
-                ' padding: 4px; border-radius: 4px; font-family: monospace;'
-            )
-
         # 실시간 상태 레이블 업데이트
         pres_curr = self.ros_node.gripper_present_current
         pres_pos = self.ros_node.gripper_present_position

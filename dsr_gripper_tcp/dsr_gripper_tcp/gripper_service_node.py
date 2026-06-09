@@ -1,20 +1,18 @@
 # 그리퍼 TCP 브릿지를 ROS 서비스와 액션으로 노출하는 단일 소유 노드
 from __future__ import annotations
 
-import os
-import signal
 import threading
 import time
 
 import rclpy
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
-from rclpy.executors import MultiThreadedExecutor, ExternalShutdownException
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from sensor_msgs.msg import JointState
-from std_msgs.msg import String
+from std_msgs.msg import String, Bool
 from std_srvs.srv import Trigger
 
 from dsr_gripper_tcp.gripper_tcp_bridge import BridgeConfig, DoosanGripperTcpBridge
@@ -156,6 +154,14 @@ class GripperServiceNode(Node):
         self._state_pub = self.create_publisher(GripperState, '~/state', qos)
         # INIT/Reinit 진행 상황 (각 retry attempt마다 발행). GUI가 "막힘 vs 진행 중" 구분용.
         self._init_progress_pub = self.create_publisher(String, '~/init_progress', 10)
+
+        # 모션 중 폴링 조율 — pick_place가 movel/movej/move_stop 전후로 motion_active를 발행한다.
+        # motion_active 동안 폴링을 skip해 컨트롤러 경합(status3)을 회피. 신호 누락 대비 타임아웃 가드.
+        self.declare_parameter('motion_pause_max_sec', 3.0)
+        self._motion_pause_max_sec = float(self.get_parameter('motion_pause_max_sec').value)
+        self._motion_active = False
+        self._motion_active_ts = 0.0
+        self.create_subscription(Bool, '/gripper_service/motion_active', self._cb_motion_active, 10)
         self._joint_state_pub = self.create_publisher(JointState, '~/joint_state', qos)
 
         self.create_service(
@@ -260,9 +266,18 @@ class GripperServiceNode(Node):
             self.get_logger().info(f'[{tag}] {attempt}/{total} ({elapsed:.0f}s): {status}')
         return cb
 
+    def _cb_motion_active(self, msg: Bool) -> None:
+        # pick_place의 모션(movel/movej/move_stop) 진행 신호. 폴링 게이팅용.
+        self._motion_active = bool(msg.data)
+        self._motion_active_ts = time.monotonic()
+
     def _poll_state(self) -> None:
         if self._reinitializing.is_set():
             # 재초기화 진행 중엔 브릿지 접근을 건너뛴다(lock 블로킹/Modbus 충돌 방지).
+            return
+        # 모션 중(movel/move_stop 등)엔 폴링 skip → 컨트롤러 경합 회피(status3 방지).
+        # 타임아웃 가드: motion_active=true 후 max_sec 내 false가 안 오면 강제 재개(신호 누락/노드 죽음 대비).
+        if self._motion_active and (time.monotonic() - self._motion_active_ts) < self._motion_pause_max_sec:
             return
         try:
             bridge_state = self._read_bridge_state()
@@ -662,27 +677,16 @@ class GripperServiceNode(Node):
 
 
 def main(args=None) -> None:
+    import signal
     rclpy.init(args=args)
+    # SIGTERM(shutdown_nodes.sh가 사용)에도 SIGINT처럼 cleanup(DRL stop + 시리얼 close)이 돌게 한다.
+    # ★ rclpy.init '뒤'에 설치해야 한다 — rclpy.init이 SIGTERM을 자체 처리(shutdown)하므로
+    #   그 뒤에 덮어써야 우리 핸들러(KeyboardInterrupt→finally cleanup)가 우선한다.
+    def _sigterm(_signum, _frame):
+        raise KeyboardInterrupt()
+    signal.signal(signal.SIGTERM, _sigterm)
     node = GripperServiceNode()
     executor = MultiThreadedExecutor(num_threads=4)
-
-    def _request_shutdown(signum, _frame):  # noqa: ARG001
-        # boot_bridge() 블로킹 중 KeyboardInterrupt가 늦게 처리되면 launch가 고아로 남긴다.
-        node.get_logger().info(f'종료 신호 수신 (signum={signum}) — gripper bridge 즉시 정리')
-        try:
-            node.shutdown()
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            if rclpy.ok():
-                rclpy.shutdown()
-        except Exception:  # noqa: BLE001
-            pass
-        os._exit(0)
-
-    signal.signal(signal.SIGTERM, _request_shutdown)
-    signal.signal(signal.SIGINT, _request_shutdown)
-
     try:
         node.boot_bridge()
         executor.add_node(node)
@@ -690,14 +694,13 @@ def main(args=None) -> None:
         # 경로를 써야 한다. boot_bridge는 위에서 spin 전 컨텍스트(직접 spin)로 이미 끝났다.
         node._bridge._executor_active = True
         executor.spin()
-    except (KeyboardInterrupt, ExternalShutdownException):
+    except KeyboardInterrupt:
         pass
     finally:
         executor.shutdown()
         node.shutdown()
         node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':

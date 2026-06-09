@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 # Doosan-E0509-ROBOTIS-RH-P12-RN-TCP-Bridge 패키지의 서비스를 래핑하는 ROS 2 그리퍼 제어 래퍼 노드.
 
-import os
 import threading
 import time
 
 import rclpy
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
-from rclpy.executors import MultiThreadedExecutor, ExternalShutdownException
+from rclpy.executors import MultiThreadedExecutor
 
 from std_srvs.srv import SetBool, Trigger
 from sensor_msgs.msg import JointState
@@ -33,8 +32,14 @@ class GripperNode(Node):
         self.declare_parameter('robot_ns', 'dsr01')
         self.declare_parameter('svc_timeout', 10.0)
         self.declare_parameter('state_hz', 20.0)
-        self.declare_parameter('open_current', 400)
+        self.declare_parameter('open_current', 200)
         self.declare_parameter('close_current', 300)
+        # 이송 전류 — 파지 후 들고 이동할 때 쓰는 낮은 전류. self-locking(기어비 1181:1)
+        # 덕에 약한 전류로도 물체를 유지 → 발열·과압착 완화. (close_current로 물고 LIFT 후 전환)
+        self.declare_parameter('transport_current', 150)
+        # idle 위치락 전류 — 작업 완료(IDLE) 시 현재 위치를 goal로 락 + 이 낮은 전류로 유지.
+        # Current-based 위치유지 미세토크(전류 튐/채터링)를 줄인다. self-locking이라 약해도 안 풀림.
+        self.declare_parameter('idle_current', 50)
         self.declare_parameter('profile_velocity', 1500)
         self.declare_parameter('profile_acceleration', 1000)
         self.declare_parameter('stroke_open', 0)
@@ -52,6 +57,8 @@ class GripperNode(Node):
         
         self.open_current = self.get_parameter('open_current').value
         self.close_current = self.get_parameter('close_current').value
+        self.transport_current = self.get_parameter('transport_current').value
+        self.idle_current = self.get_parameter('idle_current').value
         self.profile_velocity = self.get_parameter('profile_velocity').value
         self.profile_acceleration = self.get_parameter('profile_acceleration').value
         self.stroke_open = self.get_parameter('stroke_open').value
@@ -94,6 +101,10 @@ class GripperNode(Node):
                             self._srv_close, callback_group=cb)
         self.create_service(Trigger, '/gripper/stop',
                             self._srv_stop, callback_group=cb)
+        self.create_service(Trigger, '/gripper/hold_transport',
+                            self._srv_hold_transport, callback_group=cb)
+        self.create_service(Trigger, '/gripper/hold_idle',
+                            self._srv_hold_idle, callback_group=cb)
         self.create_service(SetBool, '/gripper/enable',
                             self._srv_enable, callback_group=cb)
 
@@ -115,6 +126,12 @@ class GripperNode(Node):
             elif param.name == 'close_current':
                 self.close_current = param.value
                 self.get_logger().info(f"파라미터 변경: close_current -> {param.value}")
+            elif param.name == 'transport_current':
+                self.transport_current = param.value
+                self.get_logger().info(f"파라미터 변경: transport_current -> {param.value}")
+            elif param.name == 'idle_current':
+                self.idle_current = param.value
+                self.get_logger().info(f"파라미터 변경: idle_current -> {param.value}")
             elif param.name == 'grasp_detect_current':
                 self.grasp_detect_current = param.value
                 self.get_logger().info(f"파라미터 변경: grasp_detect_current -> {param.value}")
@@ -230,66 +247,58 @@ class GripperNode(Node):
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     def _srv_open(self, _, res: Trigger.Response):
-        res.success, res.message = self._move(self.stroke_open, self.open_current)
+        # open은 무부하(여는) 방향이라 goal_current를 건드릴 이유가 없다.
+        # _move처럼 set_motion_profile로 전류를 먼저 바꾸면, goal_position이 아직 닫힘값(이전)인
+        # 채 전류만 바뀌어 set_position 전 짧게 close 방향으로 움직이는 '전류 침범'이 생긴다.
+        # → 전류 프로파일은 건드리지 않고 position만 보내 시퀀스를 분리한다.
+        pos_req = SetPosition.Request()
+        pos_req.position = self.stroke_open
+        pos_res = self._call_service(self._cli_set_position, pos_req, "set_position(open)")
+        res.success = bool(pos_res and pos_res.success)
+        res.message = "열기 완료" if (pos_res and pos_res.success) else "열기 실패"
+        return res
+
+    def _srv_hold_transport(self, _, res: Trigger.Response):
+        # 이송 전류로 전환 — 위치 명령 없이 goal_current만 낮춘다(물체 문 채 전류만 변경).
+        # apply_profile_settings가 토크를 끊지 않고 goal_current를 write하므로 물체를 안 놓친다.
+        profile_req = SetMotionProfile.Request()
+        profile_req.goal_current = self.transport_current
+        profile_req.profile_velocity = self.profile_velocity
+        profile_req.profile_acceleration = self.profile_acceleration
+        profile_res = self._call_service(self._cli_set_profile, profile_req, "set_motion_profile(transport)")
+        res.success = bool(profile_res and profile_res.success)
+        res.message = f"이송 전류 전환 ({self.transport_current}mA)" if res.success else "이송 전류 전환 실패"
+        return res
+
+    def _srv_hold_idle(self, _, res: Trigger.Response):
+        # idle 위치락 — 현재 위치를 goal로 명시(락) + idle_current(낮음)로 유지.
+        # Current-based 위치유지 미세토크(전류 튐)를 완화. self-locking이라 약해도 위치 유지.
+        with self._lock:
+            state = self._last_state
+        if state is None:
+            res.success = False
+            res.message = 'idle 위치락 실패 — 그리퍼 상태 미수신'
+            return res
+        pos = int(state.present_position)
+        profile_req = SetMotionProfile.Request()
+        profile_req.goal_current = self.idle_current
+        profile_req.profile_velocity = self.profile_velocity
+        profile_req.profile_acceleration = self.profile_acceleration
+        self._call_service(self._cli_set_profile, profile_req, "set_motion_profile(idle)")
+        pos_req = SetPosition.Request()
+        pos_req.position = pos
+        pos_res = self._call_service(self._cli_set_position, pos_req, "set_position(idle_hold)")
+        res.success = bool(pos_res and pos_res.success)
+        res.message = f'idle 위치락 (pos={pos}, {self.idle_current}mA)' if res.success else 'idle 위치락 실패'
         return res
 
     def _srv_close(self, _, res: Trigger.Response):
-        # 1. 기존 _move 함수를 사용해 모션 프로파일 설정 및 닫기 위치(1000) 인가
+        # 닫기 명령만 전송한다. 파지 성공/실패 판정은 상위(pick_place)가 LIFT 후
+        # 위치로 결정한다(설계안 v2). close 순간의 지터·통신노이즈에 휘둘리던
+        # 2.5초 모니터·전류판정·call_async 위치락을 제거했다.
         ok, msg = self._move(self.stroke_close, self.close_current)
-        if not ok:
-            res.success = False
-            res.message = f"이동 명령 전송 실패 - {msg}"
-            return res
-
-        # 2. 비동기 20Hz 상태 모니터링 루프 가동 (최대 2.5초)
-        start_time = time.time()
-        grasp_success = False
-        stable_count = 0
-        pos = None  # 루프 밖에서도 참조할 수 있도록 초기화
-
-        while time.time() - start_time < 2.5:
-            with self._lock:
-                state = self._last_state
-
-            if state is not None:
-                pos = state.present_position
-                curr = state.present_current
-
-                # 파지 감지 임계는 close_current(전류 한계)와 분리된 grasp_detect_current 사용.
-                # 단 한계보다 높으면 전류가 거기 못 닿아 영영 감지 못 하므로 close_current로 clamp.
-                detect_thresh = min(self.grasp_detect_current, self.close_current)
-                if self.min_grip_pos <= pos <= self.max_grip_pos:
-                    if curr >= detect_thresh:
-                        stable_count += 1
-                        if stable_count >= 2: # 2회 연속 감지 시 파지 성공으로 판단
-                            grasp_success = True
-                            # 물체를 쥐고 있는 현재 위치로 명령을 갱신 인가하여 락 고정
-                            pos_req = SetPosition.Request()
-                            pos_req.position = int(pos)
-                            self._cli_set_position.call_async(pos_req)
-                            break
-                    else:
-                        stable_count = 0
-
-                # 범위를 완전히 탈조하여 다 닫혀버린 경우 (물체 없음 — 수동 조작 또는 빈 상태)
-                if pos > self.max_grip_pos:
-                    self.get_logger().info(f"그리퍼 완전 닫힘 (물체 없음, 위치: {pos})")
-                    grasp_success = False
-                    break
-
-            time.sleep(0.05)
-
-        # 물체를 쥔 경우만 파지 성공. 완전히 닫힌 경우(수동 조작 등)는 성공으로 처리해
-        # GUI에 불필요한 '파지 실패' 알림이 표시되지 않도록 한다.
-        if grasp_success:
-            res.success = True
-            res.message = "파지 성공"
-        elif not grasp_success and pos is not None and pos > self.max_grip_pos:
-            res.success = True
-            res.message = "닫힘 완료 (물체 없음)"
-        else:
-            res.success = False
-            res.message = "파지 실패 (물체 누락)"
+        res.success = ok
+        res.message = "닫기 명령 전송" if ok else f"이동 명령 전송 실패 - {msg}"
         return res
 
     def _srv_stop(self, _, res: Trigger.Response):
@@ -310,24 +319,6 @@ class GripperNode(Node):
         res.success = bool(res_torque and res_torque.success)
         res.message = f"{label} 완료" if res.success else f"{label} 실패"
         return res
-
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # 타 노드 호출용 퍼블릭 메서드 (호환성 유지)
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-    def grip_cube(self) -> bool:
-        ok, msg = self._move(self.stroke_close, self.close_current)
-        self.get_logger().info(f"grip_cube -> {msg}")
-        return ok
-
-    def release(self) -> bool:
-        ok, msg = self._move(self.stroke_open, self.open_current)
-        self.get_logger().info(f"release -> {msg}")
-        return ok
-
-    def move_stroke(self, stroke: int, current: int | None = None) -> bool:
-        ok, _ = self._move(stroke, current or self.open_current)
-        return ok
 
     def shutdown_safe(self, executor, timeout_sec: float = 2.0):
         """종료 시 토크를 끈다(best-effort).
@@ -356,34 +347,14 @@ class GripperNode(Node):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def main(args=None):
-    import signal
-
     rclpy.init(args=args)
     executor = MultiThreadedExecutor(num_threads=4)
     node = None
-
-    def _request_shutdown(signum, _frame):  # noqa: ARG001
-        if node is not None:
-            node.get_logger().info(f'종료 신호 수신 (signum={signum}) — gripper 즉시 정리')
-            try:
-                node.shutdown_safe(executor)
-            except Exception:  # noqa: BLE001
-                pass
-        try:
-            if rclpy.ok():
-                rclpy.shutdown()
-        except Exception:  # noqa: BLE001
-            pass
-        os._exit(0)
-
-    signal.signal(signal.SIGTERM, _request_shutdown)
-    signal.signal(signal.SIGINT, _request_shutdown)
-
     try:
         node = GripperNode()
         executor.add_node(node)
         executor.spin()
-    except (KeyboardInterrupt, ExternalShutdownException):
+    except KeyboardInterrupt:
         pass
     finally:
         if node is not None and rclpy.ok():
