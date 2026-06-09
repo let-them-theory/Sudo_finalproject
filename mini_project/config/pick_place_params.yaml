@@ -166,9 +166,9 @@ pick_place_node:
     # grip_class_names ↔ grip_class_currents 는 같은 순서로 1:1 대응.
     # 아래 값은 현장 튜닝 시작값 — 실기에서 물체별로 미끄러짐/손상 보며 조정할 것.
     # 강성 기준 추정 시작값. 봉지/웨하스 등 잘 찌그러지는 것은 낮게, 캔/병/박스 등 단단한 것은 높게.
-    grip_current_default: 100
+    grip_current_default: 200
     grip_class_names: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "box", "can", "boxsnack", "wafers"]
-    grip_class_currents: [100, 100, 150, 100, 100, 100, 100, 100, 100, 100]
+    grip_class_currents: [150, 150, 150, 120, 180, 140, 180, 200, 170, 150]
     grip_current_min: 80            # 안전 clamp 하한 (free-run ~68mA보단 위, 그 아래는 파지감지 불안정)
     grip_current_max: 500           # 안전 clamp 상한
 

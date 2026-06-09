@@ -356,6 +356,15 @@ class PickPlaceGuiNode(Node):
         _add(Path.cwd())
         _add(Path.cwd() / 'mini_project')
 
+        # 설치본(install/share) 경로 — colcon build 후 ros2 launch로 실행하면
+        # __file__이 site-packages라 소스 트리를 못 찾는다. ament share 디렉터리를 직접 추가해
+        # 클론→빌드→실행 시에도 config/pick_place_params.yaml을 확실히 찾게 한다.
+        try:
+            from ament_index_python.packages import get_package_share_directory
+            _add(Path(get_package_share_directory('dsr_realsense_pick_place')))
+        except Exception:
+            pass
+
         for parent in Path(__file__).resolve().parents:
             _add(parent)
             _add(parent / 'src')
@@ -1877,9 +1886,9 @@ class PickPlaceGui(QWidget):
     def _load_grip_strength_config(self):
         """yaml에서 (names, currents, default, min, max)를 읽는다.
         실패 시 안전한 기본값으로 폴백한다."""
-        names = ['doll', 'cup', 'pencil', 'tape', 'pack']
-        currents = [250, 250, 200, 280, 350]
-        default, cmin, cmax = 300, 100, 500
+        names = ['ramen', 'pack', 'ssnack', 'bsnack', 'water', 'jelly', 'box', 'can', 'boxsnack', 'wafers']
+        currents = [150, 150, 150, 120, 180, 140, 180, 200, 170, 150]
+        default, cmin, cmax = 200, 80, 500
         path = self._find_params_yaml()
         if path is None:
             return names, currents, default, cmin, cmax
