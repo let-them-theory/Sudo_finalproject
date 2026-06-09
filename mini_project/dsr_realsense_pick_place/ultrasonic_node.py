@@ -14,7 +14,7 @@ except ImportError:
 def _parse_distance_m(line: str):
     """시리얼 한 줄에서 거리(m) 추출. 지원 형식:
     - DIST:23.4        (cm, hc_sr04_sensor.ino / 115200)
-    - Distance:88mm    (mm, 현장 아두이노 스케치 / 9600)
+    - DIstance:88mm    (mm, 현장 아두이노 스케치 / 9600, 오타 DIstance 포함)
     실패 시 None."""
     line = line.strip()
     if not line:

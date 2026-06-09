@@ -11,6 +11,7 @@ TIMEOUT="${2:-120}"
 source /opt/ros/"${ROS_DISTRO:-humble}"/setup.bash 2>/dev/null || true
 for _ws in \
   "/home/user/Sudo_finalproject-main/install/setup.bash" \
+  "/home/user/Sudo_finalproject/install/setup.bash" \
   "/home/user/doosan_ws/install/setup.bash"; do
   if [ -f "$_ws" ]; then
     # shellcheck disable=SC1090
@@ -19,17 +20,31 @@ for _ws in \
   fi
 done
 
+_wait_for_service() {
+  local svc="$1"
+  local timeout="$2"
+  local elapsed=0
+  while [ "$elapsed" -lt "$timeout" ]; do
+    if ros2 service list 2>/dev/null | grep -Fxq "${svc}"; then
+      return 0
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  return 1
+}
+
 DRL_START="/${ROBOT_NS}/drl/drl_start"
 SET_MODE="/${ROBOT_NS}/system/set_robot_mode"
 
 echo "[wait_robot] DRL 서비스 준비 대기: ${DRL_START} (max ${TIMEOUT}s)"
-if ! ros2 service wait "${DRL_START}" --timeout "${TIMEOUT}"; then
+if ! _wait_for_service "${DRL_START}" "${TIMEOUT}"; then
   echo "[wait_robot] FAIL: drl_start 타임아웃 — ros2_control 기동/DRCF 연결 확인"
   exit 1
 fi
 
 echo "[wait_robot] set_robot_mode 서비스 확인: ${SET_MODE}"
-if ! ros2 service wait "${SET_MODE}" --timeout 30; then
+if ! _wait_for_service "${SET_MODE}" 30; then
   echo "[wait_robot] WARN: set_robot_mode 미응답 (그리퍼 기동은 계속)"
 fi
 

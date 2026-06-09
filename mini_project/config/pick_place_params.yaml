@@ -86,8 +86,8 @@ object_detector:
     absolute_origin_in_camera_z_m: -0.96
 
     # --- 보정값 (mm) ---
-    absolute_calib_x_mm: -80.0
-    absolute_calib_y_mm: 40.0
+    absolute_calib_x_mm: -195.0
+    absolute_calib_y_mm: 10.0
     absolute_calib_z_mm: 125.0
     use_realsense: true # RealSense 카메라 사용 여부
 
@@ -171,7 +171,7 @@ pick_place_node:
     # PICK 하강 중 초음파 거리가 grasp_distance_m 이하가 되면 그 자리에서 파지.
     # 센서 미연결/임계 미달 시 카메라 기반 안전바닥(pose.z + pick_z_offset)에서 파지.
     use_ultrasonic_grasp: true
-    grasp_distance_m: 0.07          # 70mm 이하 감지 시 파지
+    grasp_distance_m: 0.05          # 50mm 이하 감지 시 파지
     ultrasonic_step_m: 0.01         # 1회 하강 스텝(m) — 작을수록 정밀/느림
     ultrasonic_settle_sec: 0.15     # 스텝 후 센서 갱신 대기(s)
     ultrasonic_range_topic: "/ultrasonic_range"

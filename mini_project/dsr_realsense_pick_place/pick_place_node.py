@@ -144,9 +144,9 @@ class PickPlaceNode(Node):
         # PICK 하강 시 초음파 거리가 grasp_distance_m 이하가 되면 그 자리에서 파지한다.
         # 센서값이 없거나(미연결) 임계 미달이면 카메라 기반 안전바닥(pose.z+pick_z_offset)에서 파지.
         self.declare_parameter('use_ultrasonic_grasp',        True)
-        self.declare_parameter('grasp_distance_m',            0.07)   # 70mm 이하면 파지
+        self.declare_parameter('grasp_distance_m',            0.08)   # 80mm 이하면 파지
         self.declare_parameter('ultrasonic_step_m',           0.01)   # 1회 하강 스텝(m)
-        self.declare_parameter('ultrasonic_settle_sec',       0.15)   # 스텝 후 센서 갱신 대기(s)
+        self.declare_parameter('ultrasonic_settle_sec',       0.05)   # 스텝 후 센서 갱신 대기(s)
         self.declare_parameter('ultrasonic_range_topic',      '/ultrasonic_range')
         self.declare_parameter('ultrasonic_max_age_sec',      0.5)    # 이보다 오래된 값은 무효
 
