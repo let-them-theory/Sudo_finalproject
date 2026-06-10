@@ -304,6 +304,46 @@ class UnknownTracker:
         return assignments
 
 
+class CentroidTracker:
+    """bbox 중심점 기반으로 프레임 간 ID를 유지하는 경량 트래커.
+    per-ROI predict 검출(추적 미포함)에 일관된 ID를 부여하기 위해 사용한다.
+    """
+
+    def __init__(self, max_dist: int = 60, max_age: int = 12):
+        self.max_dist = max_dist
+        self.max_age = max_age
+        self._tracks: dict = {}     # id → {cx, cy, age}
+        self._next_id = 1
+
+    def update(self, centroids: list) -> list:
+        """centroids: [(cx,cy),...]. 반환: [id,...] (입력 순서와 동일)."""
+        for tid in list(self._tracks):
+            self._tracks[tid]['age'] += 1
+            if self._tracks[tid]['age'] > self.max_age:
+                del self._tracks[tid]
+        used = set()
+        ids = []
+        for cx, cy in centroids:
+            best_tid, best_dist = None, self.max_dist
+            for tid, tr in self._tracks.items():
+                if tid in used:
+                    continue
+                dist = ((cx - tr['cx']) ** 2 + (cy - tr['cy']) ** 2) ** 0.5
+                if dist < best_dist:
+                    best_dist, best_tid = dist, tid
+            if best_tid is not None:
+                self._tracks[best_tid].update(cx=cx, cy=cy, age=0)
+                used.add(best_tid)
+                ids.append(best_tid)
+            else:
+                nid = self._next_id
+                self._next_id += 1
+                self._tracks[nid] = dict(cx=cx, cy=cy, age=0)
+                used.add(nid)
+                ids.append(nid)
+        return ids
+
+
 class ObjectDetectorNode(Node):
     def __init__(self):
         super().__init__('object_detector')
@@ -409,6 +449,47 @@ class ObjectDetectorNode(Node):
         self.declare_parameter('unknown_roi_shift_x', 74)
         self.declare_parameter('unknown_roi_shift_y', 10)
 
+        # true면 각 ROI를 따로 잘라(crop) YOLO를 개별 실행 → 뭉친 박스도 ROI별로 단독 검출.
+        # false면 전체 1번 + ROI 합집합 필터(기존 방식).
+        self.declare_parameter('roi_detect_per_roi', True)
+        # ── 박스 위치 ROI (unknown_roi와 동일 방식. 이 영역 안에서도 검출 허용) ───
+        # 검출은 unknown_roi 또는 box_roi/box_roi2 중 하나라도 안에 들면 통과(합집합).
+        self.declare_parameter('box_roi_enable', True)
+        self.declare_parameter('box_roi_w', 470)
+        self.declare_parameter('box_roi_h', 245)
+        self.declare_parameter('box_roi_shift_x', 120)
+        self.declare_parameter('box_roi_shift_y', 50)
+        # ── 박스 위치 ROI 2 (또 하나, 색만 다름 — 초록) ──
+        self.declare_parameter('box_roi2_enable', True)
+        self.declare_parameter('box_roi2_w', 470)
+        self.declare_parameter('box_roi2_h', 245)
+        self.declare_parameter('box_roi2_shift_x', -120)
+        self.declare_parameter('box_roi2_shift_y', 50)
+        # ── 박스 위치 ROI 3 (또 하나, 색만 다름 — 분홍) ──
+        self.declare_parameter('box_roi3_enable', True)
+        self.declare_parameter('box_roi3_w', 200)
+        self.declare_parameter('box_roi3_h', 125)
+        self.declare_parameter('box_roi3_shift_x', -130)
+        self.declare_parameter('box_roi3_shift_y', -55)
+        # ── 박스 위치 ROI 4 (또 하나, 색만 다름 — 파랑) ──
+        self.declare_parameter('box_roi4_enable', True)
+        self.declare_parameter('box_roi4_w', 200)
+        self.declare_parameter('box_roi4_h', 125)
+        self.declare_parameter('box_roi4_shift_x', 350)
+        self.declare_parameter('box_roi4_shift_y', -225)
+        # ── 박스 위치 ROI 5 (또 하나, 색만 다름 — 노랑) ──
+        self.declare_parameter('box_roi5_enable', True)
+        self.declare_parameter('box_roi5_w', 200)
+        self.declare_parameter('box_roi5_h', 125)
+        self.declare_parameter('box_roi5_shift_x', -150)
+        self.declare_parameter('box_roi5_shift_y', -140)
+        # 각 박스 ROI에서 unknown(FastSAM) 표시 허용 여부. false면 그 ROI엔 box만 뜨고 unknown 제거.
+        self.declare_parameter('box_roi_allow_unknown', True)
+        self.declare_parameter('box_roi2_allow_unknown', True)
+        self.declare_parameter('box_roi3_allow_unknown', True)
+        self.declare_parameter('box_roi4_allow_unknown', True)
+        self.declare_parameter('box_roi5_allow_unknown', True)
+
         p = self.get_parameter
         # 자주 쓰는 파라미터는 멤버 변수로 꺼내 두고 이후 계산에 재사용한다.
         self.camera_frame = p('camera_frame').value
@@ -501,9 +582,42 @@ class ObjectDetectorNode(Node):
         self.unknown_roi_h = int(p('unknown_roi_h').value)
         self.unknown_roi_shift_x = int(p('unknown_roi_shift_x').value)
         self.unknown_roi_shift_y = int(p('unknown_roi_shift_y').value)
+        self.roi_detect_per_roi = bool(p('roi_detect_per_roi').value)
+        self.box_roi_enable = bool(p('box_roi_enable').value)
+        self.box_roi_w = int(p('box_roi_w').value)
+        self.box_roi_h = int(p('box_roi_h').value)
+        self.box_roi_shift_x = int(p('box_roi_shift_x').value)
+        self.box_roi_shift_y = int(p('box_roi_shift_y').value)
+        self.box_roi2_enable = bool(p('box_roi2_enable').value)
+        self.box_roi2_w = int(p('box_roi2_w').value)
+        self.box_roi2_h = int(p('box_roi2_h').value)
+        self.box_roi2_shift_x = int(p('box_roi2_shift_x').value)
+        self.box_roi2_shift_y = int(p('box_roi2_shift_y').value)
+        self.box_roi3_enable = bool(p('box_roi3_enable').value)
+        self.box_roi3_w = int(p('box_roi3_w').value)
+        self.box_roi3_h = int(p('box_roi3_h').value)
+        self.box_roi3_shift_x = int(p('box_roi3_shift_x').value)
+        self.box_roi3_shift_y = int(p('box_roi3_shift_y').value)
+        self.box_roi4_enable = bool(p('box_roi4_enable').value)
+        self.box_roi4_w = int(p('box_roi4_w').value)
+        self.box_roi4_h = int(p('box_roi4_h').value)
+        self.box_roi4_shift_x = int(p('box_roi4_shift_x').value)
+        self.box_roi4_shift_y = int(p('box_roi4_shift_y').value)
+        self.box_roi5_enable = bool(p('box_roi5_enable').value)
+        self.box_roi5_w = int(p('box_roi5_w').value)
+        self.box_roi5_h = int(p('box_roi5_h').value)
+        self.box_roi5_shift_x = int(p('box_roi5_shift_x').value)
+        self.box_roi5_shift_y = int(p('box_roi5_shift_y').value)
+        self.box_roi_allow_unknown = bool(p('box_roi_allow_unknown').value)
+        self.box_roi2_allow_unknown = bool(p('box_roi2_allow_unknown').value)
+        self.box_roi3_allow_unknown = bool(p('box_roi3_allow_unknown').value)
+        self.box_roi4_allow_unknown = bool(p('box_roi4_allow_unknown').value)
+        self.box_roi5_allow_unknown = bool(p('box_roi5_allow_unknown').value)
         self.fastsam = None
         self.fastsam_device = 'cpu'
         self._unknown_tracker = UnknownTracker(max_dist=80, max_age=12)
+        # per-ROI YOLO 검출용 중심점 트래커 (predict 결과에 일관 ID 부여)
+        self._known_tracker = CentroidTracker(max_dist=60, max_age=12)
         if self.use_fastsam:
             self._load_fastsam()
 
@@ -695,6 +809,101 @@ class ObjectDetectorNode(Node):
         y2 = min(frame_h, y1 + self.unknown_roi_h)
         return x1, y1, x2, y2
 
+    def _box_roi_rect(self, frame_w: int, frame_h: int) -> tuple:
+        """박스 위치 ROI 사각형 (x1,y1,x2,y2). unknown_roi와 동일 로직, 박스용 파라미터 사용."""
+        cx = frame_w // 2 + self.box_roi_shift_x
+        cy = frame_h // 2 + self.box_roi_shift_y
+        x1 = max(0, cx - self.box_roi_w // 2)
+        y1 = max(0, cy - self.box_roi_h // 2)
+        x2 = min(frame_w, x1 + self.box_roi_w)
+        y2 = min(frame_h, y1 + self.box_roi_h)
+        return x1, y1, x2, y2
+
+    def _box_roi2_rect(self, frame_w: int, frame_h: int) -> tuple:
+        """박스 위치 ROI 2 사각형 (x1,y1,x2,y2). 동일 로직, box_roi2 파라미터 사용."""
+        cx = frame_w // 2 + self.box_roi2_shift_x
+        cy = frame_h // 2 + self.box_roi2_shift_y
+        x1 = max(0, cx - self.box_roi2_w // 2)
+        y1 = max(0, cy - self.box_roi2_h // 2)
+        x2 = min(frame_w, x1 + self.box_roi2_w)
+        y2 = min(frame_h, y1 + self.box_roi2_h)
+        return x1, y1, x2, y2
+
+    def _box_roi3_rect(self, frame_w: int, frame_h: int) -> tuple:
+        """박스 위치 ROI 3 사각형 (x1,y1,x2,y2). 동일 로직, box_roi3 파라미터 사용."""
+        cx = frame_w // 2 + self.box_roi3_shift_x
+        cy = frame_h // 2 + self.box_roi3_shift_y
+        x1 = max(0, cx - self.box_roi3_w // 2)
+        y1 = max(0, cy - self.box_roi3_h // 2)
+        x2 = min(frame_w, x1 + self.box_roi3_w)
+        y2 = min(frame_h, y1 + self.box_roi3_h)
+        return x1, y1, x2, y2
+
+    def _box_roi4_rect(self, frame_w: int, frame_h: int) -> tuple:
+        """박스 위치 ROI 4 사각형 (x1,y1,x2,y2). 동일 로직, box_roi4 파라미터 사용."""
+        cx = frame_w // 2 + self.box_roi4_shift_x
+        cy = frame_h // 2 + self.box_roi4_shift_y
+        x1 = max(0, cx - self.box_roi4_w // 2)
+        y1 = max(0, cy - self.box_roi4_h // 2)
+        x2 = min(frame_w, x1 + self.box_roi4_w)
+        y2 = min(frame_h, y1 + self.box_roi4_h)
+        return x1, y1, x2, y2
+
+    def _box_roi5_rect(self, frame_w: int, frame_h: int) -> tuple:
+        """박스 위치 ROI 5 사각형 (x1,y1,x2,y2). 동일 로직, box_roi5 파라미터 사용."""
+        cx = frame_w // 2 + self.box_roi5_shift_x
+        cy = frame_h // 2 + self.box_roi5_shift_y
+        x1 = max(0, cx - self.box_roi5_w // 2)
+        y1 = max(0, cy - self.box_roi5_h // 2)
+        x2 = min(frame_w, x1 + self.box_roi5_w)
+        y2 = min(frame_h, y1 + self.box_roi5_h)
+        return x1, y1, x2, y2
+
+    def _active_roi_rects(self, frame_w: int, frame_h: int) -> list:
+        """활성화된 모든 ROI 사각형 목록 (unknown + box1~5). 검출 필터/FastSAM 영역 공통 사용."""
+        rects = []
+        if self.unknown_roi_enable:
+            rects.append(self._roi_rect(frame_w, frame_h))
+        if self.box_roi_enable:
+            rects.append(self._box_roi_rect(frame_w, frame_h))
+        if self.box_roi2_enable:
+            rects.append(self._box_roi2_rect(frame_w, frame_h))
+        if self.box_roi3_enable:
+            rects.append(self._box_roi3_rect(frame_w, frame_h))
+        if self.box_roi4_enable:
+            rects.append(self._box_roi4_rect(frame_w, frame_h))
+        if self.box_roi5_enable:
+            rects.append(self._box_roi5_rect(frame_w, frame_h))
+        return rects
+
+    def _unknown_suppress_rects(self, frame_w: int, frame_h: int) -> list:
+        """unknown(FastSAM)을 표시하지 않을 ROI 사각형들 — allow_unknown=false인 박스 ROI.
+        이 영역 안에 중심이 든 unknown 마스크는 제거된다(박스만 보이게)."""
+        out = []
+        if self.box_roi_enable and not self.box_roi_allow_unknown:
+            out.append(self._box_roi_rect(frame_w, frame_h))
+        if self.box_roi2_enable and not self.box_roi2_allow_unknown:
+            out.append(self._box_roi2_rect(frame_w, frame_h))
+        if self.box_roi3_enable and not self.box_roi3_allow_unknown:
+            out.append(self._box_roi3_rect(frame_w, frame_h))
+        if self.box_roi4_enable and not self.box_roi4_allow_unknown:
+            out.append(self._box_roi4_rect(frame_w, frame_h))
+        if self.box_roi5_enable and not self.box_roi5_allow_unknown:
+            out.append(self._box_roi5_rect(frame_w, frame_h))
+        return out
+
+    def _combined_roi_bbox(self, frame_w: int, frame_h: int) -> tuple:
+        """활성 ROI들을 모두 감싸는 사각형 (x1,y1,x2,y2). FastSAM/표시 영역으로 사용.
+        활성 ROI가 없으면 전체 프레임."""
+        rects = self._active_roi_rects(frame_w, frame_h)
+        if not rects:
+            return 0, 0, frame_w, frame_h
+        x1 = min(r[0] for r in rects)
+        y1 = min(r[1] for r in rects)
+        x2 = max(r[2] for r in rects)
+        y2 = max(r[3] for r in rects)
+        return x1, y1, x2, y2
+
     @staticmethod
     def _mask_box_iou(seg: np.ndarray, box: tuple) -> float:
         """FastSAM 마스크(bool)와 YOLO bbox(x1,y1,x2,y2)의 IoU."""
@@ -722,8 +931,11 @@ class ObjectDetectorNode(Node):
         반환: 합성된 debug 이미지(BGR).
         """
         H, W = color_img.shape[:2]
-        if self.unknown_roi_enable:
-            rx1, ry1, rx2, ry2 = self._roi_rect(W, H)
+        # FastSAM/표시 영역 = 활성화된 모든 ROI(unknown + box1~5)를 감싸는 사각형.
+        # 이렇게 해야 박스 ROI 안 객체도 FastSAM 세그가 따지고 화면에 마스크가 그려진다.
+        if self.unknown_roi_enable or self.box_roi_enable or self.box_roi2_enable \
+                or self.box_roi3_enable or self.box_roi4_enable or self.box_roi5_enable:
+            rx1, ry1, rx2, ry2 = self._combined_roi_bbox(W, H)
         else:
             rx1, ry1, rx2, ry2 = 0, 0, W, H
         roi = color_img[ry1:ry2, rx1:rx2]
@@ -743,16 +955,42 @@ class ObjectDetectorNode(Node):
                        or not self._sam_masks_cache)
             if run_now:
                 try:
-                    res = self.fastsam(
-                        roi, imgsz=self.fastsam_imgsz, conf=self.fastsam_conf,
-                        iou=self.fastsam_iou, retina_masks=True,
-                        device=self.fastsam_device, verbose=False)[0]
-                    fresh = []
-                    if res.masks is not None:
-                        for m in res.masks.data.cpu().numpy():
-                            if m.shape[:2] != (RH, RW):
-                                m = cv2.resize(m, (RW, RH), interpolation=cv2.INTER_NEAREST)
-                            fresh.append(m > 0.5)
+                    _active = self._active_roi_rects(W, H)
+                    if self.roi_detect_per_roi and _active:
+                        # 각 ROI를 따로 잘라 FastSAM 개별 실행 → 마스크를 합친 ROI 좌표계에 배치.
+                        # (뭉친 박스/객체도 각 ROI 안에서 독립적으로 세그된다.)
+                        fresh = []
+                        for (ax1, ay1, ax2, ay2) in _active:
+                            if ax2 <= ax1 or ay2 <= ay1:
+                                continue
+                            sub = color_img[ay1:ay2, ax1:ax2]
+                            sres = self.fastsam(
+                                sub, imgsz=self.fastsam_imgsz, conf=self.fastsam_conf,
+                                iou=self.fastsam_iou, retina_masks=True,
+                                device=self.fastsam_device, verbose=False)[0]
+                            if sres.masks is None:
+                                continue
+                            sh, sw = ay2 - ay1, ax2 - ax1
+                            ox, oy = ax1 - rx1, ay1 - ry1   # combined-roi 안에서 이 ROI 위치
+                            for m in sres.masks.data.cpu().numpy():
+                                if m.shape[:2] != (sh, sw):
+                                    m = cv2.resize(m, (sw, sh),
+                                                   interpolation=cv2.INTER_NEAREST)
+                                full = np.zeros((RH, RW), dtype=bool)
+                                full[oy:oy + sh, ox:ox + sw] = (m > 0.5)
+                                fresh.append(full)
+                    else:
+                        res = self.fastsam(
+                            roi, imgsz=self.fastsam_imgsz, conf=self.fastsam_conf,
+                            iou=self.fastsam_iou, retina_masks=True,
+                            device=self.fastsam_device, verbose=False)[0]
+                        fresh = []
+                        if res.masks is not None:
+                            for m in res.masks.data.cpu().numpy():
+                                if m.shape[:2] != (RH, RW):
+                                    m = cv2.resize(m, (RW, RH),
+                                                   interpolation=cv2.INTER_NEAREST)
+                                fresh.append(m > 0.5)
                     sam_masks = fresh
                     self._sam_masks_cache = fresh
                 except Exception as e:
@@ -783,11 +1021,28 @@ class ObjectDetectorNode(Node):
                 known_segs.append((bm, cls, conf))
 
         unknown_masks = []
+        # FastSAM 영역이 모든 ROI를 감싸는 큰 사각형이라, ROI 사이 gap의 마스크는 제외한다.
+        _active_rects = self._active_roi_rects(W, H)
+        # allow_unknown=false인 박스 ROI: 이 안의 unknown은 표시하지 않음(박스만 보이게).
+        _suppress_rects = self._unknown_suppress_rects(W, H)
         for i, seg in enumerate(sam_masks):
             if i in matched:
                 continue
             area = int(np.count_nonzero(seg))
             if area < self.unknown_min_area or area > self.unknown_max_area:
+                continue
+            # 마스크 중심이 실제 활성 ROI(unknown/box) 안에 있을 때만 unknown으로 인정
+            _uys, _uxs = np.where(seg)
+            if _uxs.size == 0:
+                continue
+            _fu = (int(_uxs.min()) + int(_uxs.max())) // 2 + rx1
+            _fv = (int(_uys.min()) + int(_uys.max())) // 2 + ry1
+            if _active_rects and not any(ax1 <= _fu < ax2 and ay1 <= _fv < ay2
+                                         for (ax1, ay1, ax2, ay2) in _active_rects):
+                continue
+            # unknown 금지 ROI 안이면 제거
+            if any(sx1 <= _fu < sx2 and sy1 <= _fv < sy2
+                   for (sx1, sy1, sx2, sy2) in _suppress_rects):
                 continue
             unknown_masks.append(seg)
 
@@ -863,7 +1118,40 @@ class ObjectDetectorNode(Node):
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 0), 1, cv2.LINE_AA)
 
         vis[ry1:ry2, rx1:rx2] = roi_vis
-        cv2.rectangle(vis, (rx1, ry1), (rx2 - 1, ry2 - 1), (255, 255, 0), 2)
+        # 시안 사각형 = unknown_roi 자기 크기 (rx1..ry2는 모든 ROI를 감싸는 FastSAM 영역이라 별개)
+        if self.unknown_roi_enable:
+            ux1, uy1, ux2, uy2 = self._roi_rect(W, H)
+            cv2.rectangle(vis, (ux1, uy1), (ux2 - 1, uy2 - 1), (255, 255, 0), 2)
+        # 박스 위치 ROI — 주황 사각형 (unknown_roi와 동일 방식, 검출 영역으로도 쓰임)
+        if self.box_roi_enable:
+            bx1, by1, bx2, by2 = self._box_roi_rect(W, H)
+            cv2.rectangle(vis, (bx1, by1), (bx2 - 1, by2 - 1), (0, 140, 255), 2)
+            cv2.putText(vis, 'BOX', (bx1 + 4, by1 + 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 140, 255), 2)
+        # 박스 위치 ROI 2 — 초록 사각형
+        if self.box_roi2_enable:
+            cx1, cy1, cx2, cy2 = self._box_roi2_rect(W, H)
+            cv2.rectangle(vis, (cx1, cy1), (cx2 - 1, cy2 - 1), (0, 255, 0), 2)
+            cv2.putText(vis, 'BOX2', (cx1 + 4, cy1 + 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        # 박스 위치 ROI 3 — 분홍 사각형
+        if self.box_roi3_enable:
+            dx1, dy1, dx2, dy2 = self._box_roi3_rect(W, H)
+            cv2.rectangle(vis, (dx1, dy1), (dx2 - 1, dy2 - 1), (255, 0, 255), 2)
+            cv2.putText(vis, 'BOX3', (dx1 + 4, dy1 + 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+        # 박스 위치 ROI 4 — 파랑 사각형
+        if self.box_roi4_enable:
+            ex1, ey1, ex2, ey2 = self._box_roi4_rect(W, H)
+            cv2.rectangle(vis, (ex1, ey1), (ex2 - 1, ey2 - 1), (255, 0, 0), 2)
+            cv2.putText(vis, 'BOX4', (ex1 + 4, ey1 + 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+        # 박스 위치 ROI 5 — 노랑 사각형
+        if self.box_roi5_enable:
+            fx1, fy1, fx2, fy2 = self._box_roi5_rect(W, H)
+            cv2.rectangle(vis, (fx1, fy1), (fx2 - 1, fy2 - 1), (0, 255, 255), 2)
+            cv2.putText(vis, 'BOX5', (fx1 + 4, fy1 + 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
         # HUD (FPS / known / unknown / ROI)
         now = time.perf_counter()
@@ -1089,16 +1377,20 @@ class ObjectDetectorNode(Node):
         depth_img = self.latest_cv_depth_mm
 
         # YOLO를 우선 사용하고, 불가능하면 간단한 색상 기반 검출로 대체한다.
-        detections = (self._detect_yolo(color_img) if self.use_yolo and self.model
-                      else self._detect_color(color_img))
+        Hh, Ww = color_img.shape[:2]
+        _active = self._active_roi_rects(Ww, Hh)
 
-        # ROI가 켜져 있으면 known 검출도 ROI 안으로 제한한다.
-        # (이게 없으면 YOLO가 전체 프레임에서 돌아 ROI 밖 물체까지 인식됨)
-        if self.unknown_roi_enable:
-            Hh, Ww = color_img.shape[:2]
-            _rx1, _ry1, _rx2, _ry2 = self._roi_rect(Ww, Hh)
-            detections = [d for d in detections
-                          if _rx1 <= d[0] < _rx2 and _ry1 <= d[1] < _ry2]
+        if self.roi_detect_per_roi and _active and self.use_yolo and self.model:
+            # 각 ROI를 따로 잘라(crop) 개별 YOLO predict → 뭉친 박스도 ROI별로 단독 검출.
+            detections = self._detect_yolo_per_roi(color_img, _active)
+        else:
+            detections = (self._detect_yolo(color_img) if self.use_yolo and self.model
+                          else self._detect_color(color_img))
+            # 전체검출 모드: ROI 합집합으로 필터 (중심이 어느 ROI에도 없으면 제거)
+            if _active:
+                detections = [d for d in detections
+                              if any(rx1 <= d[0] < rx2 and ry1 <= d[1] < ry2
+                                     for (rx1, ry1, rx2, ry2) in _active)]
 
         candidates = []
         now_t = time.monotonic()
@@ -1540,6 +1832,54 @@ class ObjectDetectorNode(Node):
     # ────────────────────────────────────────────────────────────────────
     # YOLO 검출
     # ────────────────────────────────────────────────────────────────────
+    def _detect_yolo_per_roi(self, img: np.ndarray, roi_rects: list) -> list:
+        """각 ROI마다 따로 YOLO predict를 실행한다 — 단, '자르기(crop)'가 아니라 '가리기(masking)':
+        ROI 밖을 검정으로 가린 전체 크기 프레임을 넣는다. 스케일이 안 변해 검출 품질이 유지되고,
+        한 번에 한 ROI만 보이므로 뭉친 박스도 ROI별로 단독 검출된다.
+
+        반환: [(u, v, w, h, label_class, conf, tracker_id), ...]  — full-frame 좌표.
+        """
+        raw = []   # (u, v, w, h, cls, conf)
+        for (x1, y1, x2, y2) in roi_rects:
+            if x2 <= x1 or y2 <= y1:
+                continue
+            masked = np.zeros_like(img)
+            masked[y1:y2, x1:x2] = img[y1:y2, x1:x2]   # ROI만 남기고 검정 (전체 크기 유지)
+            try:
+                results = self.model.predict(
+                    masked, conf=self.conf_thresh, verbose=False)
+            except Exception as e:
+                self.get_logger().warn(f'per-ROI predict 실패: {e}',
+                                       throttle_duration_sec=5.0)
+                continue
+            for r in results:
+                if r.boxes is None:
+                    continue
+                for box in r.boxes:
+                    cls_id = int(box.cls[0])
+                    label_class = self.model.names[cls_id]
+                    if self.target_classes and label_class not in self.target_classes:
+                        continue
+                    conf = float(box.conf[0])
+                    bx1, by1, bx2, by2 = [int(v) for v in box.xyxy[0].tolist()]
+                    fu = (bx1 + bx2) // 2           # masking이라 이미 full-frame 좌표
+                    fv = (by1 + by2) // 2
+                    raw.append((fu, fv, bx2 - bx1, by2 - by1, label_class, conf))
+
+        # dedup: 겹치는 ROI에서 같은 물체가 두 번 잡히면 conf 높은 것만 남긴다(중심 근접 + 동일 클래스).
+        raw.sort(key=lambda d: -d[5])
+        kept = []
+        for d in raw:
+            if any(k[4] == d[4] and abs(k[0] - d[0]) < 40 and abs(k[1] - d[1]) < 40
+                   for k in kept):
+                continue
+            kept.append(d)
+
+        # 위치기반 트래커로 일관 ID 부여 (predict는 추적 ID가 없으므로)
+        tids = self._known_tracker.update([(d[0], d[1]) for d in kept])
+        return [(d[0], d[1], d[2], d[3], d[4], d[5], tid)
+                for d, tid in zip(kept, tids)]
+
     def _detect_yolo(self, img: np.ndarray) -> list:
         """YOLOv8 + 추적으로 이미지에서 물체를 검출.
 
