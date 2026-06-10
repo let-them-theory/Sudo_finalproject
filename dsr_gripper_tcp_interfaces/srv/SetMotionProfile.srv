@@ -1,0 +1,10 @@
+int32 goal_current
+int32 profile_velocity
+int32 profile_acceleration
+---
+bool success
+string message
+int32 goal_current
+int32 profile_velocity
+int32 profile_acceleration
+dsr_gripper_tcp_interfaces/GripperState state

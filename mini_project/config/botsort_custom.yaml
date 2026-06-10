@@ -1,0 +1,21 @@
+# BoT-SORT 트래커 커스텀 설정 (ultralytics .track() 용)
+# - track_buffer를 늘려 잠깐 가려졌다 나오는 물체의 ID가 유지되도록 한다.
+# - 기본값은 30프레임. 50으로 늘려 약 5초(@10Hz)의 occlusion까지 흡수.
+# - 그 외 항목은 ultralytics 기본값과 동일.
+
+tracker_type: botsort       # botsort 또는 bytetrack
+# 균형 임계 — ultralytics 기본(0.5/0.1/0.6)보다 살짝 낮춰서 GUI conf 0.25~0.6 범위와 호환.
+# 너무 낮추면(예전 0.15/0.05/0.2) 노이즈 검출까지 새 트랙 → 디바운스 미통과 → 검출률 하락 체감.
+# 너무 높이면(default 0.6) conf 낮춘 사용자가 새 트랙 못 만듦.
+track_high_thresh: 0.4      # 1차 매칭 임계 (confident 검출만)
+track_low_thresh: 0.1       # 2차 매칭 임계 (lost-track 회복용)
+new_track_thresh: 0.25      # 새 트랙 생성 임계 — GUI conf 최소 ~0.25에 맞춤
+track_buffer: 50            # ★ lost track 유지 프레임 수 (기본 30 → 50, occlusion 흡수)
+match_thresh: 0.8           # IoU 매칭 임계
+fuse_score: True
+
+# BoT-SORT 외관(appearance) 기능
+gmc_method: sparseOptFlow   # 글로벌 motion compensation
+proximity_thresh: 0.5
+appearance_thresh: 0.25
+with_reid: False
