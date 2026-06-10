@@ -1,0 +1,29 @@
+# Build artifacts
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ROS
+*.bag
+*.db3
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Calibration data (user-specific)
+scripts/sim2real/*.npz
+scripts/sim2real/*.npy
+scripts/sim2real/calibration_images/
