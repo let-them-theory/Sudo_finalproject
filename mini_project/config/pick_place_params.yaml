@@ -26,15 +26,15 @@ object_detector:
     target_classes: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "box", "can", "boxsnack", "unknown"]
 
     # known(정답·학습) 클래스 — 라벨에 클래스명 그대로 사용(예: "can_1").
-    # 이 외 검출은 'unknown_N'으로 표시. 현재 모델 10개 클래스를 그대로 등록.
+    # 이 외 검출은 'unknown_N'으로 표시.
     # pick_place_node의 grip_class_names와 동일 값으로 유지해야 한다. 어긋나면 시작 시 warn 발행.
     # GUI 강도 편집기에서 저장 누르면 이 줄도 자동 동기화됨.
     known_classes: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "box", "can", "boxsnack", "unknown"]
 
     # 클래스 → 배치 box_roi 구역(1~5). pick_place_node.sort_class_* 와 동일하게 유지.
     # box_roi1=zone1, box_roi2=zone2, ..., box_roi5=zone5
-    sort_class_names: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "box", "can", "boxsnack", "unknown"]
-    sort_class_zones: [1,       2,      2,        3,        4,       1,       3,     4,     5,          5]
+    sort_class_names: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "can", "boxsnack", "unknown"]
+    sort_class_zones: [1,       2,      2,        3,        4,       1,       4,     5,          5]
 
     # --- FastSAM unknown 검출 ---
     # proto.pt(YOLO)가 못 잡는(학습 안 된) 물체를 FastSAM 세그멘테이션으로 잡아
@@ -167,8 +167,8 @@ rh_p12_rna_gripper:
     svc_timeout: 10.0
     state_hz: 20.0
     # --- 그리퍼 동작 전류 (mA) — gripper_node가 실제로 읽는 이름 ---
-    open_current: 400           # 열기 전류 한계 (구 init_current)
-    close_current: 300          # 닫기/파지 전류 한계 (구 cube_current)
+    open_current: 200           # 열기 전류 한계 (구 init_current)
+    close_current: 200          # 닫기/파지 전류 한계 (구 cube_current)
     # --- 모터 속도/가속도 프로파일 ---
     profile_velocity: 1500      # 구동 속도(레지스터 280). 너무 높이면 물체 접촉 시 과부하 위험
     profile_acceleration: 1000  # 구동 가속도(레지스터 278)
@@ -187,6 +187,8 @@ rh_p12_rna_gripper:
 pick_place_gui:
   ros__parameters:
     use_local_yolo: false
+    # 선택 버튼에서만 숨길 클래스 — 검출·세그멘테이션(카메라 오버레이)은 그대로 표시.
+    gui_button_exclude_classes: ["box"]
     # 도달 가능 영역 필터 — 이 범위 밖 검출 물체는 GUI 버튼·요약 자체를 숨긴다.
     # pick_place_node.workspace_*와 동일 값 유지 권장. reach_radius_max는 박스와 별개로
     # sqrt(x^2+y^2)에 적용 — Doosan E0509 실제 리치는 900mm(0.9m). 테이블 높이 수직 파지 시
@@ -240,8 +242,8 @@ pick_place_node:
     # 아래 값은 현장 튜닝 시작값 — 실기에서 물체별로 미끄러짐/손상 보며 조정할 것.
     # 강성 기준 추정 시작값. 봉지/웨하스 등 잘 찌그러지는 것은 낮게, 캔/병/박스 등 단단한 것은 높게.
     grip_current_default: 200
-    grip_class_names: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "box", "can", "boxsnack", "unknown"]
-    grip_class_currents: [150, 150, 150, 120, 180, 140, 180, 200, 170, 150]
+    grip_class_names: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "can", "boxsnack", "unknown"]
+    grip_class_currents: [150, 150, 150, 120, 180, 140, 200, 170, 150]
     grip_current_min: 100           # 안전 clamp 하한
     grip_current_max: 500           # 안전 clamp 상한
 
@@ -287,9 +289,9 @@ pick_place_node:
 
     # 클래스명별 배치 구역 번호(1~5). 0 또는 미등록이면 place_position(기본값)으로 폴백.
     # box_roi1=zone1, box_roi2=zone2, box_roi3=zone3, box_roi4=zone4, box_roi5=zone5
-    sort_class_names: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "box", "can", "boxsnack", "unknown"]
-    sort_class_zones: [1,       2,      2,        3,        4,       1,       3,     4,     5,          5]
-    #                  ^roi1     ^roi2   ^roi2     ^roi3     ^roi4    ^roi1    ^roi3  ^roi4  ^roi5       ^roi5
+    sort_class_names: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "can", "boxsnack", "unknown"]
+    sort_class_zones: [1,       2,      2,        3,        4,       1,       4,     5,          5]
+    #                  ^roi1     ^roi2   ^roi2     ^roi3     ^roi4    ^roi1    ^roi4  ^roi5       ^roi5
 
     sort_max_empty_cycles:     2         # 연속 검출 실패 N회 시 정렬 종료
     sort_detect_timeout_sec:   5.0       # 물체 검출 대기 최대 시간(초)

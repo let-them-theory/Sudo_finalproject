@@ -214,6 +214,7 @@ class PickPlaceNode(Node):
         self._target_place_zone = 0
         # 현재 사이클의 Place 목표 좌표. 파지 확정 시 box_roi 구역으로 결정(폴백: place_position).
         self._active_place_pos = list(self.place_pos)
+        self._active_place_zone_idx = None
         # 사용자가 GUI에서 클릭한 라벨 (/selected_object_label 구독) — pose race 방지 검증용
         # 예: 사용자가 "doll_2" 클릭 → 발행되는 pose의 class가 "doll"이어야 채택
         self._selected_object_label = ''
@@ -539,6 +540,11 @@ class PickPlaceNode(Node):
         run_once(FSM)·sort_all 양쪽에서 동일 규칙으로 구역 배치를 결정한다.
         sort_roi_zone_positions[i] ↔ 카메라 box_roi(i+1).
         """
+        place, zone_idx = self._resolve_place(object_class, place_zone)
+        return place
+
+    def _resolve_place(self, object_class: str = '', place_zone: int = 0):
+        """box_roi 구역 → (place_xyz, zone_idx). zone_idx는 0-based, 미지정이면 None."""
         zone_idx = None
         zone = int(place_zone or 0)
         if zone > 0 and zone <= len(self.sort_zone_positions):
@@ -550,11 +556,11 @@ class PickPlaceNode(Node):
             place = list(self.sort_zone_positions[zone_idx])
             self.get_logger().info(
                 f'배치 구역 결정: box_roi{zone_idx + 1} place={place}')
-            return place
+            return place, zone_idx
         cls = (object_class or '').strip()
         self.get_logger().info(
             f'배치 구역 결정: class={cls!r} zone={zone} → default place={list(self.place_pos)}')
-        return list(self.place_pos)
+        return list(self.place_pos), None
 
     def _cb_ultrasonic(self, msg: Range):
         if msg.range is not None and msg.range > 0.0:
@@ -881,8 +887,8 @@ class PickPlaceNode(Node):
                         self._set_state(State.HOME)
                     else:
                         self.get_logger().info(f'파지 확정 (pos={grasp_pos:.0f}).')
-                        # 파지 확정 시점에 box_roi 구역으로 Place 좌표를 확정한다.
-                        self._active_place_pos = self._resolve_place_pos(
+                        # 파지 확정 시점에 box_roi 구역으로 Place 좌표·자세를 확정한다.
+                        self._active_place_pos, self._active_place_zone_idx = self._resolve_place(
                             self._target_object_class, self._target_place_zone)
                         # 파지 확정 → 이송 전류로 낮춰 들고 이동 (발열·과압착 완화, self-locking이 유지)
                         self._call_service(self.cli_gripper_hold_transport, Trigger.Request(),
@@ -890,22 +896,24 @@ class PickPlaceNode(Node):
                         self._set_state(State.MOVE_TO_PLACE)
 
                 elif current == State.MOVE_TO_PLACE:
-                    # Place 위치 상단으로 수평 이동 후 최종 하강
                     self.get_logger().info('Place 위치로 이동')
                     px, py, pz = self._active_place_pos
-                    self._move_to_cart(px, py, pz + self.pre_place_dz, self.place_rpy)
+                    self._move_to_cart(
+                        px, py, pz + self.pre_place_dz, self.place_rpy)
                     self._set_state(State.PLACE)
 
                 elif current == State.PLACE:
                     px, py, pz = self._active_place_pos
                     self.get_logger().info('물체 내려놓기')
-                    self._move_to_cart(px, py, pz, self.place_rpy, vel=50.0, acc=100.0)
+                    self._move_to_cart(
+                        px, py, pz, self.place_rpy, vel=50.0, acc=100.0)
                     self._gripper_open()
                     self._set_state(State.POST_PLACE)
 
                 elif current == State.POST_PLACE:
                     px, py, pz = self._active_place_pos
-                    self._move_to_cart(px, py, pz + self.pre_place_dz, self.place_rpy)
+                    self._move_to_cart(
+                        px, py, pz + self.pre_place_dz, self.place_rpy)
                     self.get_logger().info('Pick & Place 완료!')
                     self._set_state(State.HOME)
 
@@ -1067,7 +1075,7 @@ class PickPlaceNode(Node):
 
             empty_cycles = 0
             object_class = self._target_object_class or ''
-            place = self._resolve_place_pos(object_class, self._target_place_zone)
+            place, place_zone_idx = self._resolve_place(object_class, self._target_place_zone)
 
             rpy = self._grasp_rpy_for_pose(pose)
             px_obj = pose.pose.position.x
@@ -1355,8 +1363,12 @@ class PickPlaceNode(Node):
         else:
             self.get_logger().warn('에러 해제: set_robot_control 서비스 미연결 — 알람 리셋 생략')
 
-        # 2. 그리퍼 reinit (async). status3 latch가 있다면 풀어주는 용도.
-        if self.cli_gripper_reinit.service_is_ready():
+        # 2. 그리퍼 reinit (async). status3(IO_ERROR)는 in-process reinit이 status6까지 악화시킴.
+        #    GUI 에러 해제 버튼이 브릿지 재기동(restart_gripper_bridge.sh)으로 복구한다.
+        if self._gripper_last_status == 3:
+            self.get_logger().warn(
+                '에러 해제: 그리퍼 status3 — in-process reinit 생략 (GUI 브릿지 재기동 대기)')
+        elif self.cli_gripper_reinit.service_is_ready():
             def _reinit_done(future):
                 try:
                     r = future.result()
@@ -1373,10 +1385,15 @@ class PickPlaceNode(Node):
         self._publish_state(State.IDLE.value)
         self.get_logger().info('에러 해제 요청 — IDLE 복귀. 로봇은 정지 상태 유지.')
         res.success = True
-        res.message = (
-            '에러 해제: 알람 리셋 + 그리퍼 reinit 요청 완료. '
-            '그리퍼 ready 확인 후 수동으로 다음 명령을 내려주세요.'
-        )
+        if self._gripper_last_status == 3:
+            res.message = (
+                '에러 해제: 알람 리셋 완료. 그리퍼 status3 — 브릿지 재기동 후 ready 확인.'
+            )
+        else:
+            res.message = (
+                '에러 해제: 알람 리셋 + 그리퍼 reinit 요청 완료. '
+                '그리퍼 ready 확인 후 수동으로 다음 명령을 내려주세요.'
+            )
         return res
 
     def _srv_speed_normal(self, _, res: Trigger.Response):
