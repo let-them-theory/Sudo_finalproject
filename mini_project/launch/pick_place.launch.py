@@ -46,7 +46,11 @@ ARGUMENTS = [
     DeclareLaunchArgument('cam_tf_qz', default_value='0.0'),
     DeclareLaunchArgument('cam_tf_qw', default_value='0.707'),
     DeclareLaunchArgument('gui', default_value='true',
-                          description='PyQt GUI 실행 여부'),
+                          description='PyQt 관리자 GUI 실행 여부'),
+    DeclareLaunchArgument('kiosk', default_value='false',
+                          description='user web 주문 키오스크 백엔드 함께 실행'),
+    DeclareLaunchArgument('kiosk_port', default_value='8000',
+                          description='web 키오스크 포트'),
     DeclareLaunchArgument('use_launch_set_robot_mode', default_value='false',
                           description='Fallback: launch에서 set_robot_mode service call 실행 여부'),
     DeclareLaunchArgument('gripper_tcp_port', default_value='20002',
@@ -155,6 +159,16 @@ def generate_launch_description():
         ],
     )
 
+    # user web 키오스크 백엔드 — kiosk:=true 일 때만. 별도 web_kiosk.launch.py 재사용.
+    kiosk_backend = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource([
+            FindPackageShare('dsr_realsense_pick_place'),
+            '/launch/web_kiosk.launch.py'
+        ]),
+        launch_arguments={'kiosk_port': LaunchConfiguration('kiosk_port')}.items(),
+        condition=IfCondition(LaunchConfiguration('kiosk')),
+    )
+
     gripper = TimerAction(
         period=5.0,
         actions=[
@@ -220,6 +234,7 @@ def generate_launch_description():
         static_tf,
         object_detector,
         gui_node,
+        kiosk_backend,
         ultrasonic,
         gripper,
         pick_place,

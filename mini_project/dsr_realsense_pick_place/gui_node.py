@@ -84,6 +84,12 @@ from PyQt5.QtWidgets import (
     QSlider,
     QSpinBox,
     QFrame,
+    QTableWidget,
+    QTableWidgetItem,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QHeaderView,
+    QMessageBox,
 )
 from PyQt5.QtGui import QPalette, QFont
 from PyQt5.QtCore import QLibraryInfo
@@ -96,6 +102,22 @@ from std_msgs.msg import Int32, String
 
 from std_srvs.srv import SetBool, Trigger
 from dsr_gripper_tcp_interfaces.msg import GripperState
+
+# 유저 주문 큐 DB (web 백엔드/User_gui와 공유하는 JsonRepository). 관리자 USER 탭에서 읽기/비우기.
+from dsr_realsense_pick_place.task_repository import JsonRepository, OrderStatus, ItemStatus
+
+# 상태 영문 → 한글 (USER 탭 표시).
+_KR_STATUS = {
+    'QUEUED': '대기', 'RUNNING': '진행중', 'DONE': '완료',
+    'FAILED': '실패', 'CANCELED': '취소', 'PAUSED': '일시정지',
+}
+
+# 상품 class → 한글 표시명 (큐 탭 표시용).
+PRODUCT_KR = {
+    'ramen': '라면', 'pack': '팩음료', 'ssnack': '스낵', 'bsnack': '봉지과자',
+    'water': '생수', 'jelly': '젤리', 'box': '박스', 'can': '캔',
+    'boxsnack': '박스과자', 'wafers': '웨하스',
+}
 
 os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = QLibraryInfo.location(QLibraryInfo.PluginsPath)
 
@@ -241,6 +263,8 @@ class PickPlaceGuiNode(Node):
         self.detected_objects = []
         self._last_nonempty_objects = []
         self._last_nonempty_objects_time = 0.0
+        # box_N(1~5) 입구 위치 {x,y,z} — /detected_objects의 boxes 필드. 요약에 표시.
+        self._detected_boxes = {}
         self.selected_label = ''
         self.pick_place_state = 'IDLE'
         self.last_error_text = ''
@@ -735,6 +759,9 @@ class PickPlaceGuiNode(Node):
         else:
             self.detected_objects = []
         self.selected_label = payload.get('selected_label', '')
+        boxes = payload.get('boxes')
+        if isinstance(boxes, dict):
+            self._detected_boxes = boxes
         self.last_objects_time = now
 
     def _cb_state(self, msg: String):
@@ -826,6 +853,11 @@ class PickPlaceGui(QWidget):
     def __init__(self, ros_node: PickPlaceGuiNode):
         super().__init__()
         self.ros_node = ros_node
+        # 유저 주문 큐 DB (web 백엔드와 공유). 읽기 + 큐 비우기.
+        try:
+            self._order_repo = JsonRepository()
+        except Exception:
+            self._order_repo = None
         self._reset_in_progress = False
         self._reset_deadline = 0.0
         self._manual_command = None
@@ -1594,6 +1626,39 @@ class PickPlaceGui(QWidget):
         self.min_safe_z_status_label.setWordWrap(True)
         safety_layout.addWidget(self.min_safe_z_status_label)
 
+        # ── 초음파 파지 거리 (cm) — pick 하강 시 HC-SR04로 이 거리 도달하면 파지 ──
+        usonic_info = QLabel('초음파 파지 거리: 손끝-물체 거리가 이 값 이하가 되면 파지(IDLE 전용).')
+        usonic_info.setStyleSheet('color: #888; font-size: 11px;')
+        usonic_info.setWordWrap(True)
+        safety_layout.addWidget(usonic_info)
+
+        usonic_row = QHBoxLayout()
+        usonic_label = QLabel('파지 cm:')
+        usonic_label.setFixedWidth(56)
+        self.grasp_distance_spin = QDoubleSpinBox()
+        self.grasp_distance_spin.setRange(1.0, 30.0)   # cm
+        self.grasp_distance_spin.setSingleStep(0.5)
+        self.grasp_distance_spin.setDecimals(1)
+        self.grasp_distance_spin.setValue(self._load_grasp_distance_cm())
+        self.grasp_distance_spin.setFixedWidth(80)
+        self.grasp_distance_apply_button = QPushButton('적용')
+        self.grasp_distance_apply_button.setFixedSize(48, 26)
+        self.grasp_distance_apply_button.clicked.connect(self._grasp_distance_apply)
+        self.grasp_distance_save_button = QPushButton('💾 저장')
+        self.grasp_distance_save_button.setFixedSize(64, 26)
+        self.grasp_distance_save_button.clicked.connect(self._grasp_distance_save)
+        usonic_row.addWidget(usonic_label)
+        usonic_row.addWidget(self.grasp_distance_spin)
+        usonic_row.addStretch(1)
+        usonic_row.addWidget(self.grasp_distance_apply_button)
+        usonic_row.addWidget(self.grasp_distance_save_button)
+        safety_layout.addLayout(usonic_row)
+
+        self.grasp_distance_status_label = QLabel('')
+        self.grasp_distance_status_label.setStyleSheet('color: #aaa; font-size: 11px;')
+        self.grasp_distance_status_label.setWordWrap(True)
+        safety_layout.addWidget(self.grasp_distance_status_label)
+
         # ── 검출 임계 / 카메라 노출 조정 (운전 탭, 물체 선택 위) ─────────
         # confidence는 object_detector의 conf_thresh를 라이브 변경.
         # 노출은 RealSense rgb_camera 파라미터를 라이브 변경 (auto OFF 후 수동 값 설정).
@@ -1687,7 +1752,14 @@ class PickPlaceGui(QWidget):
 
         self.object_summary = QLabel('검출된 물체가 없습니다.')
         self.object_summary.setWordWrap(True)
-        object_layout.addWidget(self.object_summary)
+        self.object_summary.setAlignment(Qt.AlignTop)
+        # 검출 물체가 많으면 목록이 길어져 GUI가 늘어나므로 별도 스크롤 영역에 넣어
+        # 높이를 제한한다(넘치면 세로 스크롤).
+        summary_scroll = QScrollArea()
+        summary_scroll.setWidgetResizable(True)
+        summary_scroll.setWidget(self.object_summary)
+        summary_scroll.setMaximumHeight(300)
+        object_layout.addWidget(summary_scroll)
 
         # 탭1 "운전" 단일 컬럼: 긴급 제어 → 검출/노출 조정 → 물체 선택 → 실시간 전류
         # (상태창은 카메라와 그래프 사이의 cam_col로 이동 — 모든 탭에서 상시 노출)
@@ -1710,6 +1782,7 @@ class PickPlaceGui(QWidget):
         self.tabs.addTab(_tab_op, '운전')
         self.tabs.addTab(_tab_grip, 'gripper')
         self.tabs.addTab(_tab_set, '수동·설정')
+        self.tabs.addTab(self._build_queue_tab(), 'USER')
 
         # 카메라 영상은 어느 탭에서나 항상 보이도록 본문 좌측에 고정, 탭은 우측에 배치
         body = QHBoxLayout()
@@ -2173,6 +2246,81 @@ class PickPlaceGui(QWidget):
         except Exception as e:
             self.ros_node.get_logger().error(f'min_safe_z yaml 저장 실패: {e}')
             self.min_safe_z_status_label.setText(f'⚠ 저장 실패: {e}')
+
+    # ── 초음파 파지 거리 (cm) ────────────────────────────────────────
+    def _load_grasp_distance_cm(self) -> float:
+        """yaml에서 pick_place_node.grasp_distance_m(m)을 읽어 cm로 변환. 실패 시 7.0cm."""
+        path = self._find_params_yaml()
+        if path is None:
+            return 7.0
+        try:
+            with open(path, 'r') as f:
+                data = yaml.safe_load(f) or {}
+            pp = data.get('pick_place_node', {}).get('ros__parameters', {})
+            return float(pp.get('grasp_distance_m', 0.07)) * 100.0
+        except Exception as e:
+            self.ros_node.get_logger().warn(f'grasp_distance_m config 읽기 실패(7cm 사용): {e}')
+            return 7.0
+
+    def _grasp_distance_apply(self):
+        """스핀박스 값(cm)을 m로 변환해 pick_place_node.grasp_distance_m로 라이브 적용."""
+        cli = self.ros_node.cli_pickplace_set_parameters
+        if not cli.service_is_ready():
+            self.grasp_distance_status_label.setText('⚠ pick_place set_parameters 서비스 미연결')
+            return
+        val_m = float(self.grasp_distance_spin.value()) / 100.0
+        req = SetParameters.Request()
+        p = RclParameter()
+        p.name = 'grasp_distance_m'
+        p.value = ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=val_m)
+        req.parameters = [p]
+        future = cli.call_async(req)
+        future.add_done_callback(self._on_grasp_distance_applied)
+        self.grasp_distance_status_label.setText('적용 중...')
+
+    def _on_grasp_distance_applied(self, future):
+        try:
+            results = future.result().results
+            ok = bool(results) and all(r.successful for r in results)
+            reason = '' if ok else (results[0].reason if results else '거부됨')
+        except Exception as e:
+            self.ros_node.get_logger().error(f'grasp_distance_m 적용 실패: {e}')
+            self.grasp_distance_status_label.setText(f'⚠ 적용 실패: {e}')
+            return
+        if ok:
+            cm = float(self.grasp_distance_spin.value())
+            self.ros_node.get_logger().info(f'초음파 파지 거리 적용: {cm:.1f}cm')
+            self.grasp_distance_status_label.setText(f'✓ 적용: {cm:.1f} cm')
+        else:
+            self.grasp_distance_status_label.setText(f'⚠ 거부됨: {reason}')
+
+    def _grasp_distance_save(self):
+        """현재 값(cm→m)을 yaml의 grasp_distance_m 라인만 교체해 저장(주석 보존)."""
+        path = self._find_params_yaml()
+        if path is None:
+            self.grasp_distance_status_label.setText('⚠ config yaml 파일을 찾지 못함')
+            return
+        val_m = float(self.grasp_distance_spin.value()) / 100.0
+        try:
+            with open(path, 'r') as f:
+                lines = f.readlines()
+            replaced = False
+            for i, line in enumerate(lines):
+                m = re.match(r'^(\s*)grasp_distance_m\s*:', line)
+                if m:
+                    lines[i] = f'{m.group(1)}grasp_distance_m: {val_m:.3f}\n'
+                    replaced = True
+                    break
+            if not replaced:
+                self.grasp_distance_status_label.setText('⚠ yaml에서 grasp_distance_m 키를 찾지 못함')
+                return
+            with open(path, 'w') as f:
+                f.writelines(lines)
+            self.ros_node.get_logger().info(f'grasp_distance_m yaml 저장: {path} = {val_m:.3f}')
+            self.grasp_distance_status_label.setText(f'💾 저장 완료: {val_m*100:.1f} cm')
+        except Exception as e:
+            self.ros_node.get_logger().error(f'grasp_distance_m yaml 저장 실패: {e}')
+            self.grasp_distance_status_label.setText(f'⚠ 저장 실패: {e}')
 
     # ── 검출 임계 / 노출 (운전 탭) ───────────────────────────────────
     def _confidence_apply(self):
@@ -2698,6 +2846,10 @@ class PickPlaceGui(QWidget):
         # 시스템 리셋 진행 상태 폴링
         self._poll_system_reset()
 
+        # 주문 큐 탭이 보일 때만 큐를 주기 갱신 (불필요한 DB 읽기 방지).
+        if self.tabs.currentIndex() == self.tabs.count() - 1:
+            self._refresh_queue()
+
         self.ros_node.refresh_system_status()
         self._maybe_load_object_settings()
         self._maybe_apply_saved_model_path()
@@ -3140,12 +3292,192 @@ class PickPlaceGui(QWidget):
             if label not in active_labels:
                 button.setVisible(False)
 
+    # ── 주문 큐 탭 (유저 주문 모니터링 + 비우기) ─────────────────────
+    def _build_queue_tab(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(8, 8, 8, 8)
+
+        top = QHBoxLayout()
+        title = QLabel('유저 주문 큐')
+        title.setStyleSheet('font-size: 14px; font-weight: bold;')
+        self.queue_refresh_button = QPushButton('새로고침')
+        self.queue_refresh_button.setFixedHeight(28)
+        self.queue_refresh_button.clicked.connect(self._refresh_queue)
+        self.queue_pause_button = QPushButton('⏸ 큐 보류')
+        self.queue_pause_button.setFixedHeight(28)
+        self.queue_pause_button.clicked.connect(self._toggle_queue_pause)
+        self.queue_cancel_button = QPushButton('✓ 체크 주문 취소')
+        self.queue_cancel_button.setFixedHeight(28)
+        self.queue_cancel_button.clicked.connect(self._cancel_selected_order)
+        self.queue_clear_button = QPushButton('🗑 큐 비우기')
+        self.queue_clear_button.setFixedHeight(28)
+        self.queue_clear_button.clicked.connect(self._clear_queue)
+        top.addWidget(title)
+        top.addStretch(1)
+        top.addWidget(self.queue_refresh_button)
+        top.addWidget(self.queue_pause_button)
+        top.addWidget(self.queue_cancel_button)
+        top.addWidget(self.queue_clear_button)
+        lay.addLayout(top)
+
+        # 주문 단위 트리 — 부모=주문(번호표·수량·시간·상태), 자식=품목 내역. 펼치기/접기.
+        self.queue_tree = QTreeWidget()
+        self.queue_tree.setHeaderLabels(['주문', '수량', '시간', '상태'])
+        self.queue_tree.setColumnWidth(0, 120)
+        self.queue_tree.setColumnWidth(1, 56)
+        self.queue_tree.setColumnWidth(2, 64)
+        self.queue_tree.setRootIsDecorated(True)
+        # 체크박스 선택 보존 — 100ms 갱신으로 트리가 clear돼도 체크 유지.
+        self._checked_orders: set = set()
+        self._building_queue = False
+        self.queue_tree.itemChanged.connect(self._on_queue_check)
+        lay.addWidget(self.queue_tree)
+
+        self.queue_status_label = QLabel('주문 0건')
+        self.queue_status_label.setStyleSheet('color: #aaa; font-size: 12px;')
+        lay.addWidget(self.queue_status_label)
+        return w
+
+    def _refresh_queue(self):
+        if self._order_repo is None:
+            self.queue_status_label.setText('⚠ 주문 DB 연결 실패')
+            return
+        # web 백엔드가 쓴 최신 주문을 반영하려면 디스크에서 재읽기(다중 프로세스 공유 DB).
+        self._order_repo.reload()
+        try:
+            # 미완료(대기/진행/일시정지) 주문만, 최신순.
+            orders = self._order_repo.list_orders(
+                {OrderStatus.QUEUED, OrderStatus.RUNNING, OrderStatus.PAUSED})
+        except Exception as e:
+            self.queue_status_label.setText(f'⚠ 큐 읽기 실패: {e}')
+            return
+        orders.sort(key=lambda o: o.created_at, reverse=True)
+        paused = self._order_repo.is_queue_paused()
+
+        # 각 주문의 품목까지 미리 모음 (시그니처 + 렌더 공용).
+        order_items = {o.order_id: [it for it in
+                       (self._order_repo.get_item(i) for i in o.item_ids) if it]
+                       for o in orders}
+
+        # 변화 없으면 트리를 다시 그리지 않는다 — 100ms마다 clear하면 체크박스 조작이 불가능해진다.
+        sig = (paused, tuple(
+            (o.order_id, o.ticket_no, o.status,
+             tuple(it.status for it in order_items[o.order_id]))
+            for o in orders))
+        if sig == getattr(self, '_last_queue_sig', None):
+            return
+        self._last_queue_sig = sig
+
+        # 펼쳐둔 주문은 갱신 후에도 펼침 유지 (깜빡임 방지).
+        expanded = {
+            self.queue_tree.topLevelItem(i).text(0)
+            for i in range(self.queue_tree.topLevelItemCount())
+            if self.queue_tree.topLevelItem(i).isExpanded()
+        }
+        # 존재하는 주문만 체크 set에 유지(사라진 주문 정리).
+        self._checked_orders &= {o.order_id for o in orders}
+        self._building_queue = True   # 프로그램적 setCheckState가 핸들러 안 타게
+        self.queue_tree.clear()
+        for o in orders:
+            items = order_items[o.order_id]
+            hhmm = o.created_at[11:16] if len(o.created_at) >= 16 else ''
+            parent = QTreeWidgetItem([
+                o.ticket_no, f'{len(items)}개', hhmm, _KR_STATUS.get(o.status, o.status)])
+            parent.setData(0, Qt.UserRole, o.order_id)   # 취소용 order_id
+            parent.setFlags(parent.flags() | Qt.ItemIsUserCheckable)
+            parent.setCheckState(
+                0, Qt.Checked if o.order_id in self._checked_orders else Qt.Unchecked)
+            for it in items:
+                parent.addChild(QTreeWidgetItem([
+                    PRODUCT_KR.get(it.class_name, it.class_name), '', '',
+                    _KR_STATUS.get(it.status, it.status)]))
+            self.queue_tree.addTopLevelItem(parent)
+            if o.ticket_no in expanded:
+                parent.setExpanded(True)
+        self._building_queue = False
+        self.queue_pause_button.setText('▶ 큐 재개' if paused else '⏸ 큐 보류')
+        self.queue_status_label.setText(
+            f'주문 {len(orders)}건' + ('  ·  ⏸ 보류 중' if paused else ''))
+
+    def _clear_queue(self):
+        if self._order_repo is None:
+            return
+        reply = QMessageBox.question(
+            self, '큐 비우기', '대기/진행 중인 모든 유저 주문을 취소할까요?',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            self._order_repo.reload()   # web 백엔드 최신 상태 반영 후 취소(덮어쓰기 방지).
+            oids = {it.order_id for it in self._order_repo.get_queue()}
+            done, skipped = 0, 0
+            for oid in oids:
+                # 이미 처리 중(RUNNING) 주문은 취소하지 않음 — 로봇이 집는 중.
+                if self._order_repo.cancel_order(oid, protect_running=True):
+                    done += 1
+                else:
+                    skipped += 1
+        except Exception as e:
+            self.queue_status_label.setText(f'⚠ 비우기 실패: {e}')
+            return
+        self._refresh_queue()
+        msg = f'큐 비움 ({done}건 취소'
+        msg += f', {skipped}건 처리 중이라 보존)' if skipped else ')'
+        self.queue_status_label.setText(msg)
+
+    def _on_queue_check(self, item, _col):
+        # 부모(주문)의 체크 변화만 set에 반영. 갱신 중 프로그램 변경은 무시.
+        if self._building_queue or item.parent() is not None:
+            return
+        oid = item.data(0, Qt.UserRole)
+        if oid is None:
+            return
+        if item.checkState(0) == Qt.Checked:
+            self._checked_orders.add(oid)
+        else:
+            self._checked_orders.discard(oid)
+
+    def _cancel_selected_order(self):
+        if self._order_repo is None:
+            return
+        oids = set(self._checked_orders)
+        if not oids:
+            self.queue_status_label.setText('취소할 주문을 체크하세요')
+            return
+        reply = QMessageBox.question(
+            self, '주문 취소', f'체크한 {len(oids)}건을 취소할까요?',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        self._order_repo.reload()
+        done, skipped = 0, 0
+        for oid in oids:
+            # 이미 로봇이 처리 중(RUNNING)인 주문은 취소 안 함.
+            if self._order_repo.cancel_order(oid, protect_running=True):
+                done += 1
+            else:
+                skipped += 1
+        self._checked_orders.clear()
+        self._refresh_queue()
+        if skipped:
+            QMessageBox.warning(
+                self, '일부 취소 불가',
+                f'{done}건 취소. {skipped}건은 로봇이 처리 중이라 취소할 수 없습니다.')
+        self.queue_status_label.setText(
+            f'{done}건 취소' + (f', {skipped}건 보존' if skipped else ''))
+
+    def _toggle_queue_pause(self):
+        if self._order_repo is None:
+            return
+        self._order_repo.reload()
+        now = self._order_repo.is_queue_paused()
+        self._order_repo.set_queue_paused(not now)
+        self._refresh_queue()
+        self.queue_status_label.setText('큐 재개됨' if now else '큐 보류됨 (새 주문 투입 정지)')
+
     def _refresh_summary(self, detected_objects: list):
         # 우측 하단 요약은 "현재 검출된 물체 목록"을 사람이 빠르게 읽기 위한 영역이다.
-        if not detected_objects:
-            self.object_summary.setText('검출된 물체가 없습니다.')
-            return
-
         lines = []
         for item in detected_objects:
             pose = item.get('pose', {})
@@ -3156,6 +3488,19 @@ class PickPlaceGui(QWidget):
                 f"  XYZ=({pose.get('x', 0.0):+.3f}, {pose.get('y', 0.0):+.3f}, {pose.get('z', 0.0):+.3f}) m\n"
                 f"  Yaw={yaw_text}"
             )
+        # box ROI 입구 위치 = place 목적지. 물체와 별도로 항상 표시(place 좌표 확인용).
+        box_lines = []
+        boxes = self.ros_node._detected_boxes
+        for n in sorted(boxes, key=lambda k: int(k)):
+            p = boxes[n]
+            box_lines.append(
+                f"[box_{n}] XYZ=({p.get('x', 0.0):+.3f}, "
+                f"{p.get('y', 0.0):+.3f}, {p.get('z', 0.0):+.3f}) m")
+        if box_lines:
+            lines.append('── 박스(place 목적지) ──\n' + '\n'.join(box_lines))
+        if not lines:
+            self.object_summary.setText('검출된 물체가 없습니다.')
+            return
         self.object_summary.setText('\n\n'.join(lines))
 
     def _update_system_status_bar(self):
