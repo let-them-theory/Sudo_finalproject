@@ -46,10 +46,55 @@ object_detector:
     unknown_max_area: 10000      # unknown 마스크 최대 픽셀 면적 (ROI 360x240 기준)
     # unknown 검출 ROI (realsense_fastsam_segment.py와 동일). 이 영역 안에서만 FastSAM 동작.
     unknown_roi_enable: true
-    unknown_roi_w: 360
-    unknown_roi_h: 240
-    unknown_roi_shift_x: 74      # 화면 중앙에서 우측으로
-    unknown_roi_shift_y: 10      # 화면 중앙에서 아래로
+    unknown_roi_w: 600           #가로 크기 키우기/줄이기
+    unknown_roi_h: 300           # 세로 크기
+    unknown_roi_shift_x: 120      # 화면 중앙에서 좌우으로
+    unknown_roi_shift_y: 160      # 화면 중앙에서 아래위로
+
+    # true면 각 ROI마다 YOLO를 따로 실행(masking 방식 — 스케일 유지). FastSAM도 ROI별로 실행.
+    roi_detect_per_roi: true
+    # --- 박스 위치 ROI (unknown_roi와 동일 방식. 검출이 이 영역 안에서도 허용됨, 합집합) ---
+    # 화면에 주황 사각형으로 그려짐. 박스 위치에 맞게 조정.
+    box_roi_enable: true
+    box_roi_w: 240               # 가로 크기
+    box_roi_h: 185               # 세로 크기
+    box_roi_shift_x: 110         # 화면 중앙에서 좌우 이동 (+우 / -좌)
+    box_roi_shift_y: -55          # 화면 중앙에서 상하 이동 (+아래 / -위)
+
+    # --- 박스 위치 ROI 2 (또 하나, 초록 사각형) ---
+    box_roi2_enable: true
+    box_roi2_w: 240              # 가로 크기
+    box_roi2_h: 185              # 세로 크기
+    box_roi2_shift_x: 320       # 화면 중앙에서 좌우 이동 (+우 / -좌)
+    box_roi2_shift_y: -55        # 화면 중앙에서 상하 이동 (+아래 / -위)
+
+    # --- 박스 위치 ROI 3 (또 하나, 분홍 사각형) ---
+    box_roi3_enable: true
+    box_roi3_w: 280              # 가로 크기
+    box_roi3_h: 215              # 세로 크기
+    box_roi3_shift_x: 120       # 화면 중앙에서 좌우 이동 (+우 / -좌)
+    box_roi3_shift_y: -225        # 화면 중앙에서 상하 이동 (+아래 / -위)
+
+    # --- 박스 위치 ROI 4 (또 하나, 파랑 사각형) ---
+    box_roi4_enable: true
+    box_roi4_w: 260              # 가로 크기
+    box_roi4_h: 195              # 세로 크기
+    box_roi4_shift_x: 375       # 화면 중앙에서 좌우 이동 (+우 / -좌)
+    box_roi4_shift_y: -225       # 화면 중앙에서 상하 이동 (+아래 / -위)
+
+    # --- 박스 위치 ROI 5 (또 하나, 노랑 사각형) ---
+    box_roi5_enable: true
+    box_roi5_w: 185              # 가로 크기
+    box_roi5_h: 240              # 세로 크기
+    box_roi5_shift_x: -100       # 화면 중앙에서 좌우 이동 (+우 / -좌)
+    box_roi5_shift_y: -109       # 화면 중앙에서 상하 이동 (+아래 / -위)
+
+    # 각 박스 ROI에서 unknown(FastSAM) 표시 허용 여부. false면 그 ROI엔 box만 보임.
+    box_roi_allow_unknown: false    # BOX(주황) — unknown 금지
+    box_roi2_allow_unknown: false   # BOX2(초록) — unknown 금지
+    box_roi3_allow_unknown: false   # BOX3(분홍) — unknown 금지
+    box_roi4_allow_unknown: false   # BOX4(파랑) — unknown 금지
+    box_roi5_allow_unknown: true    # BOX5(노랑) — unknown 허용
 
     # --- 추적/디바운스 (검출 안정화: tracker ID 기반 표시 번호 [1],[2],...) ---
     tracker_type: "botsort_custom.yaml"  # 패키지 share/config 안의 파일명. 없으면 ultralytics 기본 사용
@@ -85,9 +130,9 @@ object_detector:
     absolute_origin_in_camera_y_m: 0.0
     absolute_origin_in_camera_z_m: -0.96
 
-    # --- 보정값 (mm) ---
-    absolute_calib_x_mm: -195.0
-    absolute_calib_y_mm: 10.0
+    # --- 보정값 (mm) ---  (카메라 이동 후 로봇 TCP 기준 1점 재캘리브레이션 값)
+    absolute_calib_x_mm: -148.0
+    absolute_calib_y_mm: -153.0
     absolute_calib_z_mm: 125.0
     use_realsense: true # RealSense 카메라 사용 여부
 
