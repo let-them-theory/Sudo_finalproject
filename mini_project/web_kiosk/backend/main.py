@@ -30,6 +30,7 @@ KNOWN_CLASSES = list(PRODUCT_DISPLAY.keys())
 
 ABNORMAL_STATES = {'ERROR', 'EMERGENCY_STOP'}
 GRASPED_STATES = {'LIFT', 'MOVE_TO_PLACE', 'PLACE', 'POST_PLACE'}
+INJECT_REPLY_TIMEOUT = 5.0   # run_once 응답 대기 한계(s). 초과 시 큐 영구정지 방지 복구.
 
 
 class KioskBackend(Node):
@@ -64,6 +65,8 @@ class KioskBackend(Node):
         self._item_grasped = False
         self._inject_inflight = False
         self._inject_cooldown_until = 0.0
+        self._inflight_item_id = None      # 응답 대기 중 item (워치독 복구용)
+        self._inject_sent_t = 0.0          # run_once 보낸 시각
         self._last_queue_json = None       # WS queue 변경 감지(중복 전송 억제)
         self._last_paused = None           # WS paused 변경 감지
 
@@ -107,6 +110,15 @@ class KioskBackend(Node):
         if abnormal:
             return
         if self._inject_inflight:
+            # 워치독 — run_once 응답이 끝내 안 오면(서비스 행/사망) 큐가 영구 정지한다.
+            # 타임아웃 초과 시 복구: item 되돌리고 백오프 후 재시도.
+            if time.monotonic() - self._inject_sent_t > INJECT_REPLY_TIMEOUT:
+                self.get_logger().warn('run_once 응답 타임아웃 → 큐 복구(재시도 예약)')
+                if self._inflight_item_id:
+                    self.repo.set_item_status(self._inflight_item_id, ItemStatus.QUEUED)
+                self._inflight_item_id = None
+                self._inject_inflight = False
+                self._inject_cooldown_until = time.monotonic() + 2.0
             return
         if self._injected_item_id is not None:
             if state in GRASPED_STATES:
@@ -148,6 +160,8 @@ class KioskBackend(Node):
         if not self.cli_run_once.service_is_ready():
             return
         self._inject_inflight = True
+        self._inflight_item_id = item.item_id
+        self._inject_sent_t = time.monotonic()
         self.repo.set_item_status(item.item_id, ItemStatus.RUNNING)
         label = String(); label.data = item.class_name
         self.pub_selected.publish(label)
@@ -155,11 +169,13 @@ class KioskBackend(Node):
 
         def _done(fut, iid=item.item_id):
             self._inject_inflight = False
+            self._inflight_item_id = None
             try:
                 res = fut.result()
             except Exception as e:
                 self.get_logger().error(f'run_once 호출 실패: {e}')
                 self.repo.set_item_status(iid, ItemStatus.QUEUED)
+                self._inject_cooldown_until = time.monotonic() + 2.0   # 예외 시도 폭주 방지
                 return
             if res.success:
                 self._injected_item_id = iid
@@ -255,28 +271,38 @@ class OrderBody(BaseModel):
     lines: list[tuple[str, int]]   # [(class_name, qty)]
 
 
+def _node():
+    # ROS 노드 초기화 전(lifespan 시작 틈)엔 503 — None 역참조 크래시 방지.
+    if node is None:
+        raise HTTPException(503, '서버 준비 중 — 잠시 후 다시 시도하세요')
+    return node
+
+
 @app.get('/api/catalog')
 def get_catalog():
-    avail = node.detected_classes if node else set()
+    n = _node()
+    avail = n.detected_classes
     return [{'class_name': c.class_name, 'display_name': c.display_name,
              'stock': c.stock, 'available': c.class_name in avail}
-            for c in node.repo.list_catalog()]
+            for c in n.repo.list_catalog()]
 
 
 @app.post('/api/orders')
 def create_order(body: OrderBody):
+    n = _node()
     if not body.lines:
         raise HTTPException(400, '빈 주문')
-    order = node.submit_order(body.lines)
+    order = n.submit_order(body.lines)
     return {'order_id': order.order_id, 'ticket_no': order.ticket_no}
 
 
 @app.get('/api/orders/{order_id}')
 def get_order(order_id: str):
-    order = node.repo.get_order(order_id)
+    n = _node()
+    order = n.repo.get_order(order_id)
     if order is None:
         raise HTTPException(404, '주문 없음')
-    items = [node.repo.get_item(i) for i in order.item_ids]
+    items = [n.repo.get_item(i) for i in order.item_ids]
     return {
         'order_id': order.order_id, 'ticket_no': order.ticket_no,
         'status': order.status,
@@ -287,27 +313,32 @@ def get_order(order_id: str):
 
 @app.post('/api/orders/{order_id}/cancel')
 def cancel_order(order_id: str):
-    if node.repo.get_order(order_id) is None:
+    n = _node()
+    if n.repo.get_order(order_id) is None:
         raise HTTPException(404, '주문 없음')
-    node.cancel_order(order_id)
+    n.cancel_order(order_id)
     return {'ok': True}
 
 
 @app.get('/api/queue')
 def get_queue():
-    return node._queue_dump()
+    return _node()._queue_dump()
 
 
 @app.get('/api/state')
 def get_state():
-    return {'state': node.pick_place_state,
-            'available': sorted(node.detected_classes),
-            'error': node.last_error_text}
+    n = _node()
+    return {'state': n.pick_place_state,
+            'available': sorted(n.detected_classes),
+            'error': n.last_error_text}
 
 
 @app.websocket('/ws')
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
+    if node is None:
+        await ws.close(code=1013)   # try again later
+        return
     _ws_clients.add(ws)
     # 접속 즉시 현재 상태 1회 전송.
     await ws.send_json({'type': 'state', 'value': node.pick_place_state})
