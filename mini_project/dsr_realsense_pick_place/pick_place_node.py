@@ -153,6 +153,20 @@ class PickPlaceNode(Node):
         # close 실패가 우리 신규 코드 때문인지 격리 검증용. true(default)로 두면 신규 코드 정상 작동.
         self.declare_parameter('enable_dynamic_grip_current',  True)
 
+        # ── Sort All (ROI 구역별 정렬) 파라미터 ──────────────────────────────
+        # 카메라 box_roi1~5 에 대응하는 로봇 place 좌표 (현장 캘리브레이션으로 채워넣을 것).
+        # sort_roi_zone_positions_{x,y,z}[i] = box_roi(i+1) 구역의 Place 목표 좌표(m).
+        self.declare_parameter('sort_roi_zone_positions_x', [0.4, 0.4, 0.4, 0.4, 0.4])
+        self.declare_parameter('sort_roi_zone_positions_y', [-0.4, -0.2, 0.0, 0.2, 0.4])
+        self.declare_parameter('sort_roi_zone_positions_z', [0.1, 0.1, 0.1, 0.1, 0.1])
+        # 클래스명별 ROI 구역 번호(1~5). 0 또는 맵에 없으면 default place_position 사용.
+        self.declare_parameter('sort_class_names', [''])
+        self.declare_parameter('sort_class_zones', [0])
+        # 연속 검출 실패 횟수 제한
+        self.declare_parameter('sort_max_empty_cycles',   2)
+        # 한 사이클당 물체 검출 대기 최대 시간(초)
+        self.declare_parameter('sort_detect_timeout_sec', 5.0)
+
         ns = self.get_parameter('robot_namespace').value
         self.jvel         = self.get_parameter('joint_vel').value
         self.jacc         = self.get_parameter('joint_acc').value
@@ -172,6 +186,9 @@ class PickPlaceNode(Node):
         self.use_target_pose_yaw = self.get_parameter('use_target_pose_yaw').value
         self.grasp_yaw_offset_deg = self.get_parameter('grasp_yaw_offset_deg').value
         self.max_grip_pos = self.get_parameter('max_grip_pos').value
+        # gripper_node는 JointState.position에 raw(0-1150) 값을 그대로 발행한다.
+        # _cb_gripper_state도 raw 단위로 비교해야 한다.
+        self.max_grip_pos_mm = float(self.max_grip_pos)
         self.grasp_min_pos = self.get_parameter('grasp_min_pos').value
         self.use_ultrasonic_grasp  = bool(self.get_parameter('use_ultrasonic_grasp').value)
         self.grasp_distance_m      = float(self.get_parameter('grasp_distance_m').value)
@@ -214,6 +231,25 @@ class PickPlaceNode(Node):
             '와 같이 두면 라벨↔강도 일치')
         # GUI에서 grip_* 파라미터를 바꾸면 맵을 라이브로 다시 만든다.
         self.add_on_set_parameters_callback(self._on_set_parameters)
+
+        # Sort All 파라미터 로딩 (ROI 구역 기반)
+        _zpx = list(self.get_parameter('sort_roi_zone_positions_x').value)
+        _zpy = list(self.get_parameter('sort_roi_zone_positions_y').value)
+        _zpz = list(self.get_parameter('sort_roi_zone_positions_z').value)
+        _nz  = min(len(_zpx), len(_zpy), len(_zpz))
+        # 인덱스 0 = box_roi1, 1 = box_roi2, ...
+        self.sort_zone_positions: list = [[_zpx[i], _zpy[i], _zpz[i]] for i in range(_nz)]
+
+        _sc_names = list(self.get_parameter('sort_class_names').value)
+        _sc_zones = list(self.get_parameter('sort_class_zones').value)
+        # class → 0-based zone index. 유효 범위(1~_nz)만 등록
+        self.sort_class_zone_map: dict = {
+            name: (zone - 1)
+            for name, zone in zip(_sc_names, _sc_zones)
+            if name and 1 <= zone <= _nz
+        }
+        self.sort_max_empty_cycles  = int(self.get_parameter('sort_max_empty_cycles').value)
+        self.sort_detect_timeout    = float(self.get_parameter('sort_detect_timeout_sec').value)
 
         self.ws = {
             'x': (self.get_parameter('workspace_x_min').value,
@@ -325,6 +361,7 @@ class PickPlaceNode(Node):
             Range, self.get_parameter('ultrasonic_range_topic').value,
             self._cb_ultrasonic, 10)
         self.create_service(Trigger, '/pick_place/run_once',       self._srv_run_once)
+        self.create_service(Trigger, '/pick_place/sort_all',       self._srv_sort_all)
         self.create_service(Trigger, '/pick_place/go_home',        self._srv_go_home)
         self.create_service(Trigger, '/pick_place/e_stop',         self._srv_e_stop)
         self.create_service(Trigger, '/pick_place/cancel',         self._srv_cancel)
@@ -613,14 +650,14 @@ class PickPlaceNode(Node):
         # 낙하 판정: 위치 기반. 물체를 쥐면 pos가 물체 두께(<max)에서 멈추고, 빠지면
         # 그리퍼가 완전닫힘(>max)으로 더 닫힌다(goal=1000 유지). 저전류 운영 시 전류 기반은
         # 정지구간 present_current가 낮아 상시 오탐이라 폐기하고 위치로 전환했다.
-        object_lost_condition = (pos > self.max_grip_pos)
+        object_lost_condition = (pos > self.max_grip_pos_mm)
 
         if object_lost_condition:
             self._object_lost_debounce_count += 1
             if self._object_lost_debounce_count >= self.object_lost_debounce_frames:
                 self.get_logger().error(
                     f'물체 탈조 낙하 감지 ({self._object_lost_debounce_count}프레임 지속): '
-                    f'위치={pos:.1f} > max_grip_pos {self.max_grip_pos}')
+                    f'위치={pos:.0f} > max_grip_pos {self.max_grip_pos_mm:.0f} (raw 0-1150)')
                 self._object_lost_debounce_count = 0
                 self._trigger_object_lost_stop()
         else:
@@ -940,7 +977,139 @@ class PickPlaceNode(Node):
             self._set_state(State.IDLE)
             return
 
+        if command == 'sort_all':
+            self.get_logger().info('Sort All 정렬 작업 시작')
+            self._execute_sort_all()
+            return
+
         raise RuntimeError(f'알 수 없는 명령: {command}')
+
+    def _execute_sort_all(self):
+        """작업공간 내 모든 물체를 클래스별 지정 위치로 정렬한다.
+
+        동작:
+          1. AUTO 모드 확인
+          2. 자동(nearest) 검출 → 해당 클래스의 sort place pos 선택
+          3. PRE_PICK→PICK→LIFT→MOVE_TO_PLACE→PLACE→POST_PLACE 인라인 실행
+          4. sort_max_empty_cycles 연속 검출 실패 시 종료 → HOME
+        """
+        if not self._ensure_robot_mode_auto_ready(timeout=5.0):
+            raise RuntimeError('robot_mode=AUTO 준비 전입니다. 잠시 후 다시 시도하세요.')
+
+        empty_cycles = 0
+        picked_count = 0
+
+        while rclpy.ok() and empty_cycles < self.sort_max_empty_cycles:
+            # ── 1. 검출 준비 ──────────────────────────────────────────────
+            self._clear_target()
+            self._clear_selected_label()  # auto(nearest) 모드
+            self._object_lost_triggered = False
+            with self.state_lock:
+                self.pick_requested = True
+            self._set_state(State.DETECTING)
+            self.detecting_start_time = time.monotonic()
+
+            # ── 2. target_pose 대기 ───────────────────────────────────────
+            deadline = time.monotonic() + self.sort_detect_timeout
+            while rclpy.ok() and time.monotonic() < deadline:
+                with self.state_lock:
+                    if self.target_pose is not None:
+                        break
+                time.sleep(0.1)
+
+            with self.state_lock:
+                pose = self.target_pose
+
+            if pose is None:
+                empty_cycles += 1
+                self.get_logger().info(
+                    f'물체 미검출 ({empty_cycles}/{self.sort_max_empty_cycles})')
+                with self.state_lock:
+                    self.pick_requested = False
+                self._set_state(State.IDLE)
+                continue
+
+            empty_cycles = 0
+            object_class = self._target_object_class or ''
+            zone_idx = self.sort_class_zone_map.get(object_class)
+            if zone_idx is not None and zone_idx < len(self.sort_zone_positions):
+                place = self.sort_zone_positions[zone_idx]
+                zone_label = f'zone{zone_idx + 1}(roi{zone_idx + 1})'
+            else:
+                place = list(self.place_pos)
+                zone_label = 'default'
+            self.get_logger().info(
+                f'정렬 대상: class={object_class!r} → {zone_label} place={place}')
+
+            rpy = self._grasp_rpy_for_pose(pose)
+            px_obj = pose.pose.position.x
+            py_obj = pose.pose.position.y
+            pz_obj = pose.pose.position.z
+
+            # ── 3. PRE_PICK ───────────────────────────────────────────────
+            self._set_state(State.PRE_PICK)
+            self._gripper_open()
+            self._move_to_cart(px_obj, py_obj, pz_obj + self.pre_pick_dz, rpy)
+
+            # ── 4. PICK ───────────────────────────────────────────────────
+            self._set_state(State.PICK)
+            z_floor = pz_obj + self.pick_dz
+            if not self.use_ultrasonic_grasp:
+                self._move_to_cart(px_obj, py_obj, z_floor, rpy, vel=50.0, acc=100.0)
+            else:
+                z = pz_obj + self.pre_pick_dz
+                while rclpy.ok():
+                    rng = self._fresh_range()
+                    if rng is not None and rng <= self.grasp_distance_m:
+                        break
+                    if z <= z_floor + 1e-6:
+                        break
+                    z = max(z_floor, z - self.ultrasonic_step_m)
+                    self._move_to_cart(px_obj, py_obj, z, rpy, vel=50.0, acc=100.0)
+                    time.sleep(self.ultrasonic_settle_sec)
+            self._gripper_close()
+
+            # ── 5. LIFT ───────────────────────────────────────────────────
+            self._set_state(State.LIFT)
+            self._move_to_cart(px_obj, py_obj, pz_obj + self.pre_pick_dz, rpy)
+
+            grasp_pos = self._gripper_last_pos
+            if grasp_pos <= self.grasp_min_pos or grasp_pos > self.max_grip_pos:
+                self.get_logger().error(
+                    f'파지 실패 (pos={grasp_pos:.0f}) — 홈 복귀 후 다음 물체 시도')
+                with self.state_lock:
+                    self.pick_requested = False
+                self._set_state(State.HOME)
+                self._go_home()
+                continue
+
+            self._call_service(self.cli_gripper_hold_transport, Trigger.Request(),
+                               'gripper/hold_transport', timeout=5.0)
+
+            # ── 6. MOVE_TO_PLACE ──────────────────────────────────────────
+            self._set_state(State.MOVE_TO_PLACE)
+            px, py, pz = place
+            self._move_to_cart(px, py, pz + self.pre_place_dz, self.place_rpy)
+
+            # ── 7. PLACE ──────────────────────────────────────────────────
+            self._set_state(State.PLACE)
+            self._move_to_cart(px, py, pz, self.place_rpy, vel=50.0, acc=100.0)
+            self._gripper_open()
+
+            # ── 8. POST_PLACE ─────────────────────────────────────────────
+            self._set_state(State.POST_PLACE)
+            self._move_to_cart(px, py, pz + self.pre_place_dz, self.place_rpy)
+
+            picked_count += 1
+            self.get_logger().info(
+                f'정렬 완료: {object_class!r} → ({px:.3f}, {py:.3f}, {pz:.3f}). '
+                f'누적 {picked_count}개')
+
+        # ── 9. HOME ───────────────────────────────────────────────────────
+        self._set_state(State.HOME)
+        self._go_home()
+        self._finish_cycle()
+        self.get_logger().info(f'Sort All 종료 — 총 {picked_count}개 정렬 완료')
 
     def _ensure_robot_mode_auto_ready(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
@@ -1000,6 +1169,25 @@ class PickPlaceNode(Node):
             return res
         res.success = True
         res.message = '1회 Pick & Place 실행을 예약했습니다.'
+        return res
+
+    def _srv_sort_all(self, _, res: Trigger.Response):
+        with self.state_lock:
+            busy = self.state != State.IDLE or self.pending_command is not None
+        if busy:
+            res.success = False
+            res.message = '현재 작업 중이어서 정렬을 시작할 수 없습니다.'
+            return res
+        if not self._gripper_ready:
+            res.success = False
+            res.message = '그리퍼 준비 미완료. 잠시 후 다시 시도하세요.'
+            return res
+        if not self._enqueue_command('sort_all'):
+            res.success = False
+            res.message = '대기 중인 명령이 있습니다.'
+            return res
+        res.success = True
+        res.message = '정렬 작업을 예약했습니다.'
         return res
 
     def _srv_go_home(self, _, res: Trigger.Response):

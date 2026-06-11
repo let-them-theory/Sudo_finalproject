@@ -155,8 +155,23 @@ def generate_launch_description():
         ],
     )
 
+    wait_robot = TimerAction(
+        period=10.0,
+        actions=[
+            ExecuteProcess(
+                cmd=[
+                    'bash',
+                    os.path.join(pkg_this, 'scripts', 'wait_for_robot_ready.sh'),
+                    LaunchConfiguration('robot_name'),
+                    '90',
+                ],
+                output='screen',
+            ),
+        ],
+    )
+
     gripper = TimerAction(
-        period=5.0,
+        period=12.0,
         actions=[
             Node(
                 package='dsr_gripper_tcp',
@@ -170,8 +185,9 @@ def generate_launch_description():
                     'goal_current': 400,
                     'profile_velocity': 1500,
                     'profile_acceleration': 1000,
-                    'poll_rate_hz': 10.0,
-                }]
+                    'poll_rate_hz': 20.0,
+                    'skip_set_autonomous': True,
+                }],
             ),
             Node(
                 package='dsr_realsense_pick_place',
@@ -181,12 +197,12 @@ def generate_launch_description():
                 parameters=[params_file, {
                     'robot_ns': LaunchConfiguration('robot_name'),
                 }],
-            )
-        ]
+            ),
+        ],
     )
 
     pick_place = TimerAction(
-        period=7.0,
+        period=18.0,
         actions=[
             Node(
                 package='dsr_realsense_pick_place',
@@ -221,6 +237,7 @@ def generate_launch_description():
         object_detector,
         gui_node,
         ultrasonic,
+        wait_robot,
         gripper,
         pick_place,
     ])

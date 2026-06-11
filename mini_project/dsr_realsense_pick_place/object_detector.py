@@ -26,6 +26,8 @@ RealSense RGB-D + YOLOv8 기반 객체 검출 노드.
 
 import json
 import math
+import queue
+import threading
 import time
 from pathlib import Path
 
@@ -668,6 +670,13 @@ class ObjectDetectorNode(Node):
         self.create_subscription(String, '/pick_place_state',
                                  self._cb_pick_place_state, 10)
 
+        # ── 검출 워커 스레드 ─────────────────────────────────────────────
+        # 카메라 콜백은 프레임을 큐에 넣고 즉시 반환 → ApproximateTimeSynchronizer 드랍 방지
+        # 워커 스레드가 큐에서 프레임을 꺼내 YOLO+FastSAM 추론(100-500ms)을 수행한다.
+        self._detect_queue: queue.Queue = queue.Queue(maxsize=1)
+        self._detect_thread = threading.Thread(target=self._detect_worker, daemon=True)
+        self._detect_thread.start()
+
         # ── 발행 ────────────────────────────────────────────────────────
         self.pub_pose = self.create_publisher(PoseStamped,
                                               '/detected_object_pose', 10)
@@ -955,42 +964,17 @@ class ObjectDetectorNode(Node):
                        or not self._sam_masks_cache)
             if run_now:
                 try:
-                    _active = self._active_roi_rects(W, H)
-                    if self.roi_detect_per_roi and _active:
-                        # 각 ROI를 따로 잘라 FastSAM 개별 실행 → 마스크를 합친 ROI 좌표계에 배치.
-                        # (뭉친 박스/객체도 각 ROI 안에서 독립적으로 세그된다.)
-                        fresh = []
-                        for (ax1, ay1, ax2, ay2) in _active:
-                            if ax2 <= ax1 or ay2 <= ay1:
-                                continue
-                            sub = color_img[ay1:ay2, ax1:ax2]
-                            sres = self.fastsam(
-                                sub, imgsz=self.fastsam_imgsz, conf=self.fastsam_conf,
-                                iou=self.fastsam_iou, retina_masks=True,
-                                device=self.fastsam_device, verbose=False)[0]
-                            if sres.masks is None:
-                                continue
-                            sh, sw = ay2 - ay1, ax2 - ax1
-                            ox, oy = ax1 - rx1, ay1 - ry1   # combined-roi 안에서 이 ROI 위치
-                            for m in sres.masks.data.cpu().numpy():
-                                if m.shape[:2] != (sh, sw):
-                                    m = cv2.resize(m, (sw, sh),
-                                                   interpolation=cv2.INTER_NEAREST)
-                                full = np.zeros((RH, RW), dtype=bool)
-                                full[oy:oy + sh, ox:ox + sw] = (m > 0.5)
-                                fresh.append(full)
-                    else:
-                        res = self.fastsam(
-                            roi, imgsz=self.fastsam_imgsz, conf=self.fastsam_conf,
-                            iou=self.fastsam_iou, retina_masks=True,
-                            device=self.fastsam_device, verbose=False)[0]
-                        fresh = []
-                        if res.masks is not None:
-                            for m in res.masks.data.cpu().numpy():
-                                if m.shape[:2] != (RH, RW):
-                                    m = cv2.resize(m, (RW, RH),
-                                                   interpolation=cv2.INTER_NEAREST)
-                                fresh.append(m > 0.5)
+                    res = self.fastsam(
+                        roi, imgsz=self.fastsam_imgsz, conf=self.fastsam_conf,
+                        iou=self.fastsam_iou, retina_masks=True,
+                        device=self.fastsam_device, verbose=False)[0]
+                    fresh = []
+                    if res.masks is not None:
+                        for m in res.masks.data.cpu().numpy():
+                            if m.shape[:2] != (RH, RW):
+                                m = cv2.resize(m, (RW, RH),
+                                               interpolation=cv2.INTER_NEAREST)
+                            fresh.append(m > 0.5)
                     sam_masks = fresh
                     self._sam_masks_cache = fresh
                 except Exception as e:
@@ -1315,10 +1299,11 @@ class ObjectDetectorNode(Node):
     # 콜백
     # ────────────────────────────────────────────────────────────────────
     def _cb_synced_camera(self, color_msg: Image, depth_msg: Image, info_msg: CameraInfo):
-        # 세 토픽이 같은 시점 기준으로 묶여 들어왔을 때만 내부 버퍼를 갱신한다.
+        # 이 콜백은 ROS 콜백 스레드에서 실행된다. 추론을 여기서 돌리면 ApproximateTimeSynchronizer
+        # 큐가 밀려 프레임이 드랍된다. 변환만 하고 워커 큐에 넣어 즉시 반환한다.
         try:
-            self.latest_cv_color = self.bridge.imgmsg_to_cv2(color_msg, 'bgr8')
-            self.latest_cv_depth_mm = self.bridge.imgmsg_to_cv2(depth_msg, '16UC1')
+            color_bgr = self.bridge.imgmsg_to_cv2(color_msg, 'bgr8')
+            depth_u16 = self.bridge.imgmsg_to_cv2(depth_msg, '16UC1')
         except CvBridgeError as e:
             self.get_logger().error(f'CV Bridge 변환 오류: {e}', throttle_duration_sec=3.0)
             return
@@ -1347,8 +1332,25 @@ class ObjectDetectorNode(Node):
             self.intrinsics = intr
             self.get_logger().info('카메라 내장 파라미터(Intrinsics) 수신 완료.')
 
-        # 동기화된 프레임이 들어올 때마다 바로 검출까지 이어서 수행한다.
-        self._detect_and_publish()
+        # 워커 큐가 가득 차면(이전 프레임 처리 중) 현재 프레임을 버린다.
+        # maxsize=1이므로 항상 최신 프레임 하나만 대기한다.
+        try:
+            self._detect_queue.put_nowait((color_bgr, depth_u16))
+        except queue.Full:
+            pass
+
+    def _detect_worker(self):
+        """카메라 콜백과 분리된 스레드에서 YOLO+FastSAM 추론을 수행한다."""
+        while rclpy.ok():
+            try:
+                color, depth = self._detect_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if self.intrinsics is None:
+                continue
+            self.latest_cv_color = color
+            self.latest_cv_depth_mm = depth
+            self._detect_and_publish()
 
     def _cb_selected_object(self, msg: String):
         # 빈 문자열이면 자동 선택 모드로 간주한다.
@@ -1621,13 +1623,14 @@ class ObjectDetectorNode(Node):
         if int(np.count_nonzero(valid)) < self.yaw_min_mask_pixels:
             return None
 
-        mask = np.zeros((h_img, w_img), dtype=np.uint8)
-        mask[y0:y1, x0:x1] = valid.astype(np.uint8) * 255
+        small_mask = valid.astype(np.uint8) * 255
         kernel = np.ones((5, 5), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        small_mask = cv2.morphologyEx(small_mask, cv2.MORPH_CLOSE, kernel)
+        small_mask = cv2.morphologyEx(small_mask, cv2.MORPH_OPEN, kernel)
 
-        ys, xs = np.nonzero(mask)
+        ys_roi, xs_roi = np.nonzero(small_mask)
+        ys = ys_roi + y0
+        xs = xs_roi + x0
         if ys.size < self.yaw_min_mask_pixels:
             return None
 

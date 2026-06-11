@@ -358,20 +358,20 @@ def build_drl_script(
             while attempts < 10:
                 try:
                     flange_serial_write(modbus_fc06(ADDR_TORQUE_ENABLE, 1))
-                    res, val = recv_modbus_response(1.0, 8)
+                    res, val = recv_modbus_response(0.3, 8)
                 except:
                     res = False
                 if res is True:
                     ok = True
                     break
                 attempts = attempts + 1
-                if attempts == 5:
+                if attempts == 3:
                     try:
                         reset_serial()
                     except:
-                        wait(0.5)
+                        wait(0.15)
                 else:
-                    wait(0.5)
+                    wait(0.15)
 
             if ok is False:
                 gripper_off()
