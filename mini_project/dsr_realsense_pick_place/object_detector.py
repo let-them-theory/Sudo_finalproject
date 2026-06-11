@@ -18,9 +18,10 @@ RealSense RGB-D + YOLOv8 기반 객체 검출 노드.
   /selected_object_label                     (std_msgs/String)        - GUI 선택 라벨
 
 발행:
-  /detected_object_pose    (geometry_msgs/PoseStamped) - 최종 선택된 물체의 베이스 좌표
-  /selected_object_pose    (geometry_msgs/PoseStamped) - pick_place_node가 구독하는 타겟 좌표
-  /detected_objects        (std_msgs/String)           - 검출 물체 전체 목록 (JSON 문자열)
+  /detected_object_pose         (geometry_msgs/PoseStamped) - 최종 선택된 물체의 베이스 좌표
+  /selected_object_pose         (geometry_msgs/PoseStamped) - pick_place_node가 구독하는 타겟 좌표
+  /selected_object_place_zone   (std_msgs/Int32)          - 배치 대상 box_roi 구역(1~5, 0=기본값)
+  /detected_objects             (std_msgs/String)           - 검출 물체 전체 목록 (JSON 문자열)
   /detection_debug_image   (sensor_msgs/Image)         - bbox / 깊이 정보가 그려진 디버그 이미지
 """
 
@@ -41,7 +42,7 @@ import pyrealsense2 as rs
 
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PoseStamped
-from std_msgs.msg import String
+from std_msgs.msg import Int32, String
 from cv_bridge import CvBridge, CvBridgeError
 import message_filters
 import tf2_ros
@@ -491,6 +492,9 @@ class ObjectDetectorNode(Node):
         self.declare_parameter('box_roi3_allow_unknown', True)
         self.declare_parameter('box_roi4_allow_unknown', True)
         self.declare_parameter('box_roi5_allow_unknown', True)
+        # 클래스 → box_roi 구역(1~5) 배치 대상. pick_place_node.sort_class_* 와 동일하게 유지.
+        self.declare_parameter('sort_class_names', [''])
+        self.declare_parameter('sort_class_zones', [0])
 
         p = self.get_parameter
         # 자주 쓰는 파라미터는 멤버 변수로 꺼내 두고 이후 계산에 재사용한다.
@@ -610,6 +614,9 @@ class ObjectDetectorNode(Node):
         self.box_roi5_h = int(p('box_roi5_h').value)
         self.box_roi5_shift_x = int(p('box_roi5_shift_x').value)
         self.box_roi5_shift_y = int(p('box_roi5_shift_y').value)
+        self._rebuild_sort_class_zone_map(
+            list(p('sort_class_names').value),
+            list(p('sort_class_zones').value))
         self.box_roi_allow_unknown = bool(p('box_roi_allow_unknown').value)
         self.box_roi2_allow_unknown = bool(p('box_roi2_allow_unknown').value)
         self.box_roi3_allow_unknown = bool(p('box_roi3_allow_unknown').value)
@@ -685,6 +692,9 @@ class ObjectDetectorNode(Node):
         # 선택된 물체의 클래스명 — pick_place가 물체별 그리퍼 강도를 정할 때 사용한다.
         # 좌표(pub_selected_pose)와 함께 발행해 자동/수동 선택 모두에서 라벨을 알 수 있게 한다.
         self.pub_selected_class = self.create_publisher(String, '/selected_object_class', 10)
+        # 배치 대상 box_roi 구역(1~5). 0=미지정(기본 place_position 폴백).
+        self.pub_selected_place_zone = self.create_publisher(
+            Int32, '/selected_object_place_zone', 10)
         self.pub_objects = self.create_publisher(String, '/detected_objects', 10)
         self.pub_debug = self.create_publisher(
             Image, '/detection_debug_image', qos_profile_sensor_data
@@ -867,6 +877,51 @@ class ObjectDetectorNode(Node):
         x2 = min(frame_w, x1 + self.box_roi5_w)
         y2 = min(frame_h, y1 + self.box_roi5_h)
         return x1, y1, x2, y2
+
+    def _rebuild_sort_class_zone_map(self, names: list, zones: list):
+        """클래스명 → box_roi 구역 번호(1~5) 맵 재구성."""
+        self._sort_class_zone_map: dict[str, int] = {
+            str(name).strip(): int(zone)
+            for name, zone in zip(names, zones)
+            if name and str(name).strip() and 1 <= int(zone) <= 5
+        }
+
+    def _box_roi_zone_rects(self, frame_w: int, frame_h: int) -> list:
+        """활성 box_roi만 (구역번호, 사각형) 목록. zone 1=box_roi, 2=box_roi2, ..."""
+        zones = []
+        if self.box_roi_enable:
+            zones.append((1, self._box_roi_rect(frame_w, frame_h)))
+        if self.box_roi2_enable:
+            zones.append((2, self._box_roi2_rect(frame_w, frame_h)))
+        if self.box_roi3_enable:
+            zones.append((3, self._box_roi3_rect(frame_w, frame_h)))
+        if self.box_roi4_enable:
+            zones.append((4, self._box_roi4_rect(frame_w, frame_h)))
+        if self.box_roi5_enable:
+            zones.append((5, self._box_roi5_rect(frame_w, frame_h)))
+        return zones
+
+    def _resolve_box_roi_zone_from_pixel(
+            self, pixel_u: int, pixel_v: int, frame_w: int, frame_h: int) -> int:
+        """픽셀 중심이 들어있는 box_roi 구역(1~5). 없으면 0."""
+        for zone_id, (x1, y1, x2, y2) in self._box_roi_zone_rects(frame_w, frame_h):
+            if x1 <= pixel_u < x2 and y1 <= pixel_v < y2:
+                return zone_id
+        return 0
+
+    def _resolve_place_zone(
+            self, class_name: str, pixel_u: int, pixel_v: int,
+            frame_w: int, frame_h: int) -> int:
+        """배치 대상 box_roi 구역(1~5) 결정.
+
+        1) 클래스 맵(sort_class_zones) — 테이블(unknown_roi)에서 집은 물체의 목표 박스.
+        2) 맵에 없으면 픽셀이 속한 box_roi 구역(이미 박스 안에 있는 물체 재배치).
+        """
+        cls = (class_name or '').strip()
+        zone = self._sort_class_zone_map.get(cls, 0)
+        if zone > 0:
+            return zone
+        return self._resolve_box_roi_zone_from_pixel(pixel_u, pixel_v, frame_w, frame_h)
 
     def _active_roi_rects(self, frame_w: int, frame_h: int) -> list:
         """활성화된 모든 ROI 사각형 목록 (unknown + box1~5). 검출 필터/FastSAM 영역 공통 사용."""
@@ -1068,6 +1123,7 @@ class ObjectDetectorNode(Node):
                 'depth_m': depth_m,
                 'pixel_u': u,
                 'pixel_v': v,
+                'place_zone': self._resolve_place_zone('object', u, v, W, H),
                 'pose': pose_abs,
                 'pose_dict': {'x': pos.x, 'y': pos.y, 'z': pos.z, 'yaw_deg': yaw_deg},
             })
@@ -1110,31 +1166,31 @@ class ObjectDetectorNode(Node):
         if self.box_roi_enable:
             bx1, by1, bx2, by2 = self._box_roi_rect(W, H)
             cv2.rectangle(vis, (bx1, by1), (bx2 - 1, by2 - 1), (0, 140, 255), 2)
-            cv2.putText(vis, 'BOX', (bx1 + 4, by1 + 22),
+            cv2.putText(vis, 'BOX Z1', (bx1 + 4, by1 + 22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 140, 255), 2)
         # 박스 위치 ROI 2 — 초록 사각형
         if self.box_roi2_enable:
             cx1, cy1, cx2, cy2 = self._box_roi2_rect(W, H)
             cv2.rectangle(vis, (cx1, cy1), (cx2 - 1, cy2 - 1), (0, 255, 0), 2)
-            cv2.putText(vis, 'BOX2', (cx1 + 4, cy1 + 22),
+            cv2.putText(vis, 'BOX Z2', (cx1 + 4, cy1 + 22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         # 박스 위치 ROI 3 — 분홍 사각형
         if self.box_roi3_enable:
             dx1, dy1, dx2, dy2 = self._box_roi3_rect(W, H)
             cv2.rectangle(vis, (dx1, dy1), (dx2 - 1, dy2 - 1), (255, 0, 255), 2)
-            cv2.putText(vis, 'BOX3', (dx1 + 4, dy1 + 22),
+            cv2.putText(vis, 'BOX Z3', (dx1 + 4, dy1 + 22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
         # 박스 위치 ROI 4 — 파랑 사각형
         if self.box_roi4_enable:
             ex1, ey1, ex2, ey2 = self._box_roi4_rect(W, H)
             cv2.rectangle(vis, (ex1, ey1), (ex2 - 1, ey2 - 1), (255, 0, 0), 2)
-            cv2.putText(vis, 'BOX4', (ex1 + 4, ey1 + 22),
+            cv2.putText(vis, 'BOX Z4', (ex1 + 4, ey1 + 22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
         # 박스 위치 ROI 5 — 노랑 사각형
         if self.box_roi5_enable:
             fx1, fy1, fx2, fy2 = self._box_roi5_rect(W, H)
             cv2.rectangle(vis, (fx1, fy1), (fx2 - 1, fy2 - 1), (0, 255, 255), 2)
-            cv2.putText(vis, 'BOX5', (fx1 + 4, fy1 + 22),
+            cv2.putText(vis, 'BOX Z5', (fx1 + 4, fy1 + 22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
         # HUD (FPS / known / unknown / ROI)
@@ -1268,6 +1324,16 @@ class ObjectDetectorNode(Node):
                     f'known_classes 갱신 → {sorted(new_known) if new_known else "(빈 set)"}')
                 # 변경 즉시 alignment 재확인 (모델은 그대로라 mismatch 체크 결과만 바뀜)
                 self._warn_class_alignment()
+            elif param.name in ('sort_class_names', 'sort_class_zones'):
+                try:
+                    names = list(self.get_parameter('sort_class_names').value)
+                    zones = list(self.get_parameter('sort_class_zones').value)
+                except Exception:
+                    return SetParametersResult(
+                        successful=False, reason='sort_class_names/zones 읽기 실패')
+                self._rebuild_sort_class_zone_map(names, zones)
+                self.get_logger().info(
+                    f'sort_class_zone_map 갱신 → {self._sort_class_zone_map}')
 
         if model_update is not None:
             if not model_update:
@@ -1433,6 +1499,7 @@ class ObjectDetectorNode(Node):
             prefix = label_class if is_known else 'unknown'
             display_label = f'{prefix}_{display_num}' if display_num is not None else prefix
 
+            place_zone = self._resolve_place_zone(label_class, u, v, Ww, Hh)
             candidate = {
                 'label': display_label,      # GUI 표시 + _choose_target 필터용 (count 보고 아래에서 재확정)
                 'class_name': label_class,   # 원본 yolo 클래스 (그리퍼 강도 룩업)
@@ -1442,6 +1509,7 @@ class ObjectDetectorNode(Node):
                 'depth_m': depth_m,
                 'pixel_u': u,
                 'pixel_v': v,
+                'place_zone': place_zone,    # 배치 대상 box_roi 구역(1~5), 0=미지정
                 'pose': pose_abs,
                 'pose_dict': {
                     'x': pos.x,
@@ -1522,10 +1590,13 @@ class ObjectDetectorNode(Node):
         self.pub_selected_pose.publish(pose_base)
         # 그리퍼 강도 룩업용 — 표시 라벨([1]) 아닌 원본 클래스 이름을 발행
         self.pub_selected_class.publish(String(data=selected.get('class_name', selected['label'])))
+        place_zone = int(selected.get('place_zone', 0))
+        self.pub_selected_place_zone.publish(Int32(data=place_zone))
         self.get_logger().info(
             f'[{selected["label"]}] 절대좌표: '
             f'x={pos.x:.3f} y={pos.y:.3f} z={pos.z:.3f} m '
-            f'yaw={self._pose_yaw_deg(selected["pose"]):+.1f} deg',
+            f'yaw={self._pose_yaw_deg(selected["pose"]):+.1f} deg '
+            f'place_zone=box_roi{place_zone if place_zone else "(default)"}',
             throttle_duration_sec=1.0,
         )
 
@@ -1789,6 +1860,7 @@ class ObjectDetectorNode(Node):
                     'depth_m': item['depth_m'],
                     'pixel_u': item['pixel_u'],
                     'pixel_v': item['pixel_v'],
+                    'place_zone': item.get('place_zone', 0),
                     'pose': item['pose_dict'],
                 }
                 for item in candidates

@@ -11,7 +11,7 @@ TERM_GRACE="${TERM_GRACE:-10}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
-source "${SCRIPT_DIR}/../../_source_workspace.sh"
+source "${SCRIPT_DIR}/../_source_workspace.sh"
 
 PKG_PREFIX="$(ros2 pkg prefix dsr_realsense_pick_place 2>/dev/null)"
 PF="${PKG_PREFIX}/share/dsr_realsense_pick_place/config/pick_place_params.yaml"
@@ -49,13 +49,13 @@ echo "[gripper-restart] gripper_service_node 새 프로세스로 재기동 (host
 setsid ros2 run dsr_gripper_tcp gripper_service_node --ros-args \
   -p controller_host:="$HOST" -p tcp_port:=20002 -p namespace:="$ROBOT_NS" \
   -p goal_current:=400 -p profile_velocity:=1500 -p profile_acceleration:=1000 \
-  -p connect_timeout_sec:=60.0 -p post_drl_start_sleep_sec:=2.0 -p drl_idle_stable_sec:=2.0 \
-  -p tcp_server_open_retry_sec:=0.5 -p init_attempts:=5 -p init_timeout_sec:=20.0 \
-  -p init_retry_delay_sec:=1.0 > /tmp/gripper_svc_restart.log 2>&1 &
+  -p skip_set_autonomous:=true -p poll_rate_hz:=20.0 \
+  > /tmp/gripper_svc_restart.log 2>&1 &
 
 echo "[gripper-restart] gripper_node(rh_p12_rna_gripper) 새 프로세스로 재기동..."
 setsid ros2 run dsr_realsense_pick_place gripper_node --ros-args \
   --params-file "$PF" -p robot_ns:="$ROBOT_NS" -r __node:=rh_p12_rna_gripper \
   > /tmp/gripper_node_restart.log 2>&1 &
 
-echo "[gripper-restart] 재기동 명령 전송 완료. 초기화에 ~5-40초. 로그: /tmp/gripper_svc_restart.log"
+echo "[gripper-restart] 재기동 명령 전송 완료. 초기화에 ~5-40초."
+echo "[gripper-restart] 로그: /tmp/gripper_svc_restart.log /tmp/gripper_node_restart.log"

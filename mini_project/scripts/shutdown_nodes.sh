@@ -3,7 +3,7 @@
 #
 # 종료 순서 (재연결 실패 방지):
 #   0. pick_place 정지
-#   1. DrlStop 서비스 (ros2_control 살아있을 때 — 플랜지 RS-485 해제)
+#   1. DrlStop 서비스 (잔여 DRL 있으면 정지)
 #   2. gripper_service / gripper_node SIGTERM (bridge.close → DrlStop 재시도)
 #   3. vision·보조 노드
 #   4. ros2_control_node SIGTERM (Drfl.close_connection — DRCF authority 해제)
@@ -31,7 +31,7 @@ done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
-source "${SCRIPT_DIR}/../../_source_workspace.sh"
+source "${SCRIPT_DIR}/../_source_workspace.sh"
 
 wait_gone() {
   local pattern="$1"

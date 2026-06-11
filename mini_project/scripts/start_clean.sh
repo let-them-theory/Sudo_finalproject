@@ -16,16 +16,16 @@ HOST="${1:-110.120.1.50}"
 echo "[start_clean] ===== 깨끗한 시작 ====="
 
 # ── 1. 잔재가 있으면만 정상 종료 (없으면 빠르게 건너뜀) ──────────────────
-if pgrep -f "ros2_control_node|gripper_service_node|pick_place_node|ros2 launch dsr_realsense" >/dev/null 2>&1; then
+if pgrep -f "ros2_control_node|gripper_service_node|gripper_node|pick_place_node|ros2 launch dsr_realsense" >/dev/null 2>&1; then
     echo "[start_clean] 기존 노드 감지 → 정상 종료(DRCF/DRL/시리얼 해제)..."
     bash "$SCRIPT_DIR/shutdown_nodes.sh" 2>/dev/null || true
     pkill -9 -f "ros2 launch dsr_realsense" 2>/dev/null || true
-    sleep 2
+    sleep 5
 else
     echo "[start_clean] 잔재 없음 — 바로 launch."
 fi
 
-# ── 2. 외부제어 포트 해제 확인 (점유 남아있으면 다음 시작이 막힘) ────────────
+# ── 2. 외부제어 포트 해제 확인 ────────────────────────────────────────────
 for i in 1 2 3; do
     if ss -tnp 2>/dev/null | grep -qE "20002|12345"; then
         echo "[start_clean] 포트(12345/20002) 아직 점유 — 대기 ($i/3)..."
@@ -38,7 +38,7 @@ done
 # ── 3. launch ────────────────────────────────────────────────────────────
 echo "[start_clean] launch (host=$HOST)..."
 # shellcheck disable=SC1091
-source "${SCRIPT_DIR}/../../_source_workspace.sh"
+source "${SCRIPT_DIR}/../_source_workspace.sh"
 export QT_QPA_PLATFORM=xcb
 export DISPLAY="${DISPLAY:-:0}"
 exec ros2 launch dsr_realsense_pick_place pick_place.launch.py mode:=real host:="$HOST"

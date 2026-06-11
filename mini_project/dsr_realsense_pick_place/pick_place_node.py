@@ -114,12 +114,12 @@ class PickPlaceNode(Node):
         self.declare_parameter('pre_place_z_offset',          0.15)
         self.declare_parameter('place_rpy',                   [0.0, 180.0, 0.0])
         self.declare_parameter('workspace_x_min',             0.15)
-        self.declare_parameter('workspace_x_max',             0.80)
-        self.declare_parameter('workspace_y_min',            -0.60)
-        self.declare_parameter('workspace_y_max',             0.60)
+        self.declare_parameter('workspace_x_max',             1.20)
+        self.declare_parameter('workspace_y_min',            -1.20)
+        self.declare_parameter('workspace_y_max',             1.20)
         self.declare_parameter('workspace_z_min',             0.0)
         self.declare_parameter('workspace_z_max',             0.60)
-        self.declare_parameter('reach_radius_max',            0.65)   # 평면 reach 하드 차단(movel을 범위밖에 안 보냄 → status3 source 차단)
+        self.declare_parameter('reach_radius_max',            1.20)   # 평면 reach 하드 차단(movel을 범위밖에 안 보냄 → status3 source 차단)
         # TCP Z 절대 하한 (base_link 기준, m). 모든 직교 이동이 이 값보다 낮게 내려가지 못하도록
         # _move_to_cart에서 강제 클램프한다. 검출 오차·잘못된 place 좌표 등 경로와 무관하게 작동.
         # 기본 0.0 = base_link 평면(현재 동작과 동일). 실제 테이블/안전 높이를 알면 그 값으로 올린다.
@@ -210,6 +210,10 @@ class PickPlaceNode(Node):
             list(self.get_parameter('grip_class_currents').value))
         # 파지 직전 갱신되는 현재 대상 물체 클래스 (/selected_object_class 구독)
         self._target_object_class = ''
+        # object_detector가 결정한 배치 box_roi 구역(1~5). 0=미지정.
+        self._target_place_zone = 0
+        # 현재 사이클의 Place 목표 좌표. 파지 확정 시 box_roi 구역으로 결정(폴백: place_position).
+        self._active_place_pos = list(self.place_pos)
         # 사용자가 GUI에서 클릭한 라벨 (/selected_object_label 구독) — pose race 방지 검증용
         # 예: 사용자가 "doll_2" 클릭 → 발행되는 pose의 class가 "doll"이어야 채택
         self._selected_object_label = ''
@@ -355,6 +359,8 @@ class PickPlaceNode(Node):
         self.create_subscription(GripperState, '/gripper_service/state', self._cb_gripper_status, 10)
         # 선택된 물체의 클래스명 — 파지 강도 결정에 사용 (object_detector가 좌표와 함께 발행)
         self.create_subscription(String, '/selected_object_class', self._cb_selected_class, 10)
+        self.create_subscription(
+            Int32, '/selected_object_place_zone', self._cb_selected_place_zone, 10)
         # 사용자가 GUI에서 클릭한 라벨 — pose race 방지 검증용 (사용자 선택과 일관된 pose만 채택)
         self.create_subscription(String, '/selected_object_label', self._cb_selected_label, 10)
         self.create_subscription(
@@ -522,6 +528,33 @@ class PickPlaceNode(Node):
     def _cb_selected_class(self, msg: String):
         # object_detector가 선택된 물체 좌표와 함께 발행하는 클래스명. 파지 강도 룩업에 쓴다.
         self._target_object_class = msg.data.strip()
+
+    def _cb_selected_place_zone(self, msg: Int32):
+        # object_detector가 결정한 배치 box_roi 구역(1~5). 카메라 box_roi와 1:1 대응.
+        self._target_place_zone = int(msg.data)
+
+    def _resolve_place_pos(self, object_class: str = '', place_zone: int = 0):
+        """box_roi 구역(1~5) → Place 좌표. 미지정이면 클래스 맵, 그래도 없으면 place_position.
+
+        run_once(FSM)·sort_all 양쪽에서 동일 규칙으로 구역 배치를 결정한다.
+        sort_roi_zone_positions[i] ↔ 카메라 box_roi(i+1).
+        """
+        zone_idx = None
+        zone = int(place_zone or 0)
+        if zone > 0 and zone <= len(self.sort_zone_positions):
+            zone_idx = zone - 1
+        if zone_idx is None:
+            cls = (object_class or '').strip()
+            zone_idx = self.sort_class_zone_map.get(cls)
+        if zone_idx is not None and zone_idx < len(self.sort_zone_positions):
+            place = list(self.sort_zone_positions[zone_idx])
+            self.get_logger().info(
+                f'배치 구역 결정: box_roi{zone_idx + 1} place={place}')
+            return place
+        cls = (object_class or '').strip()
+        self.get_logger().info(
+            f'배치 구역 결정: class={cls!r} zone={zone} → default place={list(self.place_pos)}')
+        return list(self.place_pos)
 
     def _cb_ultrasonic(self, msg: Range):
         if msg.range is not None and msg.range > 0.0:
@@ -848,6 +881,9 @@ class PickPlaceNode(Node):
                         self._set_state(State.HOME)
                     else:
                         self.get_logger().info(f'파지 확정 (pos={grasp_pos:.0f}).')
+                        # 파지 확정 시점에 box_roi 구역으로 Place 좌표를 확정한다.
+                        self._active_place_pos = self._resolve_place_pos(
+                            self._target_object_class, self._target_place_zone)
                         # 파지 확정 → 이송 전류로 낮춰 들고 이동 (발열·과압착 완화, self-locking이 유지)
                         self._call_service(self.cli_gripper_hold_transport, Trigger.Request(),
                                            'gripper/hold_transport', timeout=5.0)
@@ -856,19 +892,19 @@ class PickPlaceNode(Node):
                 elif current == State.MOVE_TO_PLACE:
                     # Place 위치 상단으로 수평 이동 후 최종 하강
                     self.get_logger().info('Place 위치로 이동')
-                    px, py, pz = self.place_pos
+                    px, py, pz = self._active_place_pos
                     self._move_to_cart(px, py, pz + self.pre_place_dz, self.place_rpy)
                     self._set_state(State.PLACE)
 
                 elif current == State.PLACE:
-                    px, py, pz = self.place_pos
+                    px, py, pz = self._active_place_pos
                     self.get_logger().info('물체 내려놓기')
                     self._move_to_cart(px, py, pz, self.place_rpy, vel=50.0, acc=100.0)
                     self._gripper_open()
                     self._set_state(State.POST_PLACE)
 
                 elif current == State.POST_PLACE:
-                    px, py, pz = self.place_pos
+                    px, py, pz = self._active_place_pos
                     self._move_to_cart(px, py, pz + self.pre_place_dz, self.place_rpy)
                     self.get_logger().info('Pick & Place 완료!')
                     self._set_state(State.HOME)
@@ -1031,15 +1067,7 @@ class PickPlaceNode(Node):
 
             empty_cycles = 0
             object_class = self._target_object_class or ''
-            zone_idx = self.sort_class_zone_map.get(object_class)
-            if zone_idx is not None and zone_idx < len(self.sort_zone_positions):
-                place = self.sort_zone_positions[zone_idx]
-                zone_label = f'zone{zone_idx + 1}(roi{zone_idx + 1})'
-            else:
-                place = list(self.place_pos)
-                zone_label = 'default'
-            self.get_logger().info(
-                f'정렬 대상: class={object_class!r} → {zone_label} place={place}')
+            place = self._resolve_place_pos(object_class, self._target_place_zone)
 
             rpy = self._grasp_rpy_for_pose(pose)
             px_obj = pose.pose.position.x
@@ -1131,6 +1159,7 @@ class PickPlaceNode(Node):
     def _clear_target(self):
         with self.state_lock:
             self.target_pose = None
+        self._target_place_zone = 0
 
     def _finish_cycle(self):
         self.pick_requested = False

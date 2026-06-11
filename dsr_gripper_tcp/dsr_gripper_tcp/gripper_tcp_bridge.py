@@ -290,23 +290,19 @@ def build_drl_script(
             return True, moving, moving_status, present_current, present_temperature, present_velocity, present_position
 
         def apply_profile():
+            # 레지스터 쓰기는 안정적이나 FC06/FC16 쓰기 에코(8B) 읽기는 RS-485에서 불안정.
+            # 에코 성공을 성공 조건으로 강제하면 status3 재시도 폭주 → write-only로 보내고 에코는 drain만 한다.
             global g_last_accel, g_last_velocity
             try:
                 flange_serial_write(modbus_fc06(ADDR_GOAL_CURRENT, g_goal_current))
-                ok, val = recv_modbus_response(0.3, 8)
-                if ok is False:
-                    return False
+                recv_modbus_response(0.15, 8)
                 if g_profile_acceleration != g_last_accel:
                     flange_serial_write(modbus_fc16(ADDR_PROFILE_ACCELERATION, 2, u32_to_words(g_profile_acceleration)))
-                    ok, val = recv_modbus_response(0.3, 8)
-                    if ok is False:
-                        return False
+                    recv_modbus_response(0.15, 8)
                     g_last_accel = g_profile_acceleration
                 if g_profile_velocity != g_last_velocity:
                     flange_serial_write(modbus_fc16(ADDR_PROFILE_VELOCITY, 2, u32_to_words(g_profile_velocity)))
-                    ok, val = recv_modbus_response(0.3, 8)
-                    if ok is False:
-                        return False
+                    recv_modbus_response(0.15, 8)
                     g_last_velocity = g_profile_velocity
             except:
                 return False
@@ -353,19 +349,26 @@ def build_drl_script(
                 gripper_off()
                 return False
 
+            # flange_serial_open 직후 그리퍼/RS-485가 응답 준비되기까지 settle 대기.
+            # (이 대기 없으면 첫 read_state가 status3로 떨어져 불필요한 재시도가 늘어남)
+            wait(0.5)
+
+            # 토크 활성화는 write-only로 보낸다(FC06 에코 읽기에 의존하지 않음 — RS-485 에코 불안정).
+            # 실제 생존/활성화 여부는 FC03 상태 읽기(read_state)로 검증한다. 읽기는 안정적이다.
             attempts = 0
             ok = False
-            while attempts < 10:
+            while attempts < 5:
                 try:
                     flange_serial_write(modbus_fc06(ADDR_TORQUE_ENABLE, 1))
-                    res, val = recv_modbus_response(0.3, 8)
                 except:
-                    res = False
-                if res is True:
+                    pass
+                wait(0.1)
+                s_ok, _, _, _, _, _, _ = read_state()
+                if s_ok is True:
                     ok = True
                     break
                 attempts = attempts + 1
-                if attempts == 3:
+                if attempts == 2:
                     try:
                         reset_serial()
                     except:
@@ -377,9 +380,7 @@ def build_drl_script(
                 gripper_off()
                 return False
 
-            if apply_profile() is False:
-                gripper_off()
-                return False
+            apply_profile()
 
             g_ready = True
             return True
@@ -440,15 +441,18 @@ def build_drl_script(
                 return
             enable = int.from_bytes(payload[0:2], byteorder='big', signed=False) != 0
             if enable:
+                # write-only 토크 활성화 후 FC03 상태 읽기로 생존 검증 (gripper_init 과 동일 구조).
                 try:
                     flange_serial_write(modbus_fc06(ADDR_TORQUE_ENABLE, 1))
-                    ok, val = recv_modbus_response(0.3, 8)
                 except:
-                    ok = False
+                    pass
+                wait(0.1)
+                ok, _, _, _, _, _, _ = read_state()
                 if ok is False:
                     send_response(command, seq, encode_state(STATUS_IO_ERROR, 0, 0, 0, 0, 0, 0))
                     return
-                g_ready = apply_profile()
+                apply_profile()
+                g_ready = True
             else:
                 try:
                     flange_serial_write(modbus_fc06(ADDR_TORQUE_ENABLE, 0))

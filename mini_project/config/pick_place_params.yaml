@@ -23,13 +23,18 @@ object_detector:
     # 인식할 클래스 목록 — 빈 문자열만 있으면 모든 클래스 통과로 처리(코드 측에서 strip 필터).
     # ROS2 humble은 yaml의 진짜 빈 리스트 []의 타입 추론을 못해 노드 사망. [""]는 string array로 OK.
     # 현재 모델(goods_yolo.pt)은 10개 클래스 멀티클래스 검출 모델이다.
-    target_classes: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "box", "can", "boxsnack", "wafers"]
+    target_classes: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "box", "can", "boxsnack", "unknown"]
 
     # known(정답·학습) 클래스 — 라벨에 클래스명 그대로 사용(예: "can_1").
     # 이 외 검출은 'unknown_N'으로 표시. 현재 모델 10개 클래스를 그대로 등록.
     # pick_place_node의 grip_class_names와 동일 값으로 유지해야 한다. 어긋나면 시작 시 warn 발행.
     # GUI 강도 편집기에서 저장 누르면 이 줄도 자동 동기화됨.
-    known_classes: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "box", "can", "boxsnack", "wafers"]
+    known_classes: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "box", "can", "boxsnack", "unknown"]
+
+    # 클래스 → 배치 box_roi 구역(1~5). pick_place_node.sort_class_* 와 동일하게 유지.
+    # box_roi1=zone1, box_roi2=zone2, ..., box_roi5=zone5
+    sort_class_names: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "box", "can", "boxsnack", "unknown"]
+    sort_class_zones: [1,       2,      2,        3,        4,       1,       3,     4,     5,          5]
 
     # --- FastSAM unknown 검출 ---
     # proto.pt(YOLO)가 못 잡는(학습 안 된) 물체를 FastSAM 세그멘테이션으로 잡아
@@ -131,8 +136,8 @@ object_detector:
     absolute_origin_in_camera_z_m: -0.96
 
     # --- 보정값 (mm) ---  (카메라 이동 후 로봇 TCP 기준 1점 재캘리브레이션 값)
-    absolute_calib_x_mm: -148.0
-    absolute_calib_y_mm: -153.0
+    absolute_calib_x_mm: -150.0
+    absolute_calib_y_mm: -173.0
     absolute_calib_z_mm: 125.0
     use_realsense: true # RealSense 카메라 사용 여부
 
@@ -187,12 +192,12 @@ pick_place_gui:
     # sqrt(x^2+y^2)에 적용 — Doosan E0509 실제 리치는 900mm(0.9m). 테이블 높이 수직 파지 시
     # 평면 리치 감소 + 안전여유 고려해 0.80m (실측상 0.8까지 동작 확인). 0.9 full은 특이점 위험.
     workspace_x_min: 0.15
-    workspace_x_max: 0.80
-    workspace_y_min: -0.60
-    workspace_y_max: 0.60
+    workspace_x_max: 1.20
+    workspace_y_min: -1.20
+    workspace_y_max: 1.20
     workspace_z_min: 0.0
     workspace_z_max: 0.60
-    reach_radius_max: 0.80
+    reach_radius_max: 1.20
 
 pick_place_node:
   ros__parameters:
@@ -235,7 +240,7 @@ pick_place_node:
     # 아래 값은 현장 튜닝 시작값 — 실기에서 물체별로 미끄러짐/손상 보며 조정할 것.
     # 강성 기준 추정 시작값. 봉지/웨하스 등 잘 찌그러지는 것은 낮게, 캔/병/박스 등 단단한 것은 높게.
     grip_current_default: 200
-    grip_class_names: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "box", "can", "boxsnack", "wafers"]
+    grip_class_names: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "box", "can", "boxsnack", "unknown"]
     grip_class_currents: [150, 150, 150, 120, 180, 140, 180, 200, 170, 150]
     grip_current_min: 100           # 안전 clamp 하한
     grip_current_max: 500           # 안전 clamp 상한
@@ -264,9 +269,9 @@ pick_place_node:
 
     # --- 안전 설정 ---
     workspace_x_min: 0.15           # 작업 영역 제한 (m)
-    workspace_x_max: 0.80
-    workspace_y_min: -0.60
-    workspace_y_max: 0.60
+    workspace_x_max: 1.20
+    workspace_y_min: -1.20
+    workspace_y_max: 1.20
     workspace_z_min: 0.0
     workspace_z_max: 0.60
     target_pose_topic: "/selected_object_pose"
@@ -276,13 +281,13 @@ pick_place_node:
     # 인덱스 0 = box_roi1, 1 = box_roi2, ..., 4 = box_roi5.
     # ★ 실제 테이블 좌표로 캘리브레이션 후 채워넣으세요 ★
     #         zone1(roi1)  zone2(roi2)  zone3(roi3)  zone4(roi4)  zone5(roi5)
-    sort_roi_zone_positions_x: [0.40,        0.40,        0.40,        0.40,        0.40]
-    sort_roi_zone_positions_y: [-0.40,       -0.20,       0.00,        0.20,        0.40]
-    sort_roi_zone_positions_z: [0.10,        0.10,        0.10,        0.10,        0.10]
+    sort_roi_zone_positions_x: [0.51,        0.20,        0.20,        0.51,        1.00]
+    sort_roi_zone_positions_y: [-0.29,       -0.29,       -0.45,       -0.45,        -0.29]
+    sort_roi_zone_positions_z: [0.20,        0.20,        0.45,        0.45,        0.20]
 
     # 클래스명별 배치 구역 번호(1~5). 0 또는 미등록이면 place_position(기본값)으로 폴백.
     # box_roi1=zone1, box_roi2=zone2, box_roi3=zone3, box_roi4=zone4, box_roi5=zone5
-    sort_class_names: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "box", "can", "boxsnack", "wafers"]
+    sort_class_names: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "box", "can", "boxsnack", "unknown"]
     sort_class_zones: [1,       2,      2,        3,        4,       1,       3,     4,     5,          5]
     #                  ^roi1     ^roi2   ^roi2     ^roi3     ^roi4    ^roi1    ^roi3  ^roi4  ^roi5       ^roi5
 

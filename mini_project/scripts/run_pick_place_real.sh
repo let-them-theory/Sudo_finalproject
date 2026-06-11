@@ -11,7 +11,7 @@ HOST="${ROBOT_HOST:-110.120.1.50}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # shellcheck disable=SC1091
-source "${SCRIPT_DIR}/../../_source_workspace.sh"
+source "${SCRIPT_DIR}/../_source_workspace.sh"
 
 _shutdown_ran=0
 _cleanup() {
