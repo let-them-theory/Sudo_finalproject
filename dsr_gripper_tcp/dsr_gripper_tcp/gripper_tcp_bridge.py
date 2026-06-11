@@ -9,7 +9,6 @@ from dsr_gripper_tcp.gripper_tcp_protocol import (
     GripperState,
     StatusCode,
     build_packet,
-    pack_config_payload,
     pack_initialize_payload,
     pack_move_payload,
     pack_torque_payload,
@@ -33,7 +32,6 @@ class GripperBridge:
 
     def connect(self, timeout: float = 30.0) -> None:
         deadline = time.monotonic() + timeout
-        attempt = 0
         last_log = 0.0
         while time.monotonic() < deadline:
             try:
@@ -42,7 +40,6 @@ class GripperBridge:
                 self._sock = s
                 return
             except OSError:
-                attempt += 1
                 now = time.monotonic()
                 if now - last_log >= 3.0:
                     last_log = now
@@ -74,13 +71,18 @@ class GripperBridge:
     def initialize(self, goal_current: int = 400, timeout: float = 40.0) -> GripperState:
         return self._send(Command.INITIALIZE, pack_initialize_payload(goal_current), timeout=timeout)
 
-    def set_motion_profile(self, goal_current: int, velocity: int, acceleration: int) -> GripperState:
-        return self._send(Command.SET_CONFIG, pack_config_payload(goal_current, velocity, acceleration))
-
-    def move_to(self, position: int, timeout_sec: float = 10.0) -> GripperState:
+    def move_to(
+        self,
+        position_mm: float,
+        goal_current: int,
+        profile_velocity: int,
+        profile_acceleration: int,
+        timeout_sec: float = 10.0,
+    ) -> GripperState:
+        """Move gripper to position_mm (0.0-106.0mm) with given force/velocity settings."""
         timeout_ms = max(0, int(timeout_sec * 1000))
-        return self._send(Command.MOVE, pack_move_payload(position, timeout_ms),
-                          timeout=max(timeout_sec + 2.0, 5.0))
+        payload = pack_move_payload(position_mm, goal_current, profile_velocity, profile_acceleration, timeout_ms)
+        return self._send(Command.MOVE, payload, timeout=max(timeout_sec + 2.0, 5.0))
 
     def set_torque(self, enabled: bool) -> GripperState:
         return self._send(Command.SET_TORQUE, pack_torque_payload(enabled))
@@ -117,7 +119,6 @@ def build_drl_script(
     return textwrap.dedent(f"""
         CMD_PING = 1
         CMD_INITIALIZE = 2
-        CMD_SET_CONFIG = 3
         CMD_MOVE = 4
         CMD_READ_STATE = 5
         CMD_SHUTDOWN = 6
@@ -135,6 +136,7 @@ def build_drl_script(
         POLL_WAIT_SEC = 0.05
         POSITION_TOLERANCE = {position_tolerance}
 
+        # RH-P12-RN Modbus RTU register map
         ADDR_TORQUE_ENABLE = 256
         ADDR_GOAL_CURRENT = 275
         ADDR_PROFILE_ACCELERATION = 278
@@ -146,6 +148,10 @@ def build_drl_script(
         ADDR_PRESENT_POSITION = 290
         ADDR_PRESENT_TEMPERATURE = 297
 
+        # mm <-> raw conversion: 0-106mm = 0-1150 raw
+        RAW_MAX = 1150
+        MM_MAX_X10 = 1060
+
         g_slaveid = {slave_id}
         g_goal_current = {goal_current}
         g_profile_velocity = {profile_velocity}
@@ -154,6 +160,12 @@ def build_drl_script(
         g_last_velocity = -1
         g_sock = None
         g_ready = False
+
+        def mm_x10_to_raw(pos_mm_x10):
+            return int(pos_mm_x10 * RAW_MAX / MM_MAX_X10)
+
+        def raw_to_mm_x10(raw):
+            return int(raw * MM_MAX_X10 / RAW_MAX)
 
         def modbus_set_slaveid(slaveid):
             global g_slaveid
@@ -415,24 +427,6 @@ def build_drl_script(
             status = STATUS_OK if state_ok else STATUS_IO_ERROR
             send_response(command, seq, encode_state(status, moving, moving_status, present_current, present_temperature, present_velocity, present_position))
 
-        def handle_set_config(command, seq, payload):
-            global g_goal_current, g_profile_velocity, g_profile_acceleration
-            if len(payload) != 10:
-                send_response(command, seq, encode_state(STATUS_BAD_PACKET, 0, 0, 0, 0, 0, 0))
-                return
-            g_goal_current = int.from_bytes(payload[0:2], byteorder='big', signed=False)
-            g_profile_velocity = int.from_bytes(payload[2:6], byteorder='big', signed=False)
-            g_profile_acceleration = int.from_bytes(payload[6:10], byteorder='big', signed=False)
-            if g_ready is False:
-                state_ok, moving, moving_status, present_current, present_temperature, present_velocity, present_position = read_state()
-                status = STATUS_OK if state_ok else STATUS_IO_ERROR
-                send_response(command, seq, encode_state(status, moving, moving_status, present_current, present_temperature, present_velocity, present_position))
-                return
-            ok = apply_profile()
-            state_ok, moving, moving_status, present_current, present_temperature, present_velocity, present_position = read_state()
-            status = STATUS_OK if ok and state_ok else STATUS_IO_ERROR
-            send_response(command, seq, encode_state(status, moving, moving_status, present_current, present_temperature, present_velocity, present_position))
-
         def handle_set_torque(command, seq, payload):
             global g_ready
             if len(payload) != 2:
@@ -461,17 +455,33 @@ def build_drl_script(
             send_response(command, seq, encode_state(status, moving, moving_status, present_current, present_temperature, present_velocity, present_position))
 
         def handle_move(command, seq, payload):
+            global g_goal_current, g_profile_velocity, g_profile_acceleration, g_last_accel, g_last_velocity
             if g_ready is False:
                 send_response(command, seq, encode_state(STATUS_NOT_READY, 0, 0, 0, 0, 0, 0))
                 return
-            if len(payload) != 8:
+            if len(payload) != 16:
                 send_response(command, seq, encode_state(STATUS_BAD_PACKET, 0, 0, 0, 0, 0, 0))
                 return
-            goal_position = int.from_bytes(payload[0:4], byteorder='big', signed=False)
-            timeout_ms = int.from_bytes(payload[4:8], byteorder='big', signed=False)
-            if goal_position < 0 or goal_position > 1150:
+
+            pos_mm_x10  = int.from_bytes(payload[0:2],  byteorder='big', signed=False)
+            force_ma    = int.from_bytes(payload[2:4],  byteorder='big', signed=False)
+            vel_raw     = int.from_bytes(payload[4:8],  byteorder='big', signed=False)
+            accel_raw   = int.from_bytes(payload[8:12], byteorder='big', signed=False)
+            timeout_ms  = int.from_bytes(payload[12:16],byteorder='big', signed=False)
+
+            if pos_mm_x10 < 0 or pos_mm_x10 > 1060:
                 send_response(command, seq, encode_state(STATUS_RANGE_ERROR, 0, 0, 0, 0, 0, 0))
                 return
+
+            goal_position = mm_x10_to_raw(pos_mm_x10)
+            g_goal_current = force_ma
+            if vel_raw != g_profile_velocity:
+                g_profile_velocity = vel_raw
+                g_last_velocity = -1
+            if accel_raw != g_profile_acceleration:
+                g_profile_acceleration = accel_raw
+                g_last_accel = -1
+
             if apply_profile() is False:
                 send_response(command, seq, encode_state(STATUS_IO_ERROR, 0, 0, 0, 0, 0, 0))
                 return
@@ -525,8 +535,6 @@ def build_drl_script(
                 handle_read(command, seq)
             elif command == CMD_INITIALIZE:
                 handle_initialize(command, seq, payload)
-            elif command == CMD_SET_CONFIG:
-                handle_set_config(command, seq, payload)
             elif command == CMD_MOVE:
                 handle_move(command, seq, payload)
             elif command == CMD_READ_STATE:

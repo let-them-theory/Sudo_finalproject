@@ -12,11 +12,22 @@ HEADER_STRUCT = struct.Struct(">2sBBHH")
 HEADER_SIZE = HEADER_STRUCT.size
 STATE_STRUCT = struct.Struct(">BBBBhhii")
 
+# mm <-> raw conversion constants (RH-P12-RN: 0-1150 raw = 0-106 mm)
+RAW_MAX = 1150
+MM_MAX = 106.0
+
+
+def mm_to_raw(mm: float) -> int:
+    return max(0, min(RAW_MAX, round(mm * RAW_MAX / MM_MAX)))
+
+
+def raw_to_mm(raw: int) -> float:
+    return raw * MM_MAX / RAW_MAX
+
 
 class Command(IntEnum):
     PING = 1
     INITIALIZE = 2
-    SET_CONFIG = 3
     MOVE = 4
     READ_STATE = 5
     SHUTDOWN = 6
@@ -47,6 +58,10 @@ class GripperState:
     @property
     def in_position(self) -> bool:
         return bool(self.moving_status & 0x01)
+
+    @property
+    def present_position_mm(self) -> float:
+        return raw_to_mm(self.present_position)
 
 
 def build_packet(command: int, sequence: int, payload: bytes = b"") -> bytes:
@@ -80,20 +95,15 @@ def pack_u16(value: int) -> bytes:
     return struct.pack(">H", int(value))
 
 
-def pack_u32(value: int) -> bytes:
-    return struct.pack(">I", int(value))
-
-
 def pack_initialize_payload(goal_current: int) -> bytes:
     return pack_u16(goal_current)
 
 
-def pack_config_payload(goal_current: int, profile_velocity: int, profile_acceleration: int) -> bytes:
-    return pack_u16(goal_current) + pack_u32(profile_velocity) + pack_u32(profile_acceleration)
-
-
-def pack_move_payload(goal_position: int, timeout_ms: int) -> bytes:
-    return pack_u32(goal_position) + pack_u32(timeout_ms)
+# MOVE payload: pos_mm_x10 (u16) + force_ma (u16) + vel_raw (u32) + accel_raw (u32) + timeout_ms (u32)
+# Total: 16 bytes
+def pack_move_payload(position_mm: float, force_ma: int, vel_raw: int, accel_raw: int, timeout_ms: int) -> bytes:
+    pos_mm_x10 = max(0, min(1060, round(position_mm * 10)))
+    return struct.pack(">HHIII", pos_mm_x10, int(force_ma), int(vel_raw), int(accel_raw), int(timeout_ms))
 
 
 def pack_torque_payload(enabled: bool) -> bytes:

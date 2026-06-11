@@ -8,7 +8,9 @@ bool object_lost
 int32 status
 int32 moving_status
 int32 present_position
+float32 present_position_mm
 int32 goal_position
+float32 goal_position_mm
 int32 present_current
 int32 current_limit
 int32 present_velocity

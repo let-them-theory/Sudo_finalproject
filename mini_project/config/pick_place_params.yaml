@@ -46,10 +46,10 @@ object_detector:
     unknown_max_area: 10000      # unknown 마스크 최대 픽셀 면적 (ROI 360x240 기준)
     # unknown 검출 ROI (realsense_fastsam_segment.py와 동일). 이 영역 안에서만 FastSAM 동작.
     unknown_roi_enable: true
-    unknown_roi_w: 360
-    unknown_roi_h: 240
+    unknown_roi_w: 540
+    unknown_roi_h: 312
     unknown_roi_shift_x: 74      # 화면 중앙에서 우측으로
-    unknown_roi_shift_y: 10      # 화면 중앙에서 아래로
+    unknown_roi_shift_y: -110    # 화면 중앙에서 위로
 
     # --- 추적/디바운스 (검출 안정화: tracker ID 기반 표시 번호 [1],[2],...) ---
     tracker_type: "botsort_custom.yaml"  # 패키지 share/config 안의 파일명. 없으면 ultralytics 기본 사용
@@ -122,12 +122,9 @@ rh_p12_rna_gripper:
     # --- 모터 속도/가속도 프로파일 ---
     profile_velocity: 1500      # 구동 속도(레지스터 280). 너무 높이면 물체 접촉 시 과부하 위험
     profile_acceleration: 1000  # 구동 가속도(레지스터 278)
-    # --- 스트로크 위치 (0=완전 열림, 1000=완전 닫힘) ---
-    stroke_open: 0
-    stroke_close: 1000
-    # --- 파지 감지 위치 범위 ---
-    min_grip_pos: 500           # 이 위치부터 파지 전류 감지 시작
-    max_grip_pos: 700           # 이 이상 = 물체 없음(완전 닫힘)
+    # --- 스트로크 위치 (mm 단위, 0.0=완전 열림, 106.0=최대 닫힘) ---
+    stroke_open_mm: 0.0
+    stroke_close_mm: 92.0       # raw 1000 ≈ 92mm (안전 마진 포함)
     # --- 파지 감지 임계 전류 (mA) — close_current(전류 한계)와 분리 ---
     # present_current가 이 값 이상이면 접촉(파지)으로 판단. close_current보다 낮게 둬
     # 포화 전에 접촉 감지 → 빨리 위치 락. free-run/노이즈(~68mA)보단 충분히 높게.
@@ -225,3 +222,4 @@ pick_place_node:
     workspace_z_min: 0.0
     workspace_z_max: 0.60
     target_pose_topic: "/selected_object_pose"
+    
