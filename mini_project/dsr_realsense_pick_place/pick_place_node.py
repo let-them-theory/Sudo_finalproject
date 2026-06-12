@@ -109,9 +109,15 @@ class PickPlaceNode(Node):
         self.declare_parameter('gripper_wait_sec',            0.8)
         self.declare_parameter('pre_pick_z_offset',           0.14)
         self.declare_parameter('pick_z_offset',               0.015)
+        # object_detector min_pick_pose_z 와 동일하게 유지. 비정상 depth Z 하한.
+        self.declare_parameter('min_pick_pose_z',             0.15)
         self.declare_parameter('grasp_rpy',                   [0.0, 180.0, 0.0])
         self.declare_parameter('place_position',              [0.4, -0.3, 0.1])
         self.declare_parameter('pre_place_z_offset',          0.15)
+        # MOVE_TO_PLACE 접근높이(place_z + this). POST_PLACE 복귀는 pre_place_z_offset 별도.
+        self.declare_parameter('place_approach_z_offset',     0.15)
+        # true: LIFT 높이에서 XY 수평 이동 → 자세 정렬 → 접근 높이 하강 후 place (zone4 IK 1206 완화).
+        self.declare_parameter('place_horizontal_transit',    True)
         self.declare_parameter('place_rpy',                   [0.0, 180.0, 0.0])
         self.declare_parameter('workspace_x_min',             0.15)
         self.declare_parameter('workspace_x_max',             1.20)
@@ -159,6 +165,25 @@ class PickPlaceNode(Node):
         self.declare_parameter('sort_roi_zone_positions_x', [0.4, 0.4, 0.4, 0.4, 0.4])
         self.declare_parameter('sort_roi_zone_positions_y', [-0.4, -0.2, 0.0, 0.2, 0.4])
         self.declare_parameter('sort_roi_zone_positions_z', [0.1, 0.1, 0.1, 0.1, 0.1])
+        # box_roi(i+1) 구역별 Place 자세(rx,ry,rz deg). place_rpy와 동일하면 그대로 두면 됨.
+        self.declare_parameter('sort_roi_zone_place_rx', [0.0, 0.0, 0.0, 0.0, 0.0])
+        self.declare_parameter('sort_roi_zone_place_ry', [180.0, 180.0, 180.0, 180.0, 180.0])
+        self.declare_parameter('sort_roi_zone_place_rz', [0.0, 0.0, 0.0, 0.0, 0.0])
+        # true이면 cartesian place 전에 해당 구역 transit 관절각(movej) 1회 — 장거리 IK 1206 회피.
+        # place 자체(접근·하강·복귀)는 항상 movel cartesian 로직을 따른다.
+        self.declare_parameter('sort_roi_zone_place_use_joints', [False, False, False, False, False])
+        self.declare_parameter('sort_roi_zone_place_j1', [0.0, 0.0, 0.0, 0.0, 0.0])
+        self.declare_parameter('sort_roi_zone_place_j2', [0.0, 0.0, 0.0, 0.0, 0.0])
+        self.declare_parameter('sort_roi_zone_place_j3', [0.0, 0.0, 0.0, 0.0, 0.0])
+        self.declare_parameter('sort_roi_zone_place_j4', [0.0, 0.0, 0.0, 0.0, 0.0])
+        self.declare_parameter('sort_roi_zone_place_j5', [0.0, 0.0, 0.0, 0.0, 0.0])
+        self.declare_parameter('sort_roi_zone_place_j6', [0.0, 0.0, 0.0, 0.0, 0.0])
+        # 구역별 MOVE_TO_PLACE ② 중간 waypoint(movel, grasp_rpy·approach_z 유지). 0=없음, 1~2=wp1(,wp2).
+        self.declare_parameter('sort_roi_zone_transit_wp_count', [0, 0, 0, 0, 0])
+        self.declare_parameter('sort_roi_zone_transit_wp1_x', [0.0, 0.0, 0.0, 0.0, 0.0])
+        self.declare_parameter('sort_roi_zone_transit_wp1_y', [0.0, 0.0, 0.0, 0.0, 0.0])
+        self.declare_parameter('sort_roi_zone_transit_wp2_x', [0.0, 0.0, 0.0, 0.0, 0.0])
+        self.declare_parameter('sort_roi_zone_transit_wp2_y', [0.0, 0.0, 0.0, 0.0, 0.0])
         # 클래스명별 ROI 구역 번호(1~5). 0 또는 맵에 없으면 default place_position 사용.
         self.declare_parameter('sort_class_names', [''])
         self.declare_parameter('sort_class_zones', [0])
@@ -175,12 +200,17 @@ class PickPlaceNode(Node):
         self.home_joints  = self.get_parameter('home_joints').value
         self.gripper_wait = self.get_parameter('gripper_wait_sec').value
         self.pre_pick_dz  = self.get_parameter('pre_pick_z_offset').value
+        self.min_pick_pose_z = float(self.get_parameter('min_pick_pose_z').value)
         self.pick_dz      = self.get_parameter('pick_z_offset').value
         self.min_safe_z   = float(self.get_parameter('min_safe_z').value)
         self.gripper_close_len = float(self.get_parameter('gripper_close_len').value)
         self.grasp_rpy    = self.get_parameter('grasp_rpy').value
         self.place_pos    = self.get_parameter('place_position').value
         self.pre_place_dz = self.get_parameter('pre_place_z_offset').value
+        self.place_approach_dz = float(
+            self.get_parameter('place_approach_z_offset').value)
+        self.place_horizontal_transit = bool(
+            self.get_parameter('place_horizontal_transit').value)
         self.place_rpy    = self.get_parameter('place_rpy').value
         self.robot_base_frame = self.get_parameter('robot_base_frame').value
         self.use_target_pose_yaw = self.get_parameter('use_target_pose_yaw').value
@@ -212,9 +242,11 @@ class PickPlaceNode(Node):
         self._target_object_class = ''
         # object_detector가 결정한 배치 box_roi 구역(1~5). 0=미지정.
         self._target_place_zone = 0
+        self._target_z_surface: float | None = None  # 카메라 원본 Z(초음파 z_floor용)
         # 현재 사이클의 Place 목표 좌표. 파지 확정 시 box_roi 구역으로 결정(폴백: place_position).
         self._active_place_pos = list(self.place_pos)
         self._active_place_zone_idx = None
+        self._active_place_rpy = list(self.place_rpy)
         # 사용자가 GUI에서 클릭한 라벨 (/selected_object_label 구독) — pose race 방지 검증용
         # 예: 사용자가 "doll_2" 클릭 → 발행되는 pose의 class가 "doll"이어야 채택
         self._selected_object_label = ''
@@ -241,9 +273,42 @@ class PickPlaceNode(Node):
         _zpx = list(self.get_parameter('sort_roi_zone_positions_x').value)
         _zpy = list(self.get_parameter('sort_roi_zone_positions_y').value)
         _zpz = list(self.get_parameter('sort_roi_zone_positions_z').value)
-        _nz  = min(len(_zpx), len(_zpy), len(_zpz))
+        _zrx = list(self.get_parameter('sort_roi_zone_place_rx').value)
+        _zry = list(self.get_parameter('sort_roi_zone_place_ry').value)
+        _zrz = list(self.get_parameter('sort_roi_zone_place_rz').value)
+        _zuj = list(self.get_parameter('sort_roi_zone_place_use_joints').value)
+        _zj1 = list(self.get_parameter('sort_roi_zone_place_j1').value)
+        _zj2 = list(self.get_parameter('sort_roi_zone_place_j2').value)
+        _zj3 = list(self.get_parameter('sort_roi_zone_place_j3').value)
+        _zj4 = list(self.get_parameter('sort_roi_zone_place_j4').value)
+        _zj5 = list(self.get_parameter('sort_roi_zone_place_j5').value)
+        _zj6 = list(self.get_parameter('sort_roi_zone_place_j6').value)
+        _zwc = list(self.get_parameter('sort_roi_zone_transit_wp_count').value)
+        _zw1x = list(self.get_parameter('sort_roi_zone_transit_wp1_x').value)
+        _zw1y = list(self.get_parameter('sort_roi_zone_transit_wp1_y').value)
+        _zw2x = list(self.get_parameter('sort_roi_zone_transit_wp2_x').value)
+        _zw2y = list(self.get_parameter('sort_roi_zone_transit_wp2_y').value)
+        _nz  = min(len(_zpx), len(_zpy), len(_zpz), len(_zrx), len(_zry), len(_zrz),
+                   len(_zuj), len(_zj1), len(_zj2), len(_zj3), len(_zj4), len(_zj5), len(_zj6),
+                   len(_zwc), len(_zw1x), len(_zw1y), len(_zw2x), len(_zw2y))
         # 인덱스 0 = box_roi1, 1 = box_roi2, ...
         self.sort_zone_positions: list = [[_zpx[i], _zpy[i], _zpz[i]] for i in range(_nz)]
+        self.sort_zone_rpy: list = [
+            [float(_zrx[i]), float(_zry[i]), float(_zrz[i])] for i in range(_nz)
+        ]
+        self.sort_zone_use_joints: list = [bool(_zuj[i]) for i in range(_nz)]
+        self.sort_zone_joints: list = [
+            [float(_zj1[i]), float(_zj2[i]), float(_zj3[i]),
+             float(_zj4[i]), float(_zj5[i]), float(_zj6[i])]
+            for i in range(_nz)
+        ]
+        self.sort_zone_transit_wp_count: list = [int(_zwc[i]) for i in range(_nz)]
+        self.sort_zone_transit_wp1: list = [
+            [float(_zw1x[i]), float(_zw1y[i])] for i in range(_nz)
+        ]
+        self.sort_zone_transit_wp2: list = [
+            [float(_zw2x[i]), float(_zw2y[i])] for i in range(_nz)
+        ]
 
         _sc_names = list(self.get_parameter('sort_class_names').value)
         _sc_zones = list(self.get_parameter('sort_class_zones').value)
@@ -513,6 +578,12 @@ class PickPlaceNode(Node):
                         return
 
                 pos = msg.pose.position
+                self._target_z_surface = float(pos.z)
+                if pos.z < self.min_pick_pose_z:
+                    self.get_logger().warn(
+                        f'Pick Z 접근높이 보정: {pos.z:.3f}→{self.min_pick_pose_z:.3f}m '
+                        f'(초음파 z_floor는 원본 {self._target_z_surface:.3f}m 유지)')
+                    pos.z = self.min_pick_pose_z
                 if self._in_workspace(pos.x, pos.y, pos.z):
                     self.target_pose = msg
                     self.state = State.PRE_PICK
@@ -554,13 +625,132 @@ class PickPlaceNode(Node):
             zone_idx = self.sort_class_zone_map.get(cls)
         if zone_idx is not None and zone_idx < len(self.sort_zone_positions):
             place = list(self.sort_zone_positions[zone_idx])
-            self.get_logger().info(
-                f'배치 구역 결정: box_roi{zone_idx + 1} place={place}')
+            rpy = self._place_rpy_for_zone(zone_idx)
+            joints = self._place_joints_for_zone(zone_idx)
+            use_j = self._place_use_joints_for_zone(zone_idx)
+            wps = self._place_transit_waypoints_for_zone(zone_idx)
+            if use_j:
+                self.get_logger().info(
+                    f'배치 구역 결정: box_roi{zone_idx + 1} '
+                    f'transit movej={joints} → cartesian place')
+            elif wps:
+                self.get_logger().info(
+                    f'배치 구역 결정: box_roi{zone_idx + 1} '
+                    f'transit waypoints={wps} → place={place} rpy={rpy}')
+            else:
+                self.get_logger().info(
+                    f'배치 구역 결정: box_roi{zone_idx + 1} place={place} rpy={rpy}')
             return place, zone_idx
         cls = (object_class or '').strip()
         self.get_logger().info(
             f'배치 구역 결정: class={cls!r} zone={zone} → default place={list(self.place_pos)}')
         return list(self.place_pos), None
+
+    def _place_rpy_for_zone(self, zone_idx: int | None):
+        """box_roi 구역별 Place RPY. 미지정이면 전역 place_rpy."""
+        if zone_idx is not None and 0 <= zone_idx < len(self.sort_zone_rpy):
+            return list(self.sort_zone_rpy[zone_idx])
+        return list(self.place_rpy)
+
+    def _place_joints_for_zone(self, zone_idx: int | None):
+        if zone_idx is not None and 0 <= zone_idx < len(self.sort_zone_joints):
+            return list(self.sort_zone_joints[zone_idx])
+        return None
+
+    def _place_use_joints_for_zone(self, zone_idx: int | None) -> bool:
+        return (zone_idx is not None
+                and 0 <= zone_idx < len(self.sort_zone_use_joints)
+                and self.sort_zone_use_joints[zone_idx])
+
+    def _place_transit_waypoints_for_zone(self, zone_idx: int | None) -> list:
+        """구역별 MOVE_TO_PLACE ② 중간 movel waypoint [(x,y), ...]. movej보다 우선순위 낮음."""
+        if zone_idx is None or not (0 <= zone_idx < len(self.sort_zone_transit_wp_count)):
+            return []
+        n = max(0, min(2, int(self.sort_zone_transit_wp_count[zone_idx])))
+        wps = []
+        if n >= 1:
+            wps.append(tuple(self.sort_zone_transit_wp1[zone_idx]))
+        if n >= 2:
+            wps.append(tuple(self.sort_zone_transit_wp2[zone_idx]))
+        return wps
+
+    def _lift_z_from_pose(self, pose) -> float:
+        return float(pose.pose.position.z) + float(self.pre_pick_dz)
+
+    def _execute_move_to_place(
+            self, px: float, py: float, pz: float, place_rpy,
+            zone_idx: int | None,
+            current_x: float, current_y: float, current_z: float,
+            grasp_rpy=None):
+        """MOVE_TO_PLACE — 접근높이 상승 → 수평 이동 → PLACE에서 하강.
+
+        ② 수평: movej(구역별) > waypoint movel(구역별) > 직선 movel.
+        place RPY 전환은 PLACE 하강 시 적용.
+        """
+        approach_z = pz + self.place_approach_dz
+        if grasp_rpy is None:
+            grasp_rpy = place_rpy
+
+        use_movej_transit = self._place_use_joints_for_zone(zone_idx)
+        transit_waypoints = self._place_transit_waypoints_for_zone(zone_idx)
+
+        # ① pick 위치에서 접근 높이 상승 (모든 zone 공통, LIFT z < approach_z 일 때)
+        if self.place_horizontal_transit and current_z < approach_z - 1e-4:
+            self.get_logger().info(
+                f'Place 접근 — 접근 높이 상승 z={current_z:.3f}→{approach_z:.3f}')
+            self._move_to_cart(current_x, current_y, approach_z, grasp_rpy)
+            current_z = approach_z
+
+        transit_z = max(current_z, approach_z)
+
+        def _needs_move(tx, ty, tz):
+            return (abs(current_x - tx) > 1e-4 or abs(current_y - ty) > 1e-4
+                    or abs(current_z - tz) > 1e-4)
+
+        # ② zone으로 수평 이동
+        if use_movej_transit:
+            joints = self._place_joints_for_zone(zone_idx)
+            self.get_logger().info(
+                f'Place 접근 — 수평 transit (movej, z={current_z:.3f}): {joints}')
+            self._move_to_joints(joints, 'place_transit')
+        elif transit_waypoints and self.place_horizontal_transit:
+            for i, (wx, wy) in enumerate(transit_waypoints):
+                if _needs_move(wx, wy, transit_z):
+                    self.get_logger().info(
+                        f'Place 접근 — transit waypoint {i + 1}/{len(transit_waypoints)} '
+                        f'({wx:.3f}, {wy:.3f}, z={transit_z:.3f})')
+                    self._move_to_cart(wx, wy, transit_z, grasp_rpy)
+                    current_x, current_y, current_z = wx, wy, transit_z
+            if _needs_move(px, py, transit_z):
+                self.get_logger().info(
+                    f'Place 접근 — 수평 이동 ({px:.3f}, {py:.3f}, z={transit_z:.3f})')
+                self._move_to_cart(px, py, transit_z, grasp_rpy)
+        elif self.place_horizontal_transit:
+            if _needs_move(px, py, transit_z):
+                self.get_logger().info(
+                    f'Place 접근 — 수평 이동 ({px:.3f}, {py:.3f}, z={transit_z:.3f})')
+                self._move_to_cart(px, py, transit_z, grasp_rpy)
+        else:
+            self.get_logger().info(
+                f'Place 위치로 이동 (접근 높이 z={approach_z:.3f})')
+            self._move_to_cart(px, py, approach_z, place_rpy)
+
+    def _move_to_joints(self, joints, label: str):
+        req = MoveJoint.Request()
+        req.pos = [float(v) for v in joints]
+        req.vel = self.jvel
+        req.acc = self.jacc
+        req.time = 0.0
+        req.radius = 0.0
+        req.mode = 0
+        req.blend_type = 0
+        req.sync_type = 0
+        self._set_motion_active(True)
+        try:
+            self._call_service(self.cli_movej, req, f'move_joint({label})', timeout=30.0)
+            self._check_motion_alarm(f'movej({label})')
+        finally:
+            self._set_motion_active(False)
 
     def _cb_ultrasonic(self, msg: Range):
         if msg.range is not None and msg.range > 0.0:
@@ -832,7 +1022,10 @@ class PickPlaceNode(Node):
                     rpy = self._grasp_rpy_for_pose(pose)
                     x = pose.pose.position.x
                     y = pose.pose.position.y
-                    z_floor = pose.pose.position.z + self.pick_dz  # 카메라 기반 최저 안전 높이
+                    z_surface = (self._target_z_surface
+                                 if self._target_z_surface is not None
+                                 else pose.pose.position.z)
+                    z_floor = z_surface + self.pick_dz  # 초음파 안전바닥 = 카메라 원본 Z 기준
 
                     if not self.use_ultrasonic_grasp:
                         # 기본: 카메라 z 좌표로 바로 하강
@@ -842,10 +1035,14 @@ class PickPlaceNode(Node):
                         # 초음파: grasp_distance_m 이하 도달 시 그 자리에서 파지
                         self.get_logger().info(
                             f'Pick 하강 — 초음파 {self.grasp_distance_m*1000:.0f}mm 도달 시 파지 '
-                            f'(안전바닥 z={z_floor:.3f}m)')
+                            f'(z_surface={z_surface:.3f}, 안전바닥 z={z_floor:.3f}m)')
                         z = pose.pose.position.z + self.pre_pick_dz
                         while rclpy.ok() and self.state == State.PICK:
                             rng = self._fresh_range()
+                            if rng is not None:
+                                self.get_logger().info(
+                                    f'초음파 거리: {rng*1000:.0f}mm (z={z:.3f}m)',
+                                    throttle_duration_sec=0.3)
                             if rng is not None and rng <= self.grasp_distance_m:
                                 self.get_logger().info(
                                     f'초음파 {rng*1000:.0f}mm ≤ '
@@ -890,30 +1087,38 @@ class PickPlaceNode(Node):
                         # 파지 확정 시점에 box_roi 구역으로 Place 좌표·자세를 확정한다.
                         self._active_place_pos, self._active_place_zone_idx = self._resolve_place(
                             self._target_object_class, self._target_place_zone)
+                        self._active_place_rpy = self._place_rpy_for_zone(
+                            self._active_place_zone_idx)
                         # 파지 확정 → 이송 전류로 낮춰 들고 이동 (발열·과압착 완화, self-locking이 유지)
                         self._call_service(self.cli_gripper_hold_transport, Trigger.Request(),
                                            'gripper/hold_transport', timeout=5.0)
                         self._set_state(State.MOVE_TO_PLACE)
 
                 elif current == State.MOVE_TO_PLACE:
-                    self.get_logger().info('Place 위치로 이동')
                     px, py, pz = self._active_place_pos
-                    self._move_to_cart(
-                        px, py, pz + self.pre_place_dz, self.place_rpy)
+                    pose = self.target_pose
+                    cur_x = float(pose.pose.position.x)
+                    cur_y = float(pose.pose.position.y)
+                    cur_z = self._lift_z_from_pose(pose)
+                    grasp_rpy = self._grasp_rpy_for_pose(pose)
+                    self._execute_move_to_place(
+                        px, py, pz, self._active_place_rpy,
+                        self._active_place_zone_idx,
+                        cur_x, cur_y, cur_z, grasp_rpy)
                     self._set_state(State.PLACE)
 
                 elif current == State.PLACE:
                     px, py, pz = self._active_place_pos
                     self.get_logger().info('물체 내려놓기')
                     self._move_to_cart(
-                        px, py, pz, self.place_rpy, vel=50.0, acc=100.0)
+                        px, py, pz, self._active_place_rpy, vel=50.0, acc=100.0)
                     self._gripper_open()
                     self._set_state(State.POST_PLACE)
 
                 elif current == State.POST_PLACE:
                     px, py, pz = self._active_place_pos
                     self._move_to_cart(
-                        px, py, pz + self.pre_place_dz, self.place_rpy)
+                        px, py, pz + self.pre_place_dz, self._active_place_rpy)
                     self.get_logger().info('Pick & Place 완료!')
                     self._set_state(State.HOME)
 
@@ -1076,6 +1281,7 @@ class PickPlaceNode(Node):
             empty_cycles = 0
             object_class = self._target_object_class or ''
             place, place_zone_idx = self._resolve_place(object_class, self._target_place_zone)
+            place_rpy = self._place_rpy_for_zone(place_zone_idx)
 
             rpy = self._grasp_rpy_for_pose(pose)
             px_obj = pose.pose.position.x
@@ -1125,16 +1331,19 @@ class PickPlaceNode(Node):
             # ── 6. MOVE_TO_PLACE ──────────────────────────────────────────
             self._set_state(State.MOVE_TO_PLACE)
             px, py, pz = place
-            self._move_to_cart(px, py, pz + self.pre_place_dz, self.place_rpy)
+            lift_z = pz_obj + self.pre_pick_dz
+            self._execute_move_to_place(
+                px, py, pz, place_rpy, place_zone_idx,
+                px_obj, py_obj, lift_z, rpy)
 
             # ── 7. PLACE ──────────────────────────────────────────────────
             self._set_state(State.PLACE)
-            self._move_to_cart(px, py, pz, self.place_rpy, vel=50.0, acc=100.0)
+            self._move_to_cart(px, py, pz, place_rpy, vel=50.0, acc=100.0)
             self._gripper_open()
 
             # ── 8. POST_PLACE ─────────────────────────────────────────────
             self._set_state(State.POST_PLACE)
-            self._move_to_cart(px, py, pz + self.pre_place_dz, self.place_rpy)
+            self._move_to_cart(px, py, pz + self.pre_place_dz, place_rpy)
 
             picked_count += 1
             self.get_logger().info(
@@ -1189,6 +1398,13 @@ class PickPlaceNode(Node):
 
     def _srv_run_once(self, _, res: Trigger.Response):
         with self.state_lock:
+            if self.state == State.ERROR:
+                self.get_logger().warn('ERROR 상태 — 1회 실행 요청으로 자동 해제 후 재시도')
+                self._stop_event.clear()
+                self.pending_command = None
+                self.pick_requested = False
+                self.target_pose = None
+                self.state = State.IDLE
             busy = self.state != State.IDLE or self.pending_command is not None
         if busy:
             res.success = False
@@ -1718,7 +1934,9 @@ class PickPlaceNode(Node):
         """에러 메시지를 카테고리로 분류 — GUI status 바에 '어떤 에러인지' 표기용."""
         t = (text or '').lower()
         if 'reachable' in t or '1206' in t:
-            return '🔴 도달 불가 — 작업영역/IK 밖 (물체 위치 조정)'
+            return '🔴 도달 불가 — IK/자세 문제 (좌표·place 자세 확인)'
+        if 'z 보정' in t or 'pick z' in t:
+            return '🟠 Pick Z 좌표 보정됨 — depth/캘리브레이션 확인'
         if 'singular' in t or '3205' in t or '3206' in t:
             return '🟠 특이점 영역 — 경로/자세 회피 필요'
         if 'status 3' in t or 'io_error' in t or 'io error' in t or 'status3' in t:

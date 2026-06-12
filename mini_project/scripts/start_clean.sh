@@ -35,10 +35,22 @@ for i in 1 2 3; do
     fi
 done
 
-# ── 3. launch ────────────────────────────────────────────────────────────
+# ── 3. DART 사전 확인 안내 ───────────────────────────────────────────────
+if ! timeout 2 bash -c "echo > /dev/tcp/${HOST}/12345" 2>/dev/null; then
+    echo "[start_clean] ⚠️  로봇 ${HOST}:12345 연결 불가 — 네트워크/DART 전원 확인"
+else
+    echo "[start_clean] 로봇 포트 ${HOST}:12345 OK"
+fi
+echo "[start_clean] DART 필수: Remote(외부제어) + Servo ON(STANDBY) + SAFE_OFF 해제"
+echo "[start_clean] (이게 안 되면 ros2_control 실패 → 그리퍼 drl_start 무한대기)"
+
+# ── 4. launch ────────────────────────────────────────────────────────────
 echo "[start_clean] launch (host=$HOST)..."
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/../_source_workspace.sh"
 export QT_QPA_PLATFORM=xcb
 export DISPLAY="${DISPLAY:-:0}"
-exec ros2 launch dsr_realsense_pick_place pick_place.launch.py mode:=real host:="$HOST"
+exec ros2 launch dsr_realsense_pick_place pick_place.launch.py \
+  mode:=real \
+  host:="$HOST" \
+  use_launch_set_robot_mode:=true

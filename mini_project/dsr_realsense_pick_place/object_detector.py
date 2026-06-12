@@ -393,6 +393,10 @@ class ObjectDetectorNode(Node):
         self.declare_parameter('depth_scale', 0.001)
         self.declare_parameter('min_depth_m', 0.15)   # 카메라 최소 유효 거리 (m)
         self.declare_parameter('max_depth_m', 1.5)    # 작업 공간 최대 깊이 (m)
+        # 로봇 base 기준 pick pose Z 하한. box_roi 등에서 depth가 바닥으로 튀면 이 값으로 올림.
+        self.declare_parameter('min_pick_pose_z', 0.15)
+        # 픽셀이 sort box(box_roi1~5) 안이면 depth 오류가 잦아 더 높은 하한 적용.
+        self.declare_parameter('box_roi_min_pick_pose_z', 0.22)
         # depth_sample_radius: bbox 중심 주변에서 샘플링할 반경 (픽셀 단위).
         # 반경이 클수록 노이즈에 강하지만 엣지 근처에서 오차 증가.
         self.declare_parameter('depth_sample_radius', 5)
@@ -403,6 +407,13 @@ class ObjectDetectorNode(Node):
         # 값이 작을수록 이상치 기준이 엄격해져 더 많은 샘플이 제거된다.
         self.declare_parameter('depth_outlier_mad_scale', 2.5)
         self.declare_parameter('selected_object_topic', '/selected_object_label')
+        # pick_place_node·GUI 와 동일 — 범위 밖 좌표는 pose 미발행(도달 불가 예방).
+        self.declare_parameter('workspace_x_min', 0.15)
+        self.declare_parameter('workspace_x_max', 1.20)
+        self.declare_parameter('workspace_y_min', -1.20)
+        self.declare_parameter('workspace_y_max', 1.20)
+        self.declare_parameter('workspace_z_min', 0.0)
+        self.declare_parameter('workspace_z_max', 0.60)
 
         self.declare_parameter('use_object_yaw_for_grasp', True)
         self.declare_parameter('yaw_axis_reference', 'long')
@@ -540,6 +551,14 @@ class ObjectDetectorNode(Node):
         self.depth_scale = p('depth_scale').value
         self.min_depth = p('min_depth_m').value
         self.max_depth = p('max_depth_m').value
+        self.min_pick_pose_z = float(p('min_pick_pose_z').value)
+        self.box_roi_min_pick_pose_z = float(p('box_roi_min_pick_pose_z').value)
+        self.workspace_x_min = float(p('workspace_x_min').value)
+        self.workspace_x_max = float(p('workspace_x_max').value)
+        self.workspace_y_min = float(p('workspace_y_min').value)
+        self.workspace_y_max = float(p('workspace_y_max').value)
+        self.workspace_z_min = float(p('workspace_z_min').value)
+        self.workspace_z_max = float(p('workspace_z_max').value)
         self.depth_r = p('depth_sample_radius').value
         self.depth_center_ratio = p('depth_center_ratio').value
         self.depth_outlier_mad_scale = p('depth_outlier_mad_scale').value
@@ -1107,6 +1126,7 @@ class ObjectDetectorNode(Node):
             pose_abs = self._to_absolute_pose(pose_optical)
             if pose_abs is None:
                 continue
+            pose_abs = self._finalize_pick_pose_z(pose_abs, u, v, W, H)
             yaw_deg = None
             if self.use_object_yaw_for_grasp:
                 yaw_deg = self._estimate_object_yaw_deg(depth_img, u, v, w, h, depth_m)
@@ -1474,6 +1494,7 @@ class ObjectDetectorNode(Node):
             pose_abs = self._to_absolute_pose(pose_optical)
             if pose_abs is None:
                 continue
+            pose_abs = self._finalize_pick_pose_z(pose_abs, u, v, Ww, Hh)
 
             yaw_deg = None
             if self.use_object_yaw_for_grasp:
@@ -1586,6 +1607,14 @@ class ObjectDetectorNode(Node):
         # 선택 결과는 "일반 검출 결과"와 "실제 pick 대상으로 쓸 결과"를 둘 다 발행한다.
         pose_base = selected['pose']
         pos = pose_base.pose.position
+        if not (self.workspace_x_min <= pos.x <= self.workspace_x_max
+                and self.workspace_y_min <= pos.y <= self.workspace_y_max
+                and self.workspace_z_min <= pos.z <= self.workspace_z_max):
+            self.get_logger().warn(
+                f'Pick 좌표 작업영역 밖 — pose 미발행: '
+                f'x={pos.x:.3f} y={pos.y:.3f} z={pos.z:.3f}',
+                throttle_duration_sec=2.0)
+            return
         self.pub_pose.publish(pose_base)
         self.pub_selected_pose.publish(pose_base)
         # 그리퍼 강도 룩업용 — 표시 라벨([1]) 아닌 원본 클래스 이름을 발행
@@ -1811,6 +1840,24 @@ class ObjectDetectorNode(Node):
         except Exception as e:
             self.get_logger().warn(f'TF 변환 실패: {e}')
             return None
+
+    def _finalize_pick_pose_z(
+            self, pose_abs: PoseStamped, u: int, v: int,
+            frame_w: int, frame_h: int) -> PoseStamped:
+        """Z가 비정상적으로 낮으면 경고만. 보정은 pick_place_node가 접근높이에만 적용."""
+        pos = pose_abs.pose.position
+        warn_z = self.min_pick_pose_z
+        box_zone = self._resolve_box_roi_zone_from_pixel(u, v, frame_w, frame_h)
+        if box_zone > 0:
+            warn_z = max(warn_z, self.box_roi_min_pick_pose_z)
+        if pos.z < warn_z:
+            self.get_logger().warn(
+                f'Pick Z 낮음: {pos.z:.3f}m < {warn_z:.3f}m '
+                f'(u={u}, v={v}'
+                f'{f", box_roi{box_zone}" if box_zone else ""}) — '
+                f'pick_place가 접근높이만 보정, 초음파는 원본 Z 사용',
+                throttle_duration_sec=2.0)
+        return pose_abs
 
     def _to_absolute_pose(self, pose_optical: PoseStamped):
         """카메라 좌표를 절대좌표로 변환한다.

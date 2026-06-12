@@ -170,8 +170,10 @@ def generate_launch_description():
         ],
     )
 
+    # ros2_control 초기화(최대 ~10s) + wait_robot(10s~) 이후에 그리퍼 기동.
+    # 너무 일찍 띄우면 drl_start 미준비 상태에서 gripper_service가 무한 대기한다.
     gripper = TimerAction(
-        period=12.0,
+        period=22.0,
         actions=[
             Node(
                 package='dsr_gripper_tcp',
@@ -202,7 +204,7 @@ def generate_launch_description():
     )
 
     pick_place = TimerAction(
-        period=18.0,
+        period=28.0,
         actions=[
             Node(
                 package='dsr_realsense_pick_place',
