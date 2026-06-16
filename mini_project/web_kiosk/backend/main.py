@@ -51,7 +51,8 @@ class KioskBackend(Node):
             self.get_logger().info(f'이전 세션 미완료 주문 {len(stale)}건 취소(새 세션)')
 
         self.pub_selected = self.create_publisher(String, '/selected_object_label', 10)
-        self.cli_run_once = self.create_client(Trigger, '/pick_place/run_once')
+        # user 주문은 항상 package 영역으로 place — sort(box zone)와 분리된 전용 서비스.
+        self.cli_run_once = self.create_client(Trigger, '/pick_place/run_once_package')
         self.cli_cancel = self.create_client(Trigger, '/pick_place/cancel')
         self.create_subscription(String, '/detected_objects', self._cb_objects, 10)
         self.create_subscription(String, '/pick_place_state', self._cb_state, 10)

@@ -46,11 +46,7 @@ ARGUMENTS = [
     DeclareLaunchArgument('cam_tf_qz', default_value='0.0'),
     DeclareLaunchArgument('cam_tf_qw', default_value='0.707'),
     DeclareLaunchArgument('gui', default_value='true',
-                          description='PyQt 관리자 GUI 실행 여부'),
-    DeclareLaunchArgument('kiosk', default_value='false',
-                          description='user web 주문 키오스크 백엔드 함께 실행'),
-    DeclareLaunchArgument('kiosk_port', default_value='8000',
-                          description='web 키오스크 포트'),
+                          description='PyQt GUI 실행 여부'),
     DeclareLaunchArgument('use_launch_set_robot_mode', default_value='false',
                           description='Fallback: launch에서 set_robot_mode service call 실행 여부'),
     DeclareLaunchArgument('gripper_tcp_port', default_value='20002',
@@ -68,7 +64,7 @@ def generate_launch_description():
 
     pkg_this = get_package_share_directory('dsr_realsense_pick_place')
     params_file = os.path.join(pkg_this, 'config', 'pick_place_params.yaml')
-    yolo_model_path = os.path.join(pkg_this, 'models', 'proto.pt')
+    yolo_model_path = os.path.join(pkg_this, 'models', 'proto_v3.pt')
     fastsam_weights_path = os.path.join(pkg_this, 'models', 'FastSAM-s.pt')
 
     doosan_bringup = IncludeLaunchDescription(
@@ -159,18 +155,25 @@ def generate_launch_description():
         ],
     )
 
-    # user web 키오스크 백엔드 — kiosk:=true 일 때만. 별도 web_kiosk.launch.py 재사용.
-    kiosk_backend = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource([
-            FindPackageShare('dsr_realsense_pick_place'),
-            '/launch/web_kiosk.launch.py'
-        ]),
-        launch_arguments={'kiosk_port': LaunchConfiguration('kiosk_port')}.items(),
-        condition=IfCondition(LaunchConfiguration('kiosk')),
+    wait_robot = TimerAction(
+        period=10.0,
+        actions=[
+            ExecuteProcess(
+                cmd=[
+                    'bash',
+                    os.path.join(pkg_this, 'scripts', 'wait_for_robot_ready.sh'),
+                    LaunchConfiguration('robot_name'),
+                    '90',
+                ],
+                output='screen',
+            ),
+        ],
     )
 
+    # ros2_control 초기화(최대 ~10s) + wait_robot(10s~) 이후에 그리퍼 기동.
+    # 너무 일찍 띄우면 drl_start 미준비 상태에서 gripper_service가 무한 대기한다.
     gripper = TimerAction(
-        period=5.0,
+        period=22.0,
         actions=[
             Node(
                 package='dsr_gripper_tcp',
@@ -184,8 +187,9 @@ def generate_launch_description():
                     'goal_current': 400,
                     'profile_velocity': 1500,
                     'profile_acceleration': 1000,
-                    'poll_rate_hz': 10.0,
-                }]
+                    'poll_rate_hz': 20.0,
+                    'skip_set_autonomous': True,
+                }],
             ),
             Node(
                 package='dsr_realsense_pick_place',
@@ -195,12 +199,12 @@ def generate_launch_description():
                 parameters=[params_file, {
                     'robot_ns': LaunchConfiguration('robot_name'),
                 }],
-            )
-        ]
+            ),
+        ],
     )
 
     pick_place = TimerAction(
-        period=7.0,
+        period=28.0,
         actions=[
             Node(
                 package='dsr_realsense_pick_place',
@@ -234,8 +238,8 @@ def generate_launch_description():
         static_tf,
         object_detector,
         gui_node,
-        kiosk_backend,
         ultrasonic,
+        wait_robot,
         gripper,
         pick_place,
     ])

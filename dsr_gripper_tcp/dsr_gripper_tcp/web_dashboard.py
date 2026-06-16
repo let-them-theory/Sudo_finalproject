@@ -687,7 +687,7 @@ def ros_thread():
     local_bridge = DoosanGripperTcpBridge(
         node=ros_node,
         config=BridgeConfig(
-            controller_host="110.120.1.56",
+            controller_host="110.120.1.50",
             namespace="dsr01",
             service_prefix=""
         )

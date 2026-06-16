@@ -6,7 +6,7 @@ PyQt5 기반 Pick & Place GUI 노드.
 화면 구성:
   좌측: 카메라 디버그 영상 (640×480, bbox + depth 정보 오버레이)
   우측 상단: 상태 패널 (Pick & Place 상태, 선택 물체, 선택 모드)
-  우측 하단: 물체 선택 패널 (자동 선택 버튼 + 검출 물체 버튼 그리드 + 요약)
+  우측 하단: 물체 선택 패널 (자동 선택 + Known/Unknown 2열 그리드, 2행 고정 높이 스크롤)
 
 동작 흐름:
   1. /detection_debug_image  → 카메라 영상 표시
@@ -18,9 +18,8 @@ PyQt5 기반 Pick & Place GUI 노드.
 
 Qt-ROS 이벤트 루프 통합:
   QApplication.exec_()이 Qt 이벤트를 처리하는 메인 루프를 실행한다.
-  ROS 콜백은 QTimer(10ms 간격)가 rclpy.spin_once()를 호출해 처리한다.
-  UI 갱신은 별도 QTimer(100ms 간격)가 _update_ui()를 호출해 수행한다.
-  이 방식으로 Qt 이벤트와 ROS 메시지가 단일 스레드에서 안전하게 공존한다.
+  ROS 콜백은 별도 스레드에서 rclpy.spin_once()를 돌려 GUI 메인스레드 블로킹을 막는다.
+  UI 갱신은 QTimer(100ms 간격)가 _update_ui()를 호출해 수행한다.
 
 구독:
   /detection_debug_image  (sensor_msgs/Image)  - bbox가 그려진 디버그 영상
@@ -37,9 +36,11 @@ import json
 import re
 import yaml
 import subprocess
+import signal
 import sys
 import math
 import time
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -84,12 +85,6 @@ from PyQt5.QtWidgets import (
     QSlider,
     QSpinBox,
     QFrame,
-    QTableWidget,
-    QTableWidgetItem,
-    QTreeWidget,
-    QTreeWidgetItem,
-    QHeaderView,
-    QMessageBox,
 )
 from PyQt5.QtGui import QPalette, QFont
 from PyQt5.QtCore import QLibraryInfo
@@ -103,7 +98,7 @@ from std_msgs.msg import Int32, String
 from std_srvs.srv import SetBool, Trigger
 from dsr_gripper_tcp_interfaces.msg import GripperState
 
-# 유저 주문 큐 DB (web 백엔드/User_gui와 공유하는 JsonRepository). 관리자 USER 탭에서 읽기/비우기.
+from PyQt5.QtWidgets import QTreeWidget, QTreeWidgetItem, QMessageBox
 from dsr_realsense_pick_place.task_repository import JsonRepository, OrderStatus, ItemStatus
 
 # 상태 영문 → 한글 (USER 탭 표시).
@@ -247,6 +242,12 @@ class PickPlaceGuiNode(Node):
         self.declare_parameter('workspace_z_min', 0.0)
         self.declare_parameter('workspace_z_max', 0.60)
         self.declare_parameter('reach_radius_max', 0.65)
+        # 선택 버튼에서만 숨길 클래스 — 검출·카메라 세그멘테이션은 유지.
+        self.declare_parameter('gui_button_exclude_classes', [''])
+        _raw_btn_exclude = list(self.get_parameter('gui_button_exclude_classes').value)
+        self.gui_button_exclude_classes = {
+            c.strip() for c in _raw_btn_exclude if c and c.strip()
+        }
         self.workspace_x_min = float(self.get_parameter('workspace_x_min').value)
         self.workspace_x_max = float(self.get_parameter('workspace_x_max').value)
         self.workspace_y_min = float(self.get_parameter('workspace_y_min').value)
@@ -259,12 +260,11 @@ class PickPlaceGuiNode(Node):
         # 화면 표시용 상태를 멤버 변수로 유지한다.
         self.use_local_yolo = bool(self.get_parameter('use_local_yolo').value)
         self.bridge = CvBridge() if CvBridge is not None else None
+        self._data_lock = threading.Lock()
         self.latest_qimage = None
         self.detected_objects = []
         self._last_nonempty_objects = []
         self._last_nonempty_objects_time = 0.0
-        # box_N(1~5) 입구 위치 {x,y,z} — /detected_objects의 boxes 필드. 요약에 표시.
-        self._detected_boxes = {}
         self.selected_label = ''
         self.pick_place_state = 'IDLE'
         self.last_error_text = ''
@@ -321,8 +321,10 @@ class PickPlaceGuiNode(Node):
         self.create_subscription(Int32, '/robot_hw_state',  self._cb_hw_state, 10)
         self.create_subscription(Int32, '/robot_speed_mode', self._cb_speed_mode, 10)
 
-        # 그리퍼 서비스 ready 상태 (INITIALIZE 완료 여부)
+        # 그리퍼 서비스 ready/status (INITIALIZE 완료 여부 + Modbus 통신 상태)
         self.gripper_hw_ready = False
+        self.gripper_hw_status = 0          # STATUS_IO_ERROR=3 등
+        self.gripper_hw_status_text = ''
         self.create_subscription(
             GripperState, '/gripper_service/state', self._cb_gripper_service_state, 10)
 
@@ -712,14 +714,15 @@ class PickPlaceGuiNode(Node):
         if self.bridge is None:
             return
         frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
-        # OpenCV BGR → Qt RGB: 채널 순서를 뒤집어 [:, :, ::-1]
         rgb = np.ascontiguousarray(frame[:, :, ::-1])
         height, width, channel = rgb.shape
-        bytes_per_line = channel * width   # 행당 바이트 수 (stride)
-        self.latest_qimage = QImage(
+        bytes_per_line = channel * width
+        qimage = QImage(
             rgb.data, width, height, bytes_per_line, QImage.Format_RGB888
-        ).copy()   # ndarray 수명 독립을 위해 QImage 복사본 보관
-        self.last_image_time = time.monotonic()
+        ).copy()
+        with self._data_lock:
+            self.latest_qimage = qimage
+            self.last_image_time = time.monotonic()
 
     def _cb_objects(self, msg: String):
         """object_detector가 발행한 검출 물체 목록(JSON)을 파싱해 멤버 변수를 갱신한다.
@@ -750,19 +753,17 @@ class PickPlaceGuiNode(Node):
             return
         objects = payload.get('objects', [])
         now = time.monotonic()
-        if objects:
-            self._last_nonempty_objects = objects
-            self._last_nonempty_objects_time = now
-            self.detected_objects = objects
-        elif now - self._last_nonempty_objects_time < 1.0:
-            self.detected_objects = list(self._last_nonempty_objects)
-        else:
-            self.detected_objects = []
-        self.selected_label = payload.get('selected_label', '')
-        boxes = payload.get('boxes')
-        if isinstance(boxes, dict):
-            self._detected_boxes = boxes
-        self.last_objects_time = now
+        with self._data_lock:
+            if objects:
+                self._last_nonempty_objects = objects
+                self._last_nonempty_objects_time = now
+                self.detected_objects = objects
+            elif now - self._last_nonempty_objects_time < 1.0:
+                self.detected_objects = list(self._last_nonempty_objects)
+            else:
+                self.detected_objects = []
+            self.selected_label = payload.get('selected_label', '')
+            self.last_objects_time = now
 
     def _cb_state(self, msg: String):
         # 상태 문자열은 pick_place_node가 발행하는 값을 그대로 사용한다.
@@ -780,6 +781,8 @@ class PickPlaceGuiNode(Node):
 
     def _cb_gripper_service_state(self, msg: GripperState):
         self.gripper_hw_ready = msg.ready
+        self.gripper_hw_status = int(msg.status)
+        self.gripper_hw_status_text = msg.status_text or ''
 
     def _cb_gripper_init_progress(self, msg: String):
         # 그리퍼 INIT/REINIT 진행 — 메시지 수신 시각도 같이 저장(GUI에서 "stale" 판정용)
@@ -834,10 +837,13 @@ class PickPlaceGuiNode(Node):
         # 기동 순서대로 표시 (HW=로봇 먼저 → 그리퍼 → 카메라/검출 → pick).
         # GRIP은 3단 구분: ok(준비완료) / warn(초기화 중 — init_progress 수신) / bad(무응답·죽음).
         # 콜드부팅 INITIALIZE 동안엔 죽은(빨강) 게 아니라 깨우는 중(노랑)으로 보이게 한다.
-        grip_state = (
-            'ok' if self.gripper_hw_ready
-            else ('warn' if fresh(self.gripper_init_progress_t, 30.0) else 'bad')
-        )
+        # status3(IO_ERROR)는 init_progress가 있어도 통신 끊김 — bad로 고정.
+        if self.gripper_hw_status == 3:
+            grip_state = 'bad'
+        elif self.gripper_hw_ready:
+            grip_state = 'ok'
+        else:
+            grip_state = 'warn' if fresh(self.gripper_init_progress_t, 30.0) else 'bad'
         self.system_status_items = [
             ('HW',   'ok' if fresh(self.last_hw_state_time) else 'warn'),
             ('GRIP', grip_state),
@@ -867,11 +873,18 @@ class PickPlaceGui(QWidget):
         self._manual_feedback_until = 0.0
         self._manual_command_token = 0
         self._gripper_feedback_hold_sec = 2.2
-        self.object_buttons = {}
-        self._stable_labels = []
-        self._candidate_labels = []
-        self._candidate_label_hits = 0
-        self._label_stable_frames = 3
+        self.known_object_buttons = {}
+        self.unknown_object_buttons = {}
+        self._stable_known_labels = []
+        self._stable_unknown_labels = []
+        self._known_candidate_labels = []
+        self._unknown_candidate_labels = []
+        self._known_candidate_hits = 0
+        self._unknown_candidate_hits = 0
+        self._label_stable_frames_known = 1
+        self._label_stable_frames_unknown = 1
+        self._label_hide_grace_sec = 0.75
+        self._label_last_seen = {}
         self._settings_path = Path.home() / '.config' / 'dsr_realsense_pick_place' / 'gui_settings.json'
         self._settings = self._load_gui_settings()
         self._calib_current_mm = [None, None, None]
@@ -885,6 +898,11 @@ class PickPlaceGui(QWidget):
         self._system_reset_phase_until = 0.0
         self._gripper_bridge_restart_proc = None   # restart_gripper_bridge.sh 프로세스
         self._gripper_bridge_restart_until = 0.0   # 이 시각까지 버튼 비활성(재기동 진행 표시)
+        self._ros_spin_timer = None
+        self._ros_spin_stop = None
+        self._ros_spin_thread = None
+        self._shutting_down = False
+        self._last_rendered_image_time = 0.0
 
         # 좌측은 카메라 영상, 우측은 상태/선택 패널로 나누어 배치한다.
         self.setWindowTitle('DSR RealSense Pick & Place GUI')
@@ -1626,39 +1644,6 @@ class PickPlaceGui(QWidget):
         self.min_safe_z_status_label.setWordWrap(True)
         safety_layout.addWidget(self.min_safe_z_status_label)
 
-        # ── 초음파 파지 거리 (cm) — pick 하강 시 HC-SR04로 이 거리 도달하면 파지 ──
-        usonic_info = QLabel('초음파 파지 거리: 손끝-물체 거리가 이 값 이하가 되면 파지(IDLE 전용).')
-        usonic_info.setStyleSheet('color: #888; font-size: 11px;')
-        usonic_info.setWordWrap(True)
-        safety_layout.addWidget(usonic_info)
-
-        usonic_row = QHBoxLayout()
-        usonic_label = QLabel('파지 cm:')
-        usonic_label.setFixedWidth(56)
-        self.grasp_distance_spin = QDoubleSpinBox()
-        self.grasp_distance_spin.setRange(1.0, 30.0)   # cm
-        self.grasp_distance_spin.setSingleStep(0.5)
-        self.grasp_distance_spin.setDecimals(1)
-        self.grasp_distance_spin.setValue(self._load_grasp_distance_cm())
-        self.grasp_distance_spin.setFixedWidth(80)
-        self.grasp_distance_apply_button = QPushButton('적용')
-        self.grasp_distance_apply_button.setFixedSize(48, 26)
-        self.grasp_distance_apply_button.clicked.connect(self._grasp_distance_apply)
-        self.grasp_distance_save_button = QPushButton('💾 저장')
-        self.grasp_distance_save_button.setFixedSize(64, 26)
-        self.grasp_distance_save_button.clicked.connect(self._grasp_distance_save)
-        usonic_row.addWidget(usonic_label)
-        usonic_row.addWidget(self.grasp_distance_spin)
-        usonic_row.addStretch(1)
-        usonic_row.addWidget(self.grasp_distance_apply_button)
-        usonic_row.addWidget(self.grasp_distance_save_button)
-        safety_layout.addLayout(usonic_row)
-
-        self.grasp_distance_status_label = QLabel('')
-        self.grasp_distance_status_label.setStyleSheet('color: #aaa; font-size: 11px;')
-        self.grasp_distance_status_label.setWordWrap(True)
-        safety_layout.addWidget(self.grasp_distance_status_label)
-
         # ── 검출 임계 / 카메라 노출 조정 (운전 탭, 물체 선택 위) ─────────
         # confidence는 object_detector의 conf_thresh를 라이브 변경.
         # 노출은 RealSense rgb_camera 파라미터를 라이브 변경 (auto OFF 후 수동 값 설정).
@@ -1743,23 +1728,32 @@ class PickPlaceGui(QWidget):
         self.auto_button.clicked.connect(lambda: self._select_label(''))
         object_layout.addWidget(self.auto_button)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll_container = QWidget()
-        self.button_grid = QGridLayout(scroll_container)
-        scroll.setWidget(scroll_container)
-        object_layout.addWidget(scroll)
+        btn_row_h = 34
+        scroll_visible_rows = 2
+        scroll_h = btn_row_h * scroll_visible_rows + 6
 
-        self.object_summary = QLabel('검출된 물체가 없습니다.')
-        self.object_summary.setWordWrap(True)
-        self.object_summary.setAlignment(Qt.AlignTop)
-        # 검출 물체가 많으면 목록이 길어져 GUI가 늘어나므로 별도 스크롤 영역에 넣어
-        # 높이를 제한한다(넘치면 세로 스크롤).
-        summary_scroll = QScrollArea()
-        summary_scroll.setWidgetResizable(True)
-        summary_scroll.setWidget(self.object_summary)
-        summary_scroll.setMaximumHeight(300)
-        object_layout.addWidget(summary_scroll)
+        def _make_object_scroll(title: str):
+            section = QGroupBox(title)
+            section_layout = QVBoxLayout(section)
+            section_layout.setContentsMargins(4, 4, 4, 4)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFixedHeight(scroll_h)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            container = QWidget()
+            grid = QGridLayout(container)
+            grid.setContentsMargins(0, 0, 0, 0)
+            grid.setHorizontalSpacing(6)
+            grid.setVerticalSpacing(4)
+            scroll.setWidget(container)
+            section_layout.addWidget(scroll)
+            return section, grid
+
+        self.known_object_group, self.known_button_grid = _make_object_scroll('학습 클래스 (Known)')
+        self.unknown_object_group, self.unknown_button_grid = _make_object_scroll('미학습 물체 (Unknown)')
+        object_layout.addWidget(self.known_object_group)
+        object_layout.addWidget(self.unknown_object_group)
 
         # 탭1 "운전" 단일 컬럼: 긴급 제어 → 검출/노출 조정 → 물체 선택 → 실시간 전류
         # (상태창은 카메라와 그래프 사이의 cam_col로 이동 — 모든 탭에서 상시 노출)
@@ -1810,6 +1804,25 @@ class PickPlaceGui(QWidget):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._update_ui)
         self.timer.start(100)
+
+    def request_shutdown(self):
+        """SIGTERM/Ctrl+C/창 닫기 시 Qt·ROS 타이머를 먼저 멈춰 rcl_shutdown 이후 RCLError를 막는다."""
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+        if self._ros_spin_stop is not None:
+            self._ros_spin_stop.set()
+        if hasattr(self, 'timer') and self.timer is not None:
+            self.timer.stop()
+        if self._ros_spin_timer is not None:
+            self._ros_spin_timer.stop()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
+    def closeEvent(self, event):
+        self.request_shutdown()
+        super().closeEvent(event)
 
     def _select_label(self, label: str):
         self.ros_node.publish_selected_label(label)
@@ -2247,81 +2260,6 @@ class PickPlaceGui(QWidget):
             self.ros_node.get_logger().error(f'min_safe_z yaml 저장 실패: {e}')
             self.min_safe_z_status_label.setText(f'⚠ 저장 실패: {e}')
 
-    # ── 초음파 파지 거리 (cm) ────────────────────────────────────────
-    def _load_grasp_distance_cm(self) -> float:
-        """yaml에서 pick_place_node.grasp_distance_m(m)을 읽어 cm로 변환. 실패 시 7.0cm."""
-        path = self._find_params_yaml()
-        if path is None:
-            return 7.0
-        try:
-            with open(path, 'r') as f:
-                data = yaml.safe_load(f) or {}
-            pp = data.get('pick_place_node', {}).get('ros__parameters', {})
-            return float(pp.get('grasp_distance_m', 0.07)) * 100.0
-        except Exception as e:
-            self.ros_node.get_logger().warn(f'grasp_distance_m config 읽기 실패(7cm 사용): {e}')
-            return 7.0
-
-    def _grasp_distance_apply(self):
-        """스핀박스 값(cm)을 m로 변환해 pick_place_node.grasp_distance_m로 라이브 적용."""
-        cli = self.ros_node.cli_pickplace_set_parameters
-        if not cli.service_is_ready():
-            self.grasp_distance_status_label.setText('⚠ pick_place set_parameters 서비스 미연결')
-            return
-        val_m = float(self.grasp_distance_spin.value()) / 100.0
-        req = SetParameters.Request()
-        p = RclParameter()
-        p.name = 'grasp_distance_m'
-        p.value = ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=val_m)
-        req.parameters = [p]
-        future = cli.call_async(req)
-        future.add_done_callback(self._on_grasp_distance_applied)
-        self.grasp_distance_status_label.setText('적용 중...')
-
-    def _on_grasp_distance_applied(self, future):
-        try:
-            results = future.result().results
-            ok = bool(results) and all(r.successful for r in results)
-            reason = '' if ok else (results[0].reason if results else '거부됨')
-        except Exception as e:
-            self.ros_node.get_logger().error(f'grasp_distance_m 적용 실패: {e}')
-            self.grasp_distance_status_label.setText(f'⚠ 적용 실패: {e}')
-            return
-        if ok:
-            cm = float(self.grasp_distance_spin.value())
-            self.ros_node.get_logger().info(f'초음파 파지 거리 적용: {cm:.1f}cm')
-            self.grasp_distance_status_label.setText(f'✓ 적용: {cm:.1f} cm')
-        else:
-            self.grasp_distance_status_label.setText(f'⚠ 거부됨: {reason}')
-
-    def _grasp_distance_save(self):
-        """현재 값(cm→m)을 yaml의 grasp_distance_m 라인만 교체해 저장(주석 보존)."""
-        path = self._find_params_yaml()
-        if path is None:
-            self.grasp_distance_status_label.setText('⚠ config yaml 파일을 찾지 못함')
-            return
-        val_m = float(self.grasp_distance_spin.value()) / 100.0
-        try:
-            with open(path, 'r') as f:
-                lines = f.readlines()
-            replaced = False
-            for i, line in enumerate(lines):
-                m = re.match(r'^(\s*)grasp_distance_m\s*:', line)
-                if m:
-                    lines[i] = f'{m.group(1)}grasp_distance_m: {val_m:.3f}\n'
-                    replaced = True
-                    break
-            if not replaced:
-                self.grasp_distance_status_label.setText('⚠ yaml에서 grasp_distance_m 키를 찾지 못함')
-                return
-            with open(path, 'w') as f:
-                f.writelines(lines)
-            self.ros_node.get_logger().info(f'grasp_distance_m yaml 저장: {path} = {val_m:.3f}')
-            self.grasp_distance_status_label.setText(f'💾 저장 완료: {val_m*100:.1f} cm')
-        except Exception as e:
-            self.ros_node.get_logger().error(f'grasp_distance_m yaml 저장 실패: {e}')
-            self.grasp_distance_status_label.setText(f'⚠ 저장 실패: {e}')
-
     # ── 검출 임계 / 노출 (운전 탭) ───────────────────────────────────
     def _confidence_apply(self):
         """object_detector의 confidence_threshold를 라이브 변경."""
@@ -2512,8 +2450,65 @@ class PickPlaceGui(QWidget):
         future = self.ros_node.cli_e_stop_reset.call_async(Trigger.Request())
         future.add_done_callback(_on_done)
 
+    GRIPPER_STATUS_IO_ERROR = 3
+
+    def _gripper_has_status3_fault(self) -> bool:
+        """그리퍼 Modbus/RS485 통신 끊김(status3) 여부 — 에러 해제 시 브릿지 재기동 트리거."""
+        rn = self.ros_node
+        if rn.gripper_hw_status == self.GRIPPER_STATUS_IO_ERROR:
+            return True
+        t = (rn.gripper_hw_status_text or '').lower()
+        if any(k in t for k in ('status 3', 'status3', 'io_error', 'io error')):
+            return True
+        et = (rn.last_error_text or '').lower()
+        return any(k in et for k in ('status 3', 'status3', 'io_error', '그리퍼 통신'))
+    
+    def _run_gripper_bridge_recovery(self, status_text: str):
+        """status3 복구 — gripper_service_node + gripper_node 프로세스만 재기동."""
+        self.command_status_label.setText(status_text)
+        self._gripper_bridge_restart()
+
     def _clear_error(self):
-        self.ros_node.call_trigger_service(self.ros_node.cli_clear_error, 'pick_place/clear_error')
+        status3 = self._gripper_has_status3_fault()
+        is_in_error = self.ros_node.pick_place_state == 'ERROR'
+
+        if not is_in_error and not status3:
+            return
+
+        if status3:
+            self.ros_node.get_logger().warn(
+                '에러 해제: 그리퍼 status3(IO_ERROR) 감지 — 브릿지 재기동으로 복구')
+
+        if is_in_error:
+            client = self.ros_node.cli_clear_error
+            if not client.service_is_ready():
+                self.ros_node.get_logger().warn('서비스 미연결: pick_place/clear_error')
+                if status3:
+                    self.ros_node.last_error_text = ''
+                    self._run_gripper_bridge_recovery('⏳ 그리퍼 status3 — 브릿지 재기동 중...')
+                return
+
+            def _on_done(future):
+                try:
+                    res = future.result()
+                    self.ros_node.get_logger().info(
+                        f'pick_place/clear_error: {"성공" if res.success else "거절"} - {res.message}')
+                except Exception as e:
+                    self.ros_node.get_logger().error(f'pick_place/clear_error 호출 실패: {e}')
+                if status3:
+                    self._run_gripper_bridge_recovery(
+                        '✅ 에러 해제 완료 — 그리퍼 status3 브릿지 재기동 중...')
+                else:
+                    self.command_status_label.setText('✅ 에러 해제 완료')
+
+            self.ros_node.last_error_text = ''
+            self.command_status_label.setText(
+                '⏳ 에러 해제 + 그리퍼 복구 요청 중...' if status3 else '⏳ 에러 해제 요청 중...')
+            client.call_async(Trigger.Request()).add_done_callback(_on_done)
+        elif status3:
+            # IDLE인데 그리퍼만 status3 — pick_place clear_error 없이 브릿지만 재기동.
+            self.ros_node.last_error_text = ''
+            self._run_gripper_bridge_recovery('⏳ 그리퍼 status3 — 브릿지 재기동 중...')
 
     def _speed_normal(self):
         self.ros_node.call_trigger_service(self.ros_node.cli_speed_normal, 'pick_place/speed_normal')
@@ -2640,10 +2635,10 @@ class PickPlaceGui(QWidget):
         if self._saved_model_applied:
             return
         model_path = str(self._settings.get('yolo_model_path', '')).strip()
-        if not model_path or not self.ros_node.cli_object_set_parameters.service_is_ready():
-            return
+        if model_path and not self.model_path_edit.text().strip():
+            self.model_path_edit.setText(model_path)
+        # launch가 yolo_model을 이미 세팅 — 시작 시 sync RPC/재로드 생략(메인스레드 블로킹 방지)
         self._saved_model_applied = True
-        self._model_apply(save=False, silent=True)
 
     def _calib_load(self):
         cli = self.ros_node.cli_object_get_parameters
@@ -2817,7 +2812,10 @@ class PickPlaceGui(QWidget):
         # status 점(색)만으론 "뭘 하는지" 모름 → 현재 동작/단계를 한 줄로. 그리퍼 초기화 중이면 우선 표시.
         st = self.ros_node.pick_place_state
         prog = self.ros_node.gripper_init_progress
-        if not self.ros_node.gripper_hw_ready:
+        if self.ros_node.gripper_hw_status == 3:
+            text = '🔴 그리퍼 status3 (통신 끊김) — 에러 해제로 브릿지 복구'
+            text, bg, fg = text, '#3a1010', '#ff9999'
+        elif not self.ros_node.gripper_hw_ready:
             # 그리퍼가 준비 안 됨 = 초기화 중. 진행 메시지(init_progress)가 끊겨도 "초기화 중" 유지.
             label = f'⚙️ 그리퍼 초기화 중 — {prog}' if prog else '⚙️ 그리퍼 초기화 중...'
             text, bg, fg = label, '#1a2a3a', '#cfe8ff'
@@ -2842,457 +2840,6 @@ class PickPlaceGui(QWidget):
             ' padding: 2px 8px; font-size: 12px; font-weight: bold;'
         )
 
-    def _update_ui(self):
-        # 시스템 리셋 진행 상태 폴링
-        self._poll_system_reset()
-
-        # 주문 큐 탭이 보일 때만 큐를 주기 갱신 (불필요한 DB 읽기 방지).
-        if self.tabs.currentIndex() == self.tabs.count() - 1:
-            self._refresh_queue()
-
-        self.ros_node.refresh_system_status()
-        self._maybe_load_object_settings()
-        self._maybe_apply_saved_model_path()
-        detected_snapshot = list(self.ros_node.detected_objects)
-
-        # 카메라 영상은 최신 프레임이 있을 때만 갱신한다.
-        if self.ros_node.latest_qimage is not None:
-            pixmap = QPixmap.fromImage(self.ros_node.latest_qimage)
-            self._draw_object_frames_on_pixmap(pixmap, detected_snapshot)
-            scaled = pixmap.scaled(
-                self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-            )
-            self.image_label.setPixmap(scaled)
-        self._update_system_status_bar()
-
-        # 선택 라벨이 비어 있으면 자동 선택 상태로 표현한다.
-        selected_text = self.ros_node.selected_label or '자동 선택'
-        self.state_label.setText(f'Pick & Place 상태: {self.ros_node.pick_place_state}')
-        # 에러 배너 — ERROR 상태에서만 '어떤 에러인지' 좌상단에 표시 (복구되면 자동 숨김)
-        if self.ros_node.pick_place_state == 'ERROR' and self.ros_node.last_error_text:
-            self.error_banner_label.setText(self.ros_node.last_error_text)
-            self.error_banner_label.setVisible(True)
-        else:
-            self.error_banner_label.setVisible(False)
-        self._update_activity_label()
-        self.selection_label.setText(f'선택 물체: {selected_text}')
-        self.selection_status_label.setText(self._build_selection_status())
-
-        state        = self.ros_node.pick_place_state
-        is_e_stopped = state == 'EMERGENCY_STOP'
-        is_idle      = state == 'IDLE'
-        is_active    = state not in ('IDLE', 'EMERGENCY_STOP')
-        # cancel은 실제 픽 사이클 + HOME 이동 중에만 의미 있음. INITIALIZING/ERROR/BACKDRIVE 제외.
-        is_in_cancelable_motion = state in (
-            'DETECTING', 'PRE_PICK', 'PICK', 'LIFT',
-            'MOVE_TO_PLACE', 'PLACE', 'POST_PLACE', 'HOME',
-        )
-        is_in_error  = state == 'ERROR'
-        hw = self.ros_node.hw_state
-        if self._reset_in_progress:
-            if (not is_e_stopped and hw not in (6, 15)) or time.monotonic() > self._reset_deadline:
-                self._reset_in_progress = False
-        self._update_manual_command_feedback(state)
-
-        # ── 서비스 / 하드웨어 연결 상태 (100ms 폴링) ─────────────────
-        go_home_svc       = self.ros_node.cli_go_home.service_is_ready()
-        recover_svc       = self.ros_node.cli_recover_to_home.service_is_ready()
-        gripper_open_svc  = self.ros_node.cli_gripper_open.service_is_ready()
-        gripper_close_svc = self.ros_node.cli_gripper_close.service_is_ready()
-        pick_svc          = self.ros_node.cli_run_once.service_is_ready()
-        speed_normal_svc  = self.ros_node.cli_speed_normal.service_is_ready()
-        speed_reduced_svc = self.ros_node.cli_speed_reduced.service_is_ready()
-        servo_off_svc     = self.ros_node.cli_servo_off.service_is_ready()
-        servo_on_svc      = self.ros_node.cli_servo_on.service_is_ready()
-        safety_normal_svc = self.ros_node.cli_safety_normal.service_is_ready()
-        safety_bd_svc     = self.ros_node.cli_safety_backdrive.service_is_ready()
-        e_stop_reset_svc  = self.ros_node.cli_e_stop_reset.service_is_ready()
-        gripper_param_svc = self.ros_node.cli_gripper_set_parameters.service_is_ready()
-        gripper_reinit_svc = self.ros_node.cli_gripper_reinit.service_is_ready()
-        gripper_enable_svc = self.ros_node.cli_gripper_enable.service_is_ready()
-
-        gripper_hw_ready  = self.ros_node.gripper_hw_ready
-        # hw=-1: 미수신, 6: E-STOP, 15: NOT_READY → 이 세 상태에서는 수동 명령 불가
-        hw_ok             = hw not in (-1, 6, 15)
-
-        # ── 긴급 제어 버튼 ────────────────────────────────────────────
-        # E-STOP: 항상 활성 (서비스 미연결이어도 클릭 가능해야 하는 최우선 안전 버튼)
-        self.e_stop_button.setEnabled(True)
-        self.cancel_button.setEnabled(is_in_cancelable_motion)
-        # 에러 해제: ERROR 상태 + 서비스 연결 + 리셋 진행 중 아닐 때만.
-        clear_error_svc = self.ros_node.cli_clear_error.service_is_ready()
-        self.clear_error_button.setEnabled(
-            is_in_error and clear_error_svc and not self._reset_in_progress
-        )
-        if self._reset_in_progress:
-            self.e_stop_reset_button.setEnabled(False)
-            self.e_stop_reset_button.setText('리셋 중...')
-        else:
-            self.e_stop_reset_button.setText('긴급정지 해제')
-            # 긴급정지 해제: E-STOP 상태 + 서비스 연결 시에만 활성
-            self.e_stop_reset_button.setEnabled(is_e_stopped and e_stop_reset_svc)
-
-        # ── 수동 제어 버튼 ────────────────────────────────────────────
-        # HW 준비 + 비정상 상태가 아닐 때 + 리셋 중이 아닐 때
-        manual_enabled = (
-            state in ('IDLE', 'DETECTING', 'ERROR')
-            and not self._reset_in_progress
-            and hw_ok
-        )
-        manual_busy     = self._manual_command is not None
-        command_enabled = manual_enabled and not manual_busy
-        # 설정·튜닝값(min_safe_z, 물체별 파지 강도, 그리퍼 정밀 전류) 편집 게이트.
-        # 캘리브레이션과 동일하게 IDLE 전용 — 동작 중(DETECTING/PICK/LIFT/MOVE 등)엔 편집·적용 불가.
-        config_edit_enabled = is_idle and not manual_busy and not self._reset_in_progress
-
-        # HOME: pick_place 서비스 연결 필요
-        self.home_button.setEnabled(command_enabled and go_home_svc)
-        # 에러 복구 & HOME: recover 서비스 연결 필요
-        self.recover_home_button.setEnabled(command_enabled and recover_svc)
-        # 그리퍼 수동 조작: 그리퍼 HW 초기화 완료(INITIALIZE) + 각 서비스 연결 필요
-        gripper_cmd_ok = command_enabled and gripper_hw_ready
-        self.gripper_open_button.setEnabled(gripper_cmd_ok and gripper_open_svc)
-        self.gripper_close_button.setEnabled(gripper_cmd_ok and gripper_close_svc)
-        # [2026-06-09] 그리퍼 리셋 버튼 제거됨 — 여기서 참조하면 AttributeError로 _update_ui 전체가
-        #   죽어 UI(전류/위치/물체버튼)가 통째로 멈춘다. 절대 되살리지 말 것.
-        # 토크 ON/OFF: 초기화 완료 + 비활성(IDLE/DETECTING/ERROR) 상태에서만.
-        #   모션 중(PICK/LIFT/MOVE)엔 command_enabled=False라 자동 차단 → 모션 중 토크 OFF 사고 방지.
-        self.gripper_torque_on_button.setEnabled(gripper_cmd_ok and gripper_enable_svc)
-        self.gripper_torque_off_button.setEnabled(gripper_cmd_ok and gripper_enable_svc)
-        self._update_manual_button_texts()
-        # 물체 선택 / 자동 선택: IDLE + 모든 서비스 준비 + 그리퍼 HW 완료 필요
-        full_system_ready  = command_enabled and is_idle and pick_svc and gripper_hw_ready
-        object_buttons_enabled = full_system_ready
-        self.auto_button.setEnabled(full_system_ready)
-        object_param_ready = (
-            self.ros_node.cli_object_get_parameters.service_is_ready()
-            and self.ros_node.cli_object_set_parameters.service_is_ready()
-        )
-        self.calib_load_button.setEnabled(self.ros_node.cli_object_get_parameters.service_is_ready())
-        self.calib_apply_button.setEnabled(object_param_ready and is_idle)
-        self.model_browse_button.setEnabled(True)
-        self.model_apply_button.setEnabled(self.ros_node.cli_object_set_parameters.service_is_ready())
-
-        # 검출/노출 조정 — confidence는 detector, 노출은 camera 서비스. 슬라이더는 항상 편집 가능.
-        camera_param_svc = self.ros_node.cli_camera_set_parameters.service_is_ready()
-        self.conf_apply_button.setEnabled(self.ros_node.cli_object_set_parameters.service_is_ready())
-        self.auto_exposure_check.setEnabled(camera_param_svc)
-        # 자동노출 ON이면 수동 슬라이더/적용 비활성 (효과 없으니 혼동 방지)
-        manual_exp_enabled = camera_param_svc and not self.auto_exposure_check.isChecked()
-        self.exposure_slider.setEnabled(manual_exp_enabled)
-        self.exposure_spin.setEnabled(manual_exp_enabled)
-        self.exposure_apply_button.setEnabled(manual_exp_enabled)
-
-        # ── 그리퍼 정밀 제어 상태 및 활성화 제어 ─────────────────────────────
-        # 실시간 상태 레이블 업데이트
-        pres_curr = self.ros_node.gripper_present_current
-        pres_pos = self.ros_node.gripper_present_position
-        self.gripper_status_label.setText(f'실시간 - 전류: {pres_curr:.0f} mA | 위치: {pres_pos:.0f}')
-
-        now_mono = time.monotonic()
-        us_fresh = (
-            self.ros_node.last_ultrasonic_time > 0.0
-            and now_mono - self.ros_node.last_ultrasonic_time <= 3.0
-        )
-        if us_fresh and self.ros_node.ultrasonic_range_m is not None:
-            self.ultrasonic_status_label.setText(
-                f'초음파 거리: {self.ros_node.ultrasonic_range_m * 1000:.0f} mm')
-        else:
-            self.ultrasonic_status_label.setText('초음파 거리: -- mm')
-
-        # 그리퍼 INIT/REINIT 라벨 — 진행 중이면 "INIT 5/15 | 47s | trying", 막힌 듯하면 stale 표시
-        prog = self.ros_node.gripper_init_progress
-        prog_t = self.ros_node.gripper_init_progress_t
-        age = time.monotonic() - prog_t if prog_t > 0 else 999
-        if gripper_hw_ready:
-            self.gripper_init_label.setText('그리퍼: ✅ 준비')
-            self.gripper_init_label.setStyleSheet(
-                'color: #88ff88; font-weight: bold; padding: 2px 6px; border-radius: 4px;'
-                'background-color: #003300;')
-        elif prog and age < 30:
-            # 최근 30초 안 메시지 → 진행 중일 가능성 (age가 카운트 되면 시각적 변화)
-            indicator = '🔄' if age < 5 else '⏳'  # 5초 이내 갱신=빠른 진행, 그 이후=느림(stuck 의심)
-            self.gripper_init_label.setText(f'그리퍼: {indicator} {prog} (수신 {age:.0f}s 전)')
-            color = '#ffaa00' if age < 5 else '#ff5500'  # 늦으면 빨강 경향
-            self.gripper_init_label.setStyleSheet(
-                f'color: white; font-weight: bold; padding: 2px 6px; border-radius: 4px;'
-                f'background-color: {color};')
-        elif prog:
-            # 메시지 30초 이상 stale → stuck/실패 가능성 큼
-            self.gripper_init_label.setText(f'그리퍼: ⚠ STUCK? 마지막 메시지 {age:.0f}s 전: {prog}')
-            self.gripper_init_label.setStyleSheet(
-                'color: white; font-weight: bold; padding: 2px 6px; border-radius: 4px;'
-                'background-color: #aa0000;')
-        else:
-            self.gripper_init_label.setText('그리퍼: 대기')
-            self.gripper_init_label.setStyleSheet(
-                'color: #aaa; font-weight: bold; padding: 2px 6px; border-radius: 4px;'
-                'background-color: #2a2a2a;')
-
-        # 실시간 그래프 데이터 추가
-        self.realtime_graph.add_data(pres_curr)
-
-        # 높은 전류 부하가 감지될 때 경고 표시 색상 부여
-        if pres_curr >= 500.0:
-            self.gripper_status_label.setStyleSheet(
-                'color: #ff3333; font-weight: bold; background-color: #4a0000; padding: 4px; border-radius: 4px; font-family: monospace;'
-            )
-        elif pres_curr >= 300.0:
-            self.gripper_status_label.setStyleSheet(
-                'color: #ffff33; font-weight: bold; background-color: #4a4a00; padding: 4px; border-radius: 4px; font-family: monospace;'
-            )
-        else:
-            self.gripper_status_label.setStyleSheet(
-                'color: #33ff33; font-weight: bold; background-color: #003a00; padding: 4px; border-radius: 4px; font-family: monospace;'
-            )
-            
-        # 그리퍼 파라미터 적용 버튼 및 컨트롤들 활성화 제어
-        # 적용: 서비스 연결 + 그리퍼 HW 초기화 완료 + IDLE(설정 편집 게이트) + 이전 요청 완료
-        gripper_apply_ok = (
-            gripper_param_svc
-            and gripper_hw_ready
-            and config_edit_enabled
-            and not getattr(self, '_gripper_apply_busy', False)
-        )
-        self.gripper_apply_button.setEnabled(gripper_apply_ok)
-
-        # 슬라이더/스핀박스: 정밀 전류는 설정값이므로 IDLE 전용(동작 중 편집 불가).
-        self.close_curr_slider.setEnabled(config_edit_enabled)
-        self.close_curr_spin.setEnabled(config_edit_enabled)
-        self.open_curr_slider.setEnabled(config_edit_enabled)
-        self.open_curr_spin.setEnabled(config_edit_enabled)
-        self.vel_slider.setEnabled(config_edit_enabled)
-        self.vel_spin.setEnabled(config_edit_enabled)
-        self.acc_slider.setEnabled(config_edit_enabled)
-        self.acc_spin.setEnabled(config_edit_enabled)
-
-        # ── 물체별 파지 강도 버튼 ─────────────────────────────────────
-        # 적용: pick_place set_parameters 연결 + IDLE 전용. 저장: 파일 쓰기라 항상 가능.
-        pickplace_param_svc = self.ros_node.cli_pickplace_set_parameters.service_is_ready()
-        self.grip_strength_apply_button.setEnabled(config_edit_enabled and pickplace_param_svc)
-        self.grip_strength_save_button.setEnabled(True)
-        for _slider, _spin in self._grip_strength_rows.values():
-            _slider.setEnabled(config_edit_enabled)
-            _spin.setEnabled(config_edit_enabled)
-
-        # ── TCP Z 안전 하한 ───────────────────────────────────────────
-        # 적용: pick_place set_parameters 연결 + IDLE 전용. 저장: 파일 쓰기라 항상 가능.
-        self.min_safe_z_apply_button.setEnabled(config_edit_enabled and pickplace_param_svc)
-        self.min_safe_z_save_button.setEnabled(True)
-        self.min_safe_z_spin.setEnabled(config_edit_enabled)
-
-        # ── 그리퍼 브릿지 재시작 버튼 ─────────────────────────────────
-        # 복구용이라 로봇 상태 무관하게 항상 활성. 재기동 진행 중(45s 창)엔만 비활성.
-        gbr_busy = (self._gripper_bridge_restart_proc is not None
-                    and time.monotonic() < self._gripper_bridge_restart_until)
-        self.gripper_bridge_restart_button.setEnabled(not gbr_busy)
-        if not gbr_busy and self._gripper_bridge_restart_proc is not None:
-            if self.gripper_bridge_restart_label.text().startswith('⏳'):
-                self.gripper_bridge_restart_label.setText('✅ 재기동 완료 — 그리퍼 ready 확인 후 사용')
-            self._gripper_bridge_restart_proc = None
-
-        # ── 안전 모드 버튼 ────────────────────────────────────────────
-        # 속도 모드: E-STOP이 아닐 때 + 서비스 연결 필요
-        self.speed_normal_button.setEnabled(not is_e_stopped and speed_normal_svc)
-        self.speed_reduced_button.setEnabled(not is_e_stopped and speed_reduced_svc)
-        # 서보 OFF: E-STOP 아닐 때 + 서비스 연결 / 서보 ON: SAFE_OFF(3,10) 또는 E-STOP + 서비스 연결
-        is_safe_off = hw in (3, 10)   # STATE_SAFE_OFF, STATE_SAFE_OFF2
-        self.servo_off_button.setEnabled(not is_e_stopped and servo_off_svc)
-        self.servo_on_button.setEnabled((is_safe_off or is_e_stopped) and servo_on_svc)
-
-        # ── HW 상태 레이블 ────────────────────────────────────────────
-        hw_state_names = {
-            0: 'INITIALIZING', 1: 'STANDBY', 2: 'MOVING',
-            3: 'SAFE_OFF', 4: 'TEACHING', 5: 'SAFE_STOP',
-            6: 'E-STOP', 7: 'HOMING', 8: 'RECOVERY',
-            9: 'SAFE_STOP2', 10: 'SAFE_OFF2', 15: 'NOT_READY',
-        }
-        hw_name = hw_state_names.get(self.ros_node.hw_state, f'CODE={self.ros_node.hw_state}')
-        hw_color = {
-            1: '#1a6a1a',   # STANDBY   → 녹색
-            2: '#1a4a8a',   # MOVING    → 파랑
-            5: '#8a4a00',   # SAFE_STOP → 주황
-            6: '#8a0000',   # E-STOP    → 빨강
-            3: '#8a0000',   # SAFE_OFF  → 빨강
-        }.get(self.ros_node.hw_state, '#444444')
-        self.hw_state_label.setText(f'HW: {hw_name}')
-        self.hw_state_label.setStyleSheet(
-            f'font-weight: bold; padding: 4px 8px; border-radius: 4px;'
-            f'background-color: {hw_color}; color: white;'
-        )
-
-        speed_name = '감속 모드' if self.ros_node.speed_mode == 1 else '정상 속도'
-        speed_color = '#7a6000' if self.ros_node.speed_mode == 1 else '#1a5c1a'
-        self.speed_mode_label.setText(f'속도: {speed_name}')
-        self.speed_mode_label.setStyleSheet(
-            f'font-weight: bold; padding: 4px 8px; border-radius: 4px;'
-            f'background-color: {speed_color}; color: white;'
-        )
-
-        # ── Doosan 안전 모드 버튼 ────────────────────────────────────
-        # 정상 운전: 서비스 연결 시 활성 (역구동 해제 수단이므로 비교적 관대)
-        # 역구동: 이미 역구동 중이 아닐 때 + 서비스 연결
-        is_backdrive = state == 'BACKDRIVE'
-        self.safety_auto_button.setEnabled(safety_normal_svc)
-        self.safety_backdrive_button.setEnabled(not is_backdrive and safety_bd_svc)
-
-        # 역구동 중 라벨 업데이트
-        if is_backdrive:
-            self.safety_mode_label.setText('현재 안전 모드: 역구동 (중력보상 스트리밍 중)')
-            self.safety_mode_label.setStyleSheet(
-                'font-weight: bold; padding: 3px 6px; border-radius: 4px;'
-                'background-color: #2a2a5a; color: #aaaaff;'
-            )
-        else:
-            self.safety_mode_label.setText('현재 안전 모드: 정상 운전')
-            self.safety_mode_label.setStyleSheet(
-                'font-weight: bold; padding: 3px 6px; border-radius: 4px;'
-                'background-color: #2a2a2a; color: white;'
-            )
-
-        # ── 배경색 경고 ───────────────────────────────────────────────
-        if is_backdrive:
-            self.setStyleSheet('QWidget { background-color: #0a0a2a; }')
-        elif is_e_stopped:
-            self.setStyleSheet('QWidget { background-color: #3a0000; }')
-        else:
-            self.setStyleSheet('')
-
-
-        # 도달 가능한 물체만 통과 — 버튼·요약 모두 같은 필터 사용.
-        reachable_snapshot = [
-            item for item in detected_snapshot
-            if self._is_object_reachable(item)
-        ]
-
-        # 같은 라벨의 물체가 여러 개 검출될 수 있으므로 버튼은 라벨 단위로만 만든다.
-        labels = []
-        for item in reachable_snapshot:
-            label = item.get('label', 'unknown')
-            if label not in labels:
-                labels.append(label)
-
-        self._refresh_buttons(self._stable_detection_labels(labels), object_buttons_enabled)
-        self._refresh_summary(reachable_snapshot)
-
-    def _update_manual_command_feedback(self, state: str):
-        now = time.monotonic()
-        if self._manual_command is not None:
-            key = self._manual_command.get('key')
-            wait_for_state = self._manual_command.get('wait_for_state', False)
-            accepted = self._manual_command.get('accepted', False)
-            progress_text = self._manual_command.get('progress_text', '')
-            done_text = self._manual_command.get('done_text', '')
-            min_busy_until = float(self._manual_command.get('min_busy_until', 0.0))
-
-            if key == 'home' and state == 'HOME':
-                self._manual_command_seen_active = True
-
-            if state in ('ERROR', 'EMERGENCY_STOP'):
-                self._finish_manual_command(f'{progress_text} 중단됨')
-            elif wait_for_state and accepted and state == 'IDLE':
-                self._finish_manual_command(done_text)
-            elif not wait_for_state and accepted and now >= min_busy_until:
-                self._finish_manual_command(done_text)
-            elif now > self._manual_command_deadline:
-                self._finish_manual_command(f'{progress_text} 확인 시간 초과')
-
-        if self._manual_command is not None:
-            self.command_status_label.setText(self._manual_command.get('progress_text', '명령 처리 중...'))
-            return
-
-        if self._manual_feedback and now <= self._manual_feedback_until:
-            self.command_status_label.setText(self._manual_feedback)
-        else:
-            self._manual_feedback = ''
-            self.command_status_label.setText('')
-
-    def _update_manual_button_texts(self):
-        texts = {
-            'home': 'HOME 이동',
-            'gripper_open': '그리퍼 OPEN',
-            'gripper_close': '그리퍼 CLOSE',
-            'recover_to_home': '에러 복구 & HOME 복귀',
-        }
-        if self._manual_command is not None:
-            key = self._manual_command.get('key')
-            texts[key] = self._manual_command.get('progress_text', texts.get(key, '처리 중...'))
-        self.home_button.setText(texts['home'])
-        self.gripper_open_button.setText(texts['gripper_open'])
-        self.gripper_close_button.setText(texts['gripper_close'])
-        self.recover_home_button.setText(texts['recover_to_home'])
-
-    def _is_object_reachable(self, obj: dict) -> bool:
-        """검출 물체가 도달 가능 영역 안에 있는지 — 박스 한계 + sqrt(x^2+y^2) 반경 둘 다 체크.
-        한계 밖이면 버튼·요약 모두 가린다. pick_place_node의 _cb_pose 검사와 동일 룰 + 반경 추가."""
-        pose = obj.get('pose') or {}
-        try:
-            x = float(pose.get('x', 0.0))
-            y = float(pose.get('y', 0.0))
-            z = float(pose.get('z', 0.0))
-        except (TypeError, ValueError):
-            return False
-        n = self.ros_node
-        if not (n.workspace_x_min <= x <= n.workspace_x_max):
-            return False
-        if not (n.workspace_y_min <= y <= n.workspace_y_max):
-            return False
-        if not (n.workspace_z_min <= z <= n.workspace_z_max):
-            return False
-        if (x * x + y * y) ** 0.5 > n.reach_radius_max:
-            return False
-        return True
-
-    def _stable_detection_labels(self, labels: list):
-        """짧은 검출 누락으로 물체 버튼이 깜빡이지 않도록 라벨 목록을 안정화한다."""
-        if labels == self._candidate_labels:
-            self._candidate_label_hits += 1
-        else:
-            self._candidate_labels = list(labels)
-            self._candidate_label_hits = 1
-
-        if self._candidate_label_hits >= self._label_stable_frames:
-            self._stable_labels = list(self._candidate_labels)
-
-        return self._stable_labels
-
-    def _refresh_buttons(self, labels: list, enabled: bool):
-        """검출된 라벨 목록에 맞게 버튼을 생성/표시/강조한다.
-
-        버튼 관리 전략:
-          - 버튼은 라벨 이름을 키로 dict(object_buttons)에 보관하고 처음 한 번만 생성한다.
-          - 이후 호출에서는 visible 상태와 스타일만 갱신한다.
-            (매 프레임 버튼을 삭제/재생성하면 레이아웃 깜빡임과 메모리 낭비 발생)
-          - 이번 프레임에 없는 라벨의 버튼은 hide()하고, 다시 나타나면 show()한다.
-          - 현재 selected_label과 일치하는 버튼은 파란색으로 강조한다.
-
-        그리드 배치: 2열 그리드 (row = idx // 2, col = idx % 2)
-        """
-        active_labels = set(labels)
-        for button in self.object_buttons.values():
-            self.button_grid.removeWidget(button)
-
-        for idx, label in enumerate(labels):
-            button = self.object_buttons.get(label)
-            if button is None:
-                button = QPushButton(label)
-                button.clicked.connect(lambda checked=False, text=label: self._select_label(text))
-                self.object_buttons[label] = button
-            button.setVisible(True)
-            button.setEnabled(enabled)
-            if label == self.ros_node.selected_label and self.ros_node.selected_label:
-                button.setStyleSheet(
-                    'background-color: #1f6feb; color: white; font-weight: bold;'
-                )
-            else:
-                button.setStyleSheet('')
-            self.button_grid.addWidget(button, idx // 2, idx % 2)
-
-        for label, button in self.object_buttons.items():
-            if label not in active_labels:
-                button.setVisible(False)
-
-    # ── 주문 큐 탭 (유저 주문 모니터링 + 비우기) ─────────────────────
     def _build_queue_tab(self) -> QWidget:
         w = QWidget()
         lay = QVBoxLayout(w)
@@ -3476,32 +3023,538 @@ class PickPlaceGui(QWidget):
         self._refresh_queue()
         self.queue_status_label.setText('큐 재개됨' if now else '큐 보류됨 (새 주문 투입 정지)')
 
-    def _refresh_summary(self, detected_objects: list):
-        # 우측 하단 요약은 "현재 검출된 물체 목록"을 사람이 빠르게 읽기 위한 영역이다.
-        lines = []
-        for item in detected_objects:
-            pose = item.get('pose', {})
-            yaw = pose.get('yaw_deg', None)
-            yaw_text = f'{yaw:+.1f}deg' if isinstance(yaw, (int, float)) else 'N/A'
-            lines.append(
-                f"[{item.get('label', 'unknown')}] conf={item.get('confidence', 0.0):.2f}\n"
-                f"  XYZ=({pose.get('x', 0.0):+.3f}, {pose.get('y', 0.0):+.3f}, {pose.get('z', 0.0):+.3f}) m\n"
-                f"  Yaw={yaw_text}"
-            )
-        # box ROI 입구 위치 = place 목적지. 물체와 별도로 항상 표시(place 좌표 확인용).
-        box_lines = []
-        boxes = self.ros_node._detected_boxes
-        for n in sorted(boxes, key=lambda k: int(k)):
-            p = boxes[n]
-            box_lines.append(
-                f"[box_{n}] XYZ=({p.get('x', 0.0):+.3f}, "
-                f"{p.get('y', 0.0):+.3f}, {p.get('z', 0.0):+.3f}) m")
-        if box_lines:
-            lines.append('── 박스(place 목적지) ──\n' + '\n'.join(box_lines))
-        if not lines:
-            self.object_summary.setText('검출된 물체가 없습니다.')
+
+    def _update_ui(self):
+        if self._shutting_down or not rclpy.ok():
             return
-        self.object_summary.setText('\n\n'.join(lines))
+        try:
+            self._update_ui_body()
+        except Exception as exc:
+            if not rclpy.ok() or self._shutting_down:
+                return
+            raise exc
+
+    def _update_ui_body(self):
+        # 주문 큐 탭이 보일 때만 큐를 주기 갱신 (불필요한 DB 읽기 방지).
+        if self.tabs.currentIndex() == self.tabs.count() - 1:
+            self._refresh_queue()
+        # 시스템 리셋 진행 상태 폴링
+        self._poll_system_reset()
+
+        self.ros_node.refresh_system_status()
+        self._maybe_load_object_settings()
+        self._maybe_apply_saved_model_path()
+
+        # 카메라 영상은 새 프레임이 올 때만 갱신한다(매 tick SmoothTransformation 금지).
+        with self.ros_node._data_lock:
+            qimage = self.ros_node.latest_qimage
+            image_time = self.ros_node.last_image_time
+        if qimage is not None and image_time != self._last_rendered_image_time:
+            self._last_rendered_image_time = image_time
+            pixmap = QPixmap.fromImage(qimage)
+            scaled = pixmap.scaled(
+                self.image_label.size(), Qt.KeepAspectRatio, Qt.FastTransformation
+            )
+            self.image_label.setPixmap(scaled)
+        self._update_system_status_bar()
+
+        # 선택 라벨이 비어 있으면 자동 선택 상태로 표현한다.
+        selected_text = self.ros_node.selected_label or '자동 선택'
+        self.state_label.setText(f'Pick & Place 상태: {self.ros_node.pick_place_state}')
+        # 에러 배너 — ERROR 상태에서만 '어떤 에러인지' 좌상단에 표시 (복구되면 자동 숨김)
+        if self.ros_node.pick_place_state == 'ERROR' and self.ros_node.last_error_text:
+            self.error_banner_label.setText(self.ros_node.last_error_text)
+            self.error_banner_label.setVisible(True)
+        else:
+            self.error_banner_label.setVisible(False)
+        self._update_activity_label()
+        self.selection_label.setText(f'선택 물체: {selected_text}')
+        self.selection_status_label.setText(self._build_selection_status())
+
+        state        = self.ros_node.pick_place_state
+        is_e_stopped = state == 'EMERGENCY_STOP'
+        is_idle      = state == 'IDLE'
+        is_active    = state not in ('IDLE', 'EMERGENCY_STOP')
+        # cancel은 실제 픽 사이클 + HOME 이동 중에만 의미 있음. INITIALIZING/ERROR/BACKDRIVE 제외.
+        is_in_cancelable_motion = state in (
+            'DETECTING', 'PRE_PICK', 'PICK', 'LIFT',
+            'MOVE_TO_PLACE', 'PLACE', 'POST_PLACE', 'HOME',
+        )
+        is_in_error  = state == 'ERROR'
+        hw = self.ros_node.hw_state
+        if self._reset_in_progress:
+            if (not is_e_stopped and hw not in (6, 15)) or time.monotonic() > self._reset_deadline:
+                self._reset_in_progress = False
+        self._update_manual_command_feedback(state)
+
+        # ── 서비스 / 하드웨어 연결 상태 (100ms 폴링) ─────────────────
+        go_home_svc       = self.ros_node.cli_go_home.service_is_ready()
+        recover_svc       = self.ros_node.cli_recover_to_home.service_is_ready()
+        gripper_open_svc  = self.ros_node.cli_gripper_open.service_is_ready()
+        gripper_close_svc = self.ros_node.cli_gripper_close.service_is_ready()
+        pick_svc          = self.ros_node.cli_run_once.service_is_ready()
+        speed_normal_svc  = self.ros_node.cli_speed_normal.service_is_ready()
+        speed_reduced_svc = self.ros_node.cli_speed_reduced.service_is_ready()
+        servo_off_svc     = self.ros_node.cli_servo_off.service_is_ready()
+        servo_on_svc      = self.ros_node.cli_servo_on.service_is_ready()
+        safety_normal_svc = self.ros_node.cli_safety_normal.service_is_ready()
+        safety_bd_svc     = self.ros_node.cli_safety_backdrive.service_is_ready()
+        e_stop_reset_svc  = self.ros_node.cli_e_stop_reset.service_is_ready()
+        gripper_param_svc = self.ros_node.cli_gripper_set_parameters.service_is_ready()
+        gripper_reinit_svc = self.ros_node.cli_gripper_reinit.service_is_ready()
+        gripper_enable_svc = self.ros_node.cli_gripper_enable.service_is_ready()
+
+        gripper_hw_ready  = self.ros_node.gripper_hw_ready
+        # hw=-1: 미수신, 6: E-STOP, 15: NOT_READY → 이 세 상태에서는 수동 명령 불가
+        hw_ok             = hw not in (-1, 6, 15)
+
+        # ── 긴급 제어 버튼 ────────────────────────────────────────────
+        # E-STOP: 항상 활성 (서비스 미연결이어도 클릭 가능해야 하는 최우선 안전 버튼)
+        self.e_stop_button.setEnabled(True)
+        self.cancel_button.setEnabled(is_in_cancelable_motion)
+        # 에러 해제: ERROR 또는 그리퍼 status3. status3-only(IDLE)는 clear_error 서비스 없이도 브릿지 복구.
+        gripper_status3 = self._gripper_has_status3_fault()
+        clear_error_svc = self.ros_node.cli_clear_error.service_is_ready()
+        gbr_busy = (self._gripper_bridge_restart_proc is not None
+                    and time.monotonic() < self._gripper_bridge_restart_until)
+        clear_error_ok = (
+            not self._reset_in_progress
+            and not gbr_busy
+            and ((is_in_error and clear_error_svc) or gripper_status3)
+        )
+        self.clear_error_button.setEnabled(clear_error_ok)
+        if self._reset_in_progress:
+            self.e_stop_reset_button.setEnabled(False)
+            self.e_stop_reset_button.setText('리셋 중...')
+        else:
+            self.e_stop_reset_button.setText('긴급정지 해제')
+            # 긴급정지 해제: E-STOP 상태 + 서비스 연결 시에만 활성
+            self.e_stop_reset_button.setEnabled(is_e_stopped and e_stop_reset_svc)
+
+        # ── 수동 제어 버튼 ────────────────────────────────────────────
+        # HW 준비 + 비정상 상태가 아닐 때 + 리셋 중이 아닐 때
+        manual_enabled = (
+            state in ('IDLE', 'DETECTING', 'ERROR')
+            and not self._reset_in_progress
+            and hw_ok
+        )
+        manual_busy     = self._manual_command is not None
+        command_enabled = manual_enabled and not manual_busy
+        # 설정·튜닝값(min_safe_z, 물체별 파지 강도, 그리퍼 정밀 전류) 편집 게이트.
+        # 캘리브레이션과 동일하게 IDLE 전용 — 동작 중(DETECTING/PICK/LIFT/MOVE 등)엔 편집·적용 불가.
+        config_edit_enabled = is_idle and not manual_busy and not self._reset_in_progress
+
+        # HOME: pick_place 서비스 연결 필요
+        self.home_button.setEnabled(command_enabled and go_home_svc)
+        # 에러 복구 & HOME: recover 서비스 연결 필요
+        self.recover_home_button.setEnabled(command_enabled and recover_svc)
+        # 그리퍼 수동 조작: 그리퍼 HW 초기화 완료(INITIALIZE) + 각 서비스 연결 필요
+        gripper_cmd_ok = command_enabled and gripper_hw_ready
+        self.gripper_open_button.setEnabled(gripper_cmd_ok and gripper_open_svc)
+        self.gripper_close_button.setEnabled(gripper_cmd_ok and gripper_close_svc)
+        # [2026-06-09] 그리퍼 리셋 버튼 제거됨 — 여기서 참조하면 AttributeError로 _update_ui 전체가
+        #   죽어 UI(전류/위치/물체버튼)가 통째로 멈춘다. 절대 되살리지 말 것.
+        # 토크 ON/OFF: 초기화 완료 + 비활성(IDLE/DETECTING/ERROR) 상태에서만.
+        #   모션 중(PICK/LIFT/MOVE)엔 command_enabled=False라 자동 차단 → 모션 중 토크 OFF 사고 방지.
+        self.gripper_torque_on_button.setEnabled(gripper_cmd_ok and gripper_enable_svc)
+        self.gripper_torque_off_button.setEnabled(gripper_cmd_ok and gripper_enable_svc)
+        self._update_manual_button_texts()
+        # 물체 선택 / 자동 선택: IDLE + 모든 서비스 준비 + 그리퍼 HW 완료 필요
+        full_system_ready  = command_enabled and is_idle and pick_svc and gripper_hw_ready
+        object_buttons_enabled = full_system_ready
+        self.auto_button.setEnabled(full_system_ready)
+        object_param_ready = (
+            self.ros_node.cli_object_get_parameters.service_is_ready()
+            and self.ros_node.cli_object_set_parameters.service_is_ready()
+        )
+        self.calib_load_button.setEnabled(self.ros_node.cli_object_get_parameters.service_is_ready())
+        self.calib_apply_button.setEnabled(object_param_ready and is_idle)
+        self.model_browse_button.setEnabled(True)
+        self.model_apply_button.setEnabled(self.ros_node.cli_object_set_parameters.service_is_ready())
+
+        # 검출/노출 조정 — confidence는 detector, 노출은 camera 서비스. 슬라이더는 항상 편집 가능.
+        camera_param_svc = self.ros_node.cli_camera_set_parameters.service_is_ready()
+        self.conf_apply_button.setEnabled(self.ros_node.cli_object_set_parameters.service_is_ready())
+        self.auto_exposure_check.setEnabled(camera_param_svc)
+        # 자동노출 ON이면 수동 슬라이더/적용 비활성 (효과 없으니 혼동 방지)
+        manual_exp_enabled = camera_param_svc and not self.auto_exposure_check.isChecked()
+        self.exposure_slider.setEnabled(manual_exp_enabled)
+        self.exposure_spin.setEnabled(manual_exp_enabled)
+        self.exposure_apply_button.setEnabled(manual_exp_enabled)
+
+        # ── 그리퍼 정밀 제어 상태 및 활성화 제어 ─────────────────────────────
+        # 실시간 상태 레이블 업데이트
+        pres_curr = self.ros_node.gripper_present_current
+        pres_pos = self.ros_node.gripper_present_position
+        self.gripper_status_label.setText(f'실시간 - 전류: {pres_curr:.0f} mA | 위치: {pres_pos:.0f}')
+
+        now_mono = time.monotonic()
+        us_fresh = (
+            self.ros_node.last_ultrasonic_time > 0.0
+            and now_mono - self.ros_node.last_ultrasonic_time <= 3.0
+        )
+        if us_fresh and self.ros_node.ultrasonic_range_m is not None:
+            self.ultrasonic_status_label.setText(
+                f'초음파 거리: {self.ros_node.ultrasonic_range_m * 1000:.0f} mm')
+        else:
+            self.ultrasonic_status_label.setText('초음파 거리: -- mm')
+
+        # 그리퍼 INIT/REINIT 라벨 — 진행 중이면 "INIT 5/15 | 47s | trying", 막힌 듯하면 stale 표시
+        prog = self.ros_node.gripper_init_progress
+        prog_t = self.ros_node.gripper_init_progress_t
+        age = time.monotonic() - prog_t if prog_t > 0 else 999
+        if gripper_hw_ready:
+            self.gripper_init_label.setText('그리퍼: ✅ 준비')
+            self.gripper_init_label.setStyleSheet(
+                'color: #88ff88; font-weight: bold; padding: 2px 6px; border-radius: 4px;'
+                'background-color: #003300;')
+        elif self.ros_node.gripper_hw_status == 3:
+            self.gripper_init_label.setText('그리퍼: 🔴 status3 (IO_ERROR) — 에러 해제 클릭')
+            self.gripper_init_label.setStyleSheet(
+                'color: white; font-weight: bold; padding: 2px 6px; border-radius: 4px;'
+                'background-color: #aa0000;')
+        elif prog and age < 30:
+            # 최근 30초 안 메시지 → 진행 중일 가능성 (age가 카운트 되면 시각적 변화)
+            indicator = '🔄' if age < 5 else '⏳'  # 5초 이내 갱신=빠른 진행, 그 이후=느림(stuck 의심)
+            self.gripper_init_label.setText(f'그리퍼: {indicator} {prog} (수신 {age:.0f}s 전)')
+            color = '#ffaa00' if age < 5 else '#ff5500'  # 늦으면 빨강 경향
+            self.gripper_init_label.setStyleSheet(
+                f'color: white; font-weight: bold; padding: 2px 6px; border-radius: 4px;'
+                f'background-color: {color};')
+        elif prog:
+            # 메시지 30초 이상 stale → stuck/실패 가능성 큼
+            self.gripper_init_label.setText(f'그리퍼: ⚠ STUCK? 마지막 메시지 {age:.0f}s 전: {prog}')
+            self.gripper_init_label.setStyleSheet(
+                'color: white; font-weight: bold; padding: 2px 6px; border-radius: 4px;'
+                'background-color: #aa0000;')
+        else:
+            self.gripper_init_label.setText('그리퍼: 대기')
+            self.gripper_init_label.setStyleSheet(
+                'color: #aaa; font-weight: bold; padding: 2px 6px; border-radius: 4px;'
+                'background-color: #2a2a2a;')
+
+        # 실시간 그래프 데이터 추가
+        self.realtime_graph.add_data(pres_curr)
+
+        # 높은 전류 부하가 감지될 때 경고 표시 색상 부여
+        if pres_curr >= 500.0:
+            self.gripper_status_label.setStyleSheet(
+                'color: #ff3333; font-weight: bold; background-color: #4a0000; padding: 4px; border-radius: 4px; font-family: monospace;'
+            )
+        elif pres_curr >= 300.0:
+            self.gripper_status_label.setStyleSheet(
+                'color: #ffff33; font-weight: bold; background-color: #4a4a00; padding: 4px; border-radius: 4px; font-family: monospace;'
+            )
+        else:
+            self.gripper_status_label.setStyleSheet(
+                'color: #33ff33; font-weight: bold; background-color: #003a00; padding: 4px; border-radius: 4px; font-family: monospace;'
+            )
+            
+        # 그리퍼 파라미터 적용 버튼 및 컨트롤들 활성화 제어
+        # 적용: 서비스 연결 + 그리퍼 HW 초기화 완료 + IDLE(설정 편집 게이트) + 이전 요청 완료
+        gripper_apply_ok = (
+            gripper_param_svc
+            and gripper_hw_ready
+            and config_edit_enabled
+            and not getattr(self, '_gripper_apply_busy', False)
+        )
+        self.gripper_apply_button.setEnabled(gripper_apply_ok)
+
+        # 슬라이더/스핀박스: 정밀 전류는 설정값이므로 IDLE 전용(동작 중 편집 불가).
+        self.close_curr_slider.setEnabled(config_edit_enabled)
+        self.close_curr_spin.setEnabled(config_edit_enabled)
+        self.open_curr_slider.setEnabled(config_edit_enabled)
+        self.open_curr_spin.setEnabled(config_edit_enabled)
+        self.vel_slider.setEnabled(config_edit_enabled)
+        self.vel_spin.setEnabled(config_edit_enabled)
+        self.acc_slider.setEnabled(config_edit_enabled)
+        self.acc_spin.setEnabled(config_edit_enabled)
+
+        # ── 물체별 파지 강도 버튼 ─────────────────────────────────────
+        # 적용: pick_place set_parameters 연결 + IDLE 전용. 저장: 파일 쓰기라 항상 가능.
+        pickplace_param_svc = self.ros_node.cli_pickplace_set_parameters.service_is_ready()
+        self.grip_strength_apply_button.setEnabled(config_edit_enabled and pickplace_param_svc)
+        self.grip_strength_save_button.setEnabled(True)
+        for _slider, _spin in self._grip_strength_rows.values():
+            _slider.setEnabled(config_edit_enabled)
+            _spin.setEnabled(config_edit_enabled)
+
+        # ── TCP Z 안전 하한 ───────────────────────────────────────────
+        # 적용: pick_place set_parameters 연결 + IDLE 전용. 저장: 파일 쓰기라 항상 가능.
+        self.min_safe_z_apply_button.setEnabled(config_edit_enabled and pickplace_param_svc)
+        self.min_safe_z_save_button.setEnabled(True)
+        self.min_safe_z_spin.setEnabled(config_edit_enabled)
+
+        # ── 그리퍼 브릿지 재시작 버튼 ─────────────────────────────────
+        # 복구용이라 로봇 상태 무관하게 항상 활성. 재기동 진행 중(45s 창)엔만 비활성.
+        gbr_busy = (self._gripper_bridge_restart_proc is not None
+                    and time.monotonic() < self._gripper_bridge_restart_until)
+        self.gripper_bridge_restart_button.setEnabled(not gbr_busy)
+        if not gbr_busy and self._gripper_bridge_restart_proc is not None:
+            if self.gripper_bridge_restart_label.text().startswith('⏳'):
+                self.gripper_bridge_restart_label.setText('✅ 재기동 완료 — 그리퍼 ready 확인 후 사용')
+            self._gripper_bridge_restart_proc = None
+
+        # ── 안전 모드 버튼 ────────────────────────────────────────────
+        # 속도 모드: E-STOP이 아닐 때 + 서비스 연결 필요
+        self.speed_normal_button.setEnabled(not is_e_stopped and speed_normal_svc)
+        self.speed_reduced_button.setEnabled(not is_e_stopped and speed_reduced_svc)
+        # 서보 OFF: E-STOP 아닐 때 + 서비스 연결 / 서보 ON: SAFE_OFF(3,10) 또는 E-STOP + 서비스 연결
+        is_safe_off = hw in (3, 10)   # STATE_SAFE_OFF, STATE_SAFE_OFF2
+        self.servo_off_button.setEnabled(not is_e_stopped and servo_off_svc)
+        self.servo_on_button.setEnabled((is_safe_off or is_e_stopped) and servo_on_svc)
+
+        # ── HW 상태 레이블 ────────────────────────────────────────────
+        hw_state_names = {
+            0: 'INITIALIZING', 1: 'STANDBY', 2: 'MOVING',
+            3: 'SAFE_OFF', 4: 'TEACHING', 5: 'SAFE_STOP',
+            6: 'E-STOP', 7: 'HOMING', 8: 'RECOVERY',
+            9: 'SAFE_STOP2', 10: 'SAFE_OFF2', 15: 'NOT_READY',
+        }
+        hw_name = hw_state_names.get(self.ros_node.hw_state, f'CODE={self.ros_node.hw_state}')
+        hw_color = {
+            1: '#1a6a1a',   # STANDBY   → 녹색
+            2: '#1a4a8a',   # MOVING    → 파랑
+            5: '#8a4a00',   # SAFE_STOP → 주황
+            6: '#8a0000',   # E-STOP    → 빨강
+            3: '#8a0000',   # SAFE_OFF  → 빨강
+        }.get(self.ros_node.hw_state, '#444444')
+        self.hw_state_label.setText(f'HW: {hw_name}')
+        self.hw_state_label.setStyleSheet(
+            f'font-weight: bold; padding: 4px 8px; border-radius: 4px;'
+            f'background-color: {hw_color}; color: white;'
+        )
+
+        speed_name = '감속 모드' if self.ros_node.speed_mode == 1 else '정상 속도'
+        speed_color = '#7a6000' if self.ros_node.speed_mode == 1 else '#1a5c1a'
+        self.speed_mode_label.setText(f'속도: {speed_name}')
+        self.speed_mode_label.setStyleSheet(
+            f'font-weight: bold; padding: 4px 8px; border-radius: 4px;'
+            f'background-color: {speed_color}; color: white;'
+        )
+
+        # ── Doosan 안전 모드 버튼 ────────────────────────────────────
+        # 정상 운전: 서비스 연결 시 활성 (역구동 해제 수단이므로 비교적 관대)
+        # 역구동: 이미 역구동 중이 아닐 때 + 서비스 연결
+        is_backdrive = state == 'BACKDRIVE'
+        self.safety_auto_button.setEnabled(safety_normal_svc)
+        self.safety_backdrive_button.setEnabled(not is_backdrive and safety_bd_svc)
+
+        # 역구동 중 라벨 업데이트
+        if is_backdrive:
+            self.safety_mode_label.setText('현재 안전 모드: 역구동 (중력보상 스트리밍 중)')
+            self.safety_mode_label.setStyleSheet(
+                'font-weight: bold; padding: 3px 6px; border-radius: 4px;'
+                'background-color: #2a2a5a; color: #aaaaff;'
+            )
+        else:
+            self.safety_mode_label.setText('현재 안전 모드: 정상 운전')
+            self.safety_mode_label.setStyleSheet(
+                'font-weight: bold; padding: 3px 6px; border-radius: 4px;'
+                'background-color: #2a2a2a; color: white;'
+            )
+
+        # ── 배경색 경고 ───────────────────────────────────────────────
+        if is_backdrive:
+            self.setStyleSheet('QWidget { background-color: #0a0a2a; }')
+        elif is_e_stopped:
+            self.setStyleSheet('QWidget { background-color: #3a0000; }')
+        else:
+            self.setStyleSheet('')
+
+        detected_snapshot = []
+        with self.ros_node._data_lock:
+            detected_snapshot = list(self.ros_node.detected_objects)
+
+        # 도달 가능한 물체만 통과 — 버튼·요약 모두 같은 필터 사용.
+        reachable_snapshot = [
+            item for item in detected_snapshot
+            if self._is_object_reachable(item)
+        ]
+
+        # 같은 라벨의 물체가 여러 개 검출될 수 있으므로 버튼은 라벨 단위로만 만든다.
+        known_labels = []
+        unknown_labels = []
+        for item in reachable_snapshot:
+            if self._is_gui_button_excluded(item):
+                continue
+            label = item.get('label', 'unknown')
+            if label.startswith('unknown_') or label == 'unknown':
+                if label not in unknown_labels:
+                    unknown_labels.append(label)
+            else:
+                if label not in known_labels:
+                    known_labels.append(label)
+
+        stable_known = self._stable_detection_labels(known_labels, 'known')
+        stable_unknown = self._stable_detection_labels(unknown_labels, 'unknown')
+        self._refresh_button_grid(
+            self.known_button_grid, self.known_object_buttons, stable_known, object_buttons_enabled
+        )
+        self._refresh_button_grid(
+            self.unknown_button_grid, self.unknown_object_buttons, stable_unknown, object_buttons_enabled
+        )
+
+    def _update_manual_command_feedback(self, state: str):
+        now = time.monotonic()
+        if self._manual_command is not None:
+            key = self._manual_command.get('key')
+            wait_for_state = self._manual_command.get('wait_for_state', False)
+            accepted = self._manual_command.get('accepted', False)
+            progress_text = self._manual_command.get('progress_text', '')
+            done_text = self._manual_command.get('done_text', '')
+            min_busy_until = float(self._manual_command.get('min_busy_until', 0.0))
+
+            if key == 'home' and state == 'HOME':
+                self._manual_command_seen_active = True
+
+            if state in ('ERROR', 'EMERGENCY_STOP'):
+                self._finish_manual_command(f'{progress_text} 중단됨')
+            elif wait_for_state and accepted and state == 'IDLE':
+                self._finish_manual_command(done_text)
+            elif not wait_for_state and accepted and now >= min_busy_until:
+                self._finish_manual_command(done_text)
+            elif now > self._manual_command_deadline:
+                self._finish_manual_command(f'{progress_text} 확인 시간 초과')
+
+        if self._manual_command is not None:
+            self.command_status_label.setText(self._manual_command.get('progress_text', '명령 처리 중...'))
+            return
+
+        if self._manual_feedback and now <= self._manual_feedback_until:
+            self.command_status_label.setText(self._manual_feedback)
+        else:
+            self._manual_feedback = ''
+            self.command_status_label.setText('')
+
+    def _update_manual_button_texts(self):
+        texts = {
+            'home': 'HOME 이동',
+            'gripper_open': '그리퍼 OPEN',
+            'gripper_close': '그리퍼 CLOSE',
+            'recover_to_home': '에러 복구 & HOME 복귀',
+        }
+        if self._manual_command is not None:
+            key = self._manual_command.get('key')
+            texts[key] = self._manual_command.get('progress_text', texts.get(key, '처리 중...'))
+        self.home_button.setText(texts['home'])
+        self.gripper_open_button.setText(texts['gripper_open'])
+        self.gripper_close_button.setText(texts['gripper_close'])
+        self.recover_home_button.setText(texts['recover_to_home'])
+
+    def _is_gui_button_excluded(self, obj: dict) -> bool:
+        """선택 버튼에서만 숨길 클래스 — 카메라 오버레이·검출은 그대로."""
+        exclude = self.ros_node.gui_button_exclude_classes
+        if not exclude:
+            return False
+        cls = (obj.get('class_name') or '').strip()
+        if cls in exclude:
+            return True
+        label = (obj.get('label') or '').strip()
+        if not cls and label in exclude:
+            return True
+        if not cls and label.startswith('box_'):
+            parts = label.split('_', 1)
+            if len(parts) == 2 and parts[0] in exclude and parts[1].isdigit():
+                return True
+        return False
+
+    def _is_object_reachable(self, obj: dict) -> bool:
+        """검출 물체가 도달 가능 영역 안에 있는지 — 박스 한계 + sqrt(x^2+y^2) 반경 둘 다 체크.
+        한계 밖이면 버튼·요약 모두 가린다. pick_place_node의 _cb_pose 검사와 동일 룰 + 반경 추가."""
+        pose = obj.get('pose') or {}
+        try:
+            x = float(pose.get('x', 0.0))
+            y = float(pose.get('y', 0.0))
+            z = float(pose.get('z', 0.0))
+        except (TypeError, ValueError):
+            return False
+        n = self.ros_node
+        if not (n.workspace_x_min <= x <= n.workspace_x_max):
+            return False
+        if not (n.workspace_y_min <= y <= n.workspace_y_max):
+            return False
+        if not (n.workspace_z_min <= z <= n.workspace_z_max):
+            return False
+        if (x * x + y * y) ** 0.5 > n.reach_radius_max:
+            return False
+        return True
+
+    def _stable_detection_labels(self, labels: list, category: str):
+        """짧은 검출 누락으로 물체 버튼이 깜빡이지 않도록 라벨 목록을 안정화한다."""
+        if category == 'known':
+            candidate = self._known_candidate_labels
+            hits_attr = '_known_candidate_hits'
+            stable_attr = '_stable_known_labels'
+            stable_frames = self._label_stable_frames_known
+        else:
+            candidate = self._unknown_candidate_labels
+            hits_attr = '_unknown_candidate_hits'
+            stable_attr = '_stable_unknown_labels'
+            stable_frames = self._label_stable_frames_unknown
+
+        if labels == candidate:
+            setattr(self, hits_attr, getattr(self, hits_attr) + 1)
+        else:
+            if category == 'known':
+                self._known_candidate_labels = list(labels)
+                self._known_candidate_hits = 1
+            else:
+                self._unknown_candidate_labels = list(labels)
+                self._unknown_candidate_hits = 1
+
+        if getattr(self, hits_attr) >= stable_frames:
+            setattr(self, stable_attr, list(labels))
+
+        return getattr(self, stable_attr)
+
+    def _refresh_button_grid(self, grid: QGridLayout, buttons: dict, labels: list, enabled: bool):
+        """검출된 라벨 목록에 맞게 버튼을 생성/표시/강조한다.
+
+        Known/Unknown 각각 독립 그리드. 2열 배치, 2행 높이 스크롤로 넘침 처리.
+        매 프레임 removeWidget 하지 않고, 위치가 바뀔 때만 재배치한다.
+        """
+        now = time.monotonic()
+        active_labels = set(labels)
+        for label in labels:
+            self._label_last_seen[label] = now
+
+        visible_labels = sorted(labels)
+        for label in sorted(buttons.keys()):
+            if label in active_labels:
+                continue
+            last_seen = self._label_last_seen.get(label, 0.0)
+            if now - last_seen < self._label_hide_grace_sec:
+                visible_labels.append(label)
+        visible_labels = sorted(set(visible_labels))
+
+        for idx, label in enumerate(visible_labels):
+            button = buttons.get(label)
+            if button is None:
+                button = QPushButton(label)
+                button.clicked.connect(lambda checked=False, text=label: self._select_label(text))
+                buttons[label] = button
+            button.setVisible(True)
+            button.setEnabled(enabled)
+            if label == self.ros_node.selected_label and self.ros_node.selected_label:
+                button.setStyleSheet(
+                    'background-color: #1f6feb; color: white; font-weight: bold;'
+                )
+            else:
+                button.setStyleSheet('')
+            row, col = idx // 2, idx % 2
+            grid_idx = grid.indexOf(button)
+            if grid_idx < 0:
+                grid.addWidget(button, row, col)
+            else:
+                cur_row, cur_col, _, _ = grid.getItemPosition(grid_idx)
+                if cur_row != row or cur_col != col:
+                    grid.removeWidget(button)
+                    grid.addWidget(button, row, col)
+
+        for label, button in buttons.items():
+            if label not in visible_labels:
+                button.setVisible(False)
 
     def _update_system_status_bar(self):
         colors = {
@@ -3518,59 +3571,6 @@ class PickPlaceGui(QWidget):
                 'border-radius: 3px; font-size: 11px; font-weight: bold;'
             )
 
-    def _draw_object_frames_on_pixmap(self, pixmap: QPixmap, detected_objects: list):
-        """검출 물체의 픽셀 중심에 간단한 좌표계(X/Z) 오버레이를 그린다."""
-        if pixmap.isNull():
-            return
-        painter = QPainter(pixmap)
-        try:
-            painter.setRenderHint(QPainter.Antialiasing, True)
-
-            x_pen = QPen(QColor(255, 90, 90), 3)      # X축: 빨강
-            z_pen = QPen(QColor(80, 220, 255), 3)     # Z축(테이블 법선): 하늘색
-            center_pen = QPen(QColor(255, 255, 0), 3)
-            text_pen = QPen(QColor(255, 255, 255), 1)
-            axis_len = 42
-
-            for item in detected_objects:
-                u = int(item.get('pixel_u', -1))
-                v = int(item.get('pixel_v', -1))
-                if u < 0 or v < 0:
-                    continue
-
-                pose = item.get('pose', {})
-                yaw_deg = pose.get('yaw_deg', None)
-
-                painter.setPen(center_pen)
-                painter.drawEllipse(u - 3, v - 3, 6, 6)
-
-                if isinstance(yaw_deg, (int, float)):
-                    yaw_rad = math.radians(float(yaw_deg))
-                    dx = axis_len * math.cos(yaw_rad)
-                    dy = -axis_len * math.sin(yaw_rad)
-                    painter.setPen(x_pen)
-                    painter.drawLine(u, v, int(round(u + dx)), int(round(v + dy)))
-                    painter.drawText(int(round(u + dx + 6)), int(round(v + dy - 6)), 'LONG')
-
-                painter.setPen(z_pen)
-                painter.drawLine(u, v, u, v - axis_len)
-                painter.drawText(u + 4, v - axis_len - 4, 'Z')
-
-                label = item.get('label', 'obj')
-                yaw_text = f'{float(yaw_deg):+.1f}deg' if isinstance(yaw_deg, (int, float)) else 'yaw=N/A'
-                tag_text = f'{label} | {yaw_text}'
-                tag_x = u + 10
-                tag_y = v + 10
-                tag_w = max(118, 8 * len(tag_text))
-                tag_h = 24
-                painter.fillRect(tag_x, tag_y, tag_w, tag_h, QColor(20, 20, 20, 180))
-                painter.setPen(QPen(QColor(255, 190, 60), 1))
-                painter.drawRect(tag_x, tag_y, tag_w, tag_h)
-                painter.setPen(text_pen)
-                painter.drawText(tag_x + 8, tag_y + 16, tag_text)
-        finally:
-            painter.end()
-
     def _build_selection_status(self):
         # 사용자가 아무 것도 고르지 않았으면 자동 선택 모드 상태를 명확히 보여 준다.
         if not self.ros_node.selected_label:
@@ -3584,17 +3584,10 @@ class PickPlaceGui(QWidget):
 
 
 def main(args=None):
-    """Qt 이벤트 루프와 ROS 2 spin을 단일 프로세스에서 통합 실행한다.
+    """Qt 이벤트 루프와 ROS 2 spin을 통합 실행한다.
 
-    통합 방식:
-      - QApplication.exec_()이 Qt 이벤트 루프를 점유하므로
-        rclpy.spin()을 별도 스레드에서 돌리는 대신
-        QTimer로 10ms마다 spin_once()를 호출하는 방식을 사용한다.
-      - 이렇게 하면 ROS 콜백과 Qt 이벤트가 모두 메인 스레드에서 처리되어
-        스레드 안전성 문제 없이 공유 데이터(latest_qimage 등)에 접근할 수 있다.
-
-    종료 흐름:
-      사용자가 창을 닫으면 app.exec_() 반환 → destroy_node() → shutdown() 순서로 정리.
+    ROS 콜백은 백그라운드 스레드에서 spin_once()를 호출하고,
+    Qt 메인 스레드는 UI만 담당한다(블로킹 시 '응답 없음' 방지).
     """
     rclpy.init(args=args)
     node = PickPlaceGuiNode()
@@ -3605,14 +3598,32 @@ def main(args=None):
     gui.raise_()
     gui.activateWindow()
 
-    # ROS 콜백 처리용 타이머: 10ms마다 spin_once() 호출
-    # timeout_sec=0.0: 대기 없이 현재 큐에 있는 콜백만 즉시 처리
-    timer = QTimer()
-    timer.timeout.connect(lambda: rclpy.spin_once(node, timeout_sec=0.0))
-    timer.start(10)   # 10ms = 약 100Hz, 카메라 30fps에 비해 충분히 빠름
+    ros_spin_stop = threading.Event()
+    gui._ros_spin_stop = ros_spin_stop
 
-    exit_code = app.exec_()   # Qt 이벤트 루프 진입 (창 닫힐 때까지 블로킹)
-    timer.stop()
+    def _spin_loop():
+        while not ros_spin_stop.is_set() and rclpy.ok():
+            try:
+                rclpy.spin_once(node, timeout_sec=0.05)
+            except Exception:
+                break
+
+    ros_spin_thread = threading.Thread(
+        target=_spin_loop, name='gui_ros_spin', daemon=True)
+    gui._ros_spin_thread = ros_spin_thread
+    ros_spin_thread.start()
+
+    def _handle_signal(_signum, _frame):
+        gui.request_shutdown()
+
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+
+    exit_code = app.exec_()
+    gui.request_shutdown()
+    ros_spin_stop.set()
+    if ros_spin_thread.is_alive():
+        ros_spin_thread.join(timeout=2.0)
     node.cleanup_hardware()
     if rclpy.ok():
         node.destroy_node()

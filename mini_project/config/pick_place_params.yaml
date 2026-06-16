@@ -15,21 +15,38 @@ object_detector:
 
     # --- YOLO 설정 ---
     use_yolo: true
-    # 런치 실행 시 launch가 패키지 내장 models/proto.pt 절대경로로 override한다(이 값보다 우선).
-    yolo_model: "proto.pt"
-    confidence_threshold: 0.5
+    # 런치 실행 시 launch가 패키지 내장 models/proto_v3.pt 절대경로로 override한다(이 값보다 우선).
+    yolo_model: "proto_v3.pt"
+    confidence_threshold: 0.25
 
 
-    # 인식할 클래스 목록 — 빈 문자열만 있으면 모든 클래스 통과로 처리(코드 측에서 strip 필터).
-    # ROS2 humble은 yaml의 진짜 빈 리스트 []의 타입 추론을 못해 노드 사망. [""]는 string array로 OK.
-    # 현재 모델(goods_yolo.pt)은 10개 클래스 멀티클래스 검출 모델이다.
+    # 인식할 클래스 목록 — proto_v3.pt 학습 클래스와 일치해야 함 (wafers 포함, unknown 제외).
     target_classes: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "box", "can", "boxsnack", "wafers"]
 
     # known(정답·학습) 클래스 — 라벨에 클래스명 그대로 사용(예: "can_1").
-    # 이 외 검출은 'unknown_N'으로 표시. 현재 모델 10개 클래스를 그대로 등록.
+    # 이 외 검출은 'unknown_N'으로 표시.
     # pick_place_node의 grip_class_names와 동일 값으로 유지해야 한다. 어긋나면 시작 시 warn 발행.
     # GUI 강도 편집기에서 저장 누르면 이 줄도 자동 동기화됨.
     known_classes: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "box", "can", "boxsnack", "wafers"]
+
+    # 클래스 → 배치 box_roi 구역(1~5). pick_place_node.sort_class_* 와 동일하게 유지.
+    # box_roi1=zone1, box_roi2=zone2, ..., box_roi5=zone5
+    sort_class_names: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "can", "boxsnack", "wafers", "unknown"]
+    sort_class_zones: [1,       2,      2,        3,        4,       1,       4,     5,          5,       5]
+
+    # --- 동적 place (box_roi 그리드 빈 칸 탐색) ---
+    # true: 카메라 depth+검출로 빈 칸 → /zone_dynamic_place_targets 발행. pick_place가 우선 사용.
+    use_dynamic_place_pose: true
+    place_slot_grid_cols: 2          # box_roi 가로 2칸
+    place_slot_grid_rows: 2          # 세로 2칸 → 2x2=4칸
+    place_slot_occupy_depth_margin_m: 0.025  # depth 점유 켤 때만: 바닥보다 이만큼 가까우면 점유
+    place_slot_floor_percentile: 70.0        # depth 점유 바닥 기준 백분위
+    place_slot_min_valid_pixels: 40
+    place_slot_mark_from_detections: true    # YOLO 검출 중심이 칸 안이면 점유
+    # 빈 크레이트가 'box'로 검출되면 빈 칸이 빨강 → box/unknown 제외, 상품만 점유
+    place_slot_occupy_classes: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "can", "boxsnack"]
+    place_slot_use_depth_occupancy: false    # 크레이트 벽·격자 무늬 depth 오판 방지
+    place_slot_z_offset_m: 0.03              # (카메라 xyz 모드용) pick_place 앵커 모드에서는 pick_place_node 값 사용
 
     # --- FastSAM unknown 검출 ---
     # proto.pt(YOLO)가 못 잡는(학습 안 된) 물체를 FastSAM 세그멘테이션으로 잡아
@@ -108,12 +125,21 @@ object_detector:
     depth_scale: 0.001              # mm → m (RealSense 기본값)
     min_depth_m: 0.15               # 최소 유효 깊이 (m)
     max_depth_m: 1.5                # 최대 유효 깊이 (m)
+    # 로봇 base 기준 pick Z 하한(m). box_roi depth 오류로 z≈0.05처럼 튀면 이 값으로 보정.
+    min_pick_pose_z: 0.15
+    box_roi_min_pick_pose_z: 0.22   # sort box 안 물체는 더 높게 (바닥 depth 오측정 방지)
+    workspace_x_min: 0.15
+    workspace_x_max: 1.20
+    workspace_y_min: -1.20
+    workspace_y_max: 1.20
+    workspace_z_min: 0.0
+    workspace_z_max: 0.60
     depth_sample_radius: 5          # depth 샘플링 반경 (픽셀)
     depth_center_ratio: 0.6         # 샘플링 반경 내 사용 비율 (0~1)
     depth_outlier_mad_scale: 2.5    # MAD 이상치 제거 스케일 팩터
     selected_object_topic: "/selected_object_label"
-    # 마스크 기반 축(yaw) 추정 비활성화 — FastSAM 마스크 화면과 혼용 방지.
-    use_object_yaw_for_grasp: False
+    # 마스크 기반 축(yaw) 추정 비활성화 — GUI 장축/단축 오버레이 미사용.
+    use_object_yaw_for_grasp: false
     yaw_axis_reference: "long"
     yaw_depth_band_m: 0.03
     yaw_min_mask_pixels: 40
@@ -131,8 +157,8 @@ object_detector:
     absolute_origin_in_camera_z_m: -0.96
 
     # --- 보정값 (mm) ---  (카메라 이동 후 로봇 TCP 기준 1점 재캘리브레이션 값)
-    absolute_calib_x_mm: -148.0
-    absolute_calib_y_mm: -153.0
+    absolute_calib_x_mm: -150.0
+    absolute_calib_y_mm: -173.0
     absolute_calib_z_mm: 125.0
     use_realsense: true # RealSense 카메라 사용 여부
 
@@ -162,8 +188,8 @@ rh_p12_rna_gripper:
     svc_timeout: 10.0
     state_hz: 20.0
     # --- 그리퍼 동작 전류 (mA) — gripper_node가 실제로 읽는 이름 ---
-    open_current: 400           # 열기 전류 한계 (구 init_current)
-    close_current: 300          # 닫기/파지 전류 한계 (구 cube_current)
+    open_current: 200           # 열기 전류 한계 (구 init_current)
+    close_current: 200          # 닫기/파지 전류 한계 (구 cube_current)
     # --- 모터 속도/가속도 프로파일 ---
     profile_velocity: 1500      # 구동 속도(레지스터 280). 너무 높이면 물체 접촉 시 과부하 위험
     profile_acceleration: 1000  # 구동 가속도(레지스터 278)
@@ -182,25 +208,38 @@ rh_p12_rna_gripper:
 pick_place_gui:
   ros__parameters:
     use_local_yolo: false
+    # 선택 버튼에서만 숨길 클래스 — 검출·세그멘테이션(카메라 오버레이)은 그대로 표시.
+    gui_button_exclude_classes: ["box"]
     # 도달 가능 영역 필터 — 이 범위 밖 검출 물체는 GUI 버튼·요약 자체를 숨긴다.
     # pick_place_node.workspace_*와 동일 값 유지 권장. reach_radius_max는 박스와 별개로
     # sqrt(x^2+y^2)에 적용 — Doosan E0509 실제 리치는 900mm(0.9m). 테이블 높이 수직 파지 시
     # 평면 리치 감소 + 안전여유 고려해 0.80m (실측상 0.8까지 동작 확인). 0.9 full은 특이점 위험.
     workspace_x_min: 0.15
-    workspace_x_max: 0.80
-    workspace_y_min: -0.60
-    workspace_y_max: 0.60
+    workspace_x_max: 1.20
+    workspace_y_min: -1.20
+    workspace_y_max: 1.20
     workspace_z_min: 0.0
     workspace_z_max: 0.60
-    reach_radius_max: 0.80
+    reach_radius_max: 1.20
 
 pick_place_node:
   ros__parameters:
+    # object_detector 동적 place(/zone_dynamic_place_targets) 우선. 없으면 sort_roi_zone_positions 폴백.
+    use_dynamic_place_pose: true
+    # round_robin=순환 / camera=카메라 빈칸 우선+place한 칸 로컬 기억(카메라 미인식 대비)
+    place_slot_use_yaml_anchor: true
+    place_slot_mode: camera
+    place_slot_grid_cols: 2
+    place_slot_grid_rows: 2             # 2x2=4칸
+    place_slot_cell_spacing_x_m: 0.09   # 칸 간격(m). zone 중심 기준 좌우
+    place_slot_cell_spacing_y_m: 0.08   # zone 중심 기준 앞뒤
+    place_slot_z_offset_m: 0.04       # zone yaml z + this. 깊으면 ↑ (0.05~0.06)
+
     # --- 로봇 설정 ---
     robot_namespace: "dsr01"
     robot_base_frame: "base_link"
     # 축(yaw) 기반 파지 비활성화 — 고정 자세(grasp_rpy)로 파지.
-    use_target_pose_yaw: False
+    use_target_pose_yaw: true
     grasp_yaw_offset_deg: 0.0
 
     # --- 속도/가속도 ---
@@ -218,7 +257,7 @@ pick_place_node:
     use_ultrasonic_grasp: true
     grasp_distance_m: 0.05          # 50mm 이하 감지 시 파지
     ultrasonic_step_m: 0.01         # 1회 하강 스텝(m) — 작을수록 정밀/느림
-    ultrasonic_settle_sec: 0.15     # 스텝 후 센서 갱신 대기(s)
+    ultrasonic_settle_sec: 0.05     # 스텝 후 센서 갱신 대기(s)
     ultrasonic_range_topic: "/ultrasonic_range"
     ultrasonic_max_age_sec: 0.5     # 이보다 오래된 거리값은 무효 처리
 
@@ -235,8 +274,8 @@ pick_place_node:
     # 아래 값은 현장 튜닝 시작값 — 실기에서 물체별로 미끄러짐/손상 보며 조정할 것.
     # 강성 기준 추정 시작값. 봉지/웨하스 등 잘 찌그러지는 것은 낮게, 캔/병/박스 등 단단한 것은 높게.
     grip_current_default: 200
-    grip_class_names: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "box", "can", "boxsnack", "wafers"]
-    grip_class_currents: [150, 150, 150, 120, 180, 140, 180, 200, 170, 150]
+    grip_class_names: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "can", "boxsnack", "wafers", "unknown"]
+    grip_class_currents: [150, 150, 150, 120, 180, 140, 200, 170, 150, 150]
     grip_current_min: 100           # 안전 clamp 하한
     grip_current_max: 500           # 안전 clamp 상한
 
@@ -251,22 +290,76 @@ pick_place_node:
     min_safe_z: 0.0
 
     # --- Pick 파라미터 ---
-    pre_pick_z_offset: 0.14         # Pick 위 대기 높이 오프셋 (m)
+    pre_pick_z_offset: 0.12         # Pick 위 대기·LIFT 높이 (m). 초음파 하강 시작 높이에도 사용.
     pick_z_offset: 0.015            # 실제 픽 높이 보정 (m)
+    min_pick_pose_z: 0.15           # object_detector 와 동일. 비정상 depth Z 하한(m)
     grasp_rpy: [0.0, 179.9, 0.0]    # 그리퍼 자세 (rx, ry, rz deg)
                                     # [0, 180, 0] = 수직 하강
 
     # --- Place 파라미터 ---
     # Place 위치 (로봇 베이스 기준, m)
     place_position: [0.4, -0.3, 0.2]
-    pre_place_z_offset: 0.15        # Place 위 대기 높이 (m)
+    # user 주문 전용 place(=package 영역). run_once_package 호출 시 zone 무시하고 여기로.
+    # box zone(-Y)의 반대 +Y쪽. z는 package 표면 실측 후 조정.
+    package_position: [0.40, 0.40, 0.25]
+    # zone4 transit 티치: approach_z = sort_roi_zone_positions_z[3] + place_approach_z_offset
+    # scripts/teach_zone4_transit.py info → goto → (티치 미세조정) → capture --apply
+    place_approach_z_offset: 0.09   # 미지정 구역 폴백. 구역별은 sort_roi_zone_approach_z_offset 사용
+    pre_place_z_offset: 0.12        # POST_PLACE 복귀 높이만 = place_z + this
+    # LIFT 높이에서 XY 수평 이동 → place 자세 정렬 → 접근 높이 하강 (zone4 IK 1206 완화).
+    place_horizontal_transit: true
     place_rpy: [0.0, 179.9, 0.0]
 
     # --- 안전 설정 ---
     workspace_x_min: 0.15           # 작업 영역 제한 (m)
-    workspace_x_max: 0.80
-    workspace_y_min: -0.60
-    workspace_y_max: 0.60
+    workspace_x_max: 1.20
+    workspace_y_min: -1.20
+    workspace_y_max: 1.20
     workspace_z_min: 0.0
     workspace_z_max: 0.60
     target_pose_topic: "/selected_object_pose"
+
+    # --- Sort All — ROI 구역별 정렬 ---
+    # 카메라 box_roi1~5 각 구역에 대응하는 로봇 Place 좌표(m).
+    # 인덱스 0 = box_roi1, 1 = box_roi2, ..., 4 = box_roi5.
+    # ★ 실제 테이블 좌표로 캘리브레이션 후 채워넣으세요 ★
+    #         zone1(roi1)  zone2(roi2)  zone3(roi3)  zone4(roi4)  zone5(roi5)
+    sort_roi_zone_positions_x: [0.51,        0.20,        0.20,        0.145,       0.60]
+    sort_roi_zone_positions_y: [-0.29,       -0.29,       -0.45,       -0.543,       0.0]
+    sort_roi_zone_positions_z: [0.25,        0.25,        0.45,        0.341,       0.25]
+    #                            zone1/2/5 바닥 높이(티치). 동적 place z = 이 값 + place_slot_z_offset_m
+    # 구역별 MOVE_TO_PLACE 접근 상승(place_z+). 0= LIFT 높이에서 수평이동 / zone4만 높게
+    sort_roi_zone_approach_z_offset: [0.0,     0.0,         0.0,         0.09,        0.0]
+    #                                 z1      z2          z3          z4          z5
+
+    # box_roi1~5 Place 자세(rx,ry,rz deg). teach pendant flange 기준. 미설정 구역은 place_rpy와 동일.
+    sort_roi_zone_place_rx: [0.0,   0.0,   0.0,   30.94,  0.0]
+    sort_roi_zone_place_ry: [179.9, 179.9, 179.9, -177.61, 179.9]
+    sort_roi_zone_place_rz: [0.0,   0.0,   0.0,   34.65,  0.0]
+    #                              z1    z2    z3    z4티치  z5
+
+    # true = ②수평을 movej(관절각 티치). waypoint와 동시 true면 movej 우선.
+    sort_roi_zone_place_use_joints: [false, false, false, false, false]
+    sort_roi_zone_place_j1: [0.0,   0.0,   0.0,   -74.3,  0.0]
+    sort_roi_zone_place_j2: [0.0,   0.0,   0.0,   30.5,   0.0]
+    sort_roi_zone_place_j3: [0.0,   0.0,   0.0,   65.4,   0.0]
+    sort_roi_zone_place_j4: [0.0,   0.0,   0.0,   -2.3,   0.0]
+    sort_roi_zone_place_j5: [0.0,   0.0,   0.0,   83.5,   0.0]
+    sort_roi_zone_place_j6: [0.0,   0.0,   0.0,   -70.4,  0.0]
+
+    # A안: ② 중간 waypoint movel (grasp_rpy·approach_z 유지). wp_count 0=직선, 1~2=경유점 수.
+    # zone4 시험 — 1206 나오면 xy 조정 또는 wp_count=2 로 wp2 추가.
+    sort_roi_zone_transit_wp_count: [0,     0,     0,     2,     0]
+    sort_roi_zone_transit_wp1_x:    [0.0,   0.0,   0.0,   0.35,  0.0]
+    sort_roi_zone_transit_wp1_y:    [0.0,   0.0,   0.0,   -0.29, 0.0]
+    sort_roi_zone_transit_wp2_x:    [0.0,   0.0,   0.0,   0.20,  0.0]
+    sort_roi_zone_transit_wp2_y:    [0.0,   0.0,   0.0,   -0.45, 0.0]
+
+    # 클래스명별 배치 구역 번호(1~5). 0 또는 미등록이면 place_position(기본값)으로 폴백.
+    # box_roi1=zone1, box_roi2=zone2, box_roi3=zone3, box_roi4=zone4, box_roi5=zone5
+    sort_class_names: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "can", "boxsnack", "wafers", "unknown"]
+    sort_class_zones: [1,       2,      2,        3,        4,       1,       4,     5,          5,       5]
+    #                  ^roi1     ^roi2   ^roi2     ^roi3     ^roi4    ^roi1    ^roi4  ^roi5       ^roi5
+
+    sort_max_empty_cycles:     2         # 연속 검출 실패 N회 시 정렬 종료
+    sort_detect_timeout_sec:   5.0       # 물체 검출 대기 최대 시간(초)

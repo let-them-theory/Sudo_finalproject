@@ -72,6 +72,7 @@ class GripperServiceNode(Node):
 
         self._lock = threading.Lock()
         self._ready = False
+        self._reinitializing = False   # reinit 중 _poll_state가 lock 경쟁 안 하도록
         self._last_state: GripperState | None = None
         self._last_goal_position = 0
 
@@ -95,7 +96,9 @@ class GripperServiceNode(Node):
             self.get_logger().info('Setting robot to autonomous mode...')
             set_robot_mode_autonomous(self, self._namespace, '')
 
-        self._start_drl_and_connect()
+        # 빠른 경로: 이전 세션에서 DRL 서버가 이미 기동 중이면 재시작 없이 TCP만 연결.
+        # 실패하면 _start_drl_and_connect 내에서 자동으로 전체 재시작 경로를 탄다.
+        self._start_drl_and_connect(quick_reconnect=True)
 
         self.get_logger().info('Initializing gripper...')
         for attempt in range(1, 4):
@@ -103,7 +106,7 @@ class GripperServiceNode(Node):
                 with self._lock:
                     state = self._bridge.initialize(
                         goal_current=self._goal_current,
-                        timeout=40.0,
+                        timeout=20.0,
                     )
                 self._ready = True
                 self._cache_state(state)
@@ -125,26 +128,48 @@ class GripperServiceNode(Node):
 
     # ── DRL management ─────────────────────────────────────────────────────
 
-    def _start_drl_and_connect(self) -> None:
-        self.get_logger().info('Stopping existing DRL program...')
-        self._call_service(self._cli_drl_stop, DrlStop.Request())
-        time.sleep(1.0)
+    def _start_drl_and_connect(self, quick_reconnect: bool = False) -> None:
+        """DRL 재시작 후 TCP 연결.
 
-        self.get_logger().info('Starting DRL gripper server...')
+        quick_reconnect=True: DRL 재시작 없이 TCP 접속만 시도(빠른 경로, ~1-2s).
+        이전 세션에서 DRL 서버가 이미 기동 중이면 이 경로로 즉시 연결된다.
+        실패하면 전체 재시작 경로(slow path)로 폴백한다.
+        """
+        if quick_reconnect:
+            self.get_logger().info('Quick reconnect: TCP 접속 시도 (DRL 재시작 없음)...')
+            try:
+                self._bridge.connect(timeout=3.0)
+                self.get_logger().info('Quick reconnect 성공')
+                return
+            except RuntimeError as e:
+                self.get_logger().info(f'Quick reconnect 실패({e}) — DRL 전체 재시작으로 전환')
+
+        self.get_logger().info('DRL 프로그램 정지 중...')
+        stop_resp = self._call_service(self._cli_drl_stop, DrlStop.Request())
+        self.get_logger().info(f'DrlStop 응답: {stop_resp}')
+        time.sleep(0.3)
+
+        self.get_logger().info('DRL 그리퍼 서버 시작 중...')
         req = DrlStart.Request()
         req.robot_system = 0
         req.code = self._drl_script
         resp = self._call_service(self._cli_drl_start, req)
+        self.get_logger().info(f'DrlStart 응답: success={getattr(resp, "success", None)}')
         if not resp or not resp.success:
-            raise RuntimeError('DrlStart failed')
+            raise RuntimeError(f'DrlStart failed (resp={resp})')
 
-        self.get_logger().info('Connecting to gripper TCP server...')
+        self.get_logger().info(f'그리퍼 TCP 서버 연결 중 ({self._bridge._host}:{self._bridge._port})...')
         self._bridge.connect(timeout=30.0)
-        self.get_logger().info('TCP connected')
+        self.get_logger().info('TCP 연결 완료')
 
     # ── Polling ────────────────────────────────────────────────────────────
 
     def _poll_state(self) -> None:
+        # reinit 중에는 lock 경쟁을 피해 즉시 반환한다.
+        # MultiThreadedExecutor 4스레드가 _poll_state lock 대기로 모두 소진되면
+        # _start_drl_and_connect의 async future 콜백이 실행될 스레드가 없어 데드락.
+        if self._reinitializing:
+            return
         try:
             with self._lock:
                 bridge_state = self._bridge.read_state()
@@ -232,11 +257,18 @@ class GripperServiceNode(Node):
         return response
 
     def _handle_reinitialize(self, request, response):  # noqa: ARG002
+        # _reinitializing 플래그로 _poll_state가 lock 경쟁을 하지 않게 한다.
+        # 이전 구현은 self._lock을 쥔 채로 DrlStop→DrlStart→TCP connect→initialize(최대 ~91s)를
+        # 수행했고, 그 사이 _poll_state(10Hz)가 lock을 기다리며 4스레드를 모두 소진 →
+        # _call_service의 async future 콜백이 실행될 스레드가 없어 데드락이 발생했다.
         try:
+            self._reinitializing = True
             with self._lock:
                 self._ready = False
-                self._bridge.reset()
-                self._start_drl_and_connect()
+            # lock 해제 상태에서 오래 걸리는 DRL/TCP 작업 수행
+            self._bridge.reset()
+            self._start_drl_and_connect()
+            with self._lock:
                 state = self._bridge.initialize(goal_current=self._goal_current, timeout=40.0)
             self._ready = True
             self._cache_state(state)
@@ -247,6 +279,8 @@ class GripperServiceNode(Node):
             response.success = False
             response.message = str(exc)
             self.get_logger().error(f'Reinitialize failed: {exc}')
+        finally:
+            self._reinitializing = False
         return response
 
     # ── Helpers ────────────────────────────────────────────────────────────
@@ -255,7 +289,9 @@ class GripperServiceNode(Node):
         event = threading.Event()
         future = client.call_async(req)
         future.add_done_callback(lambda _: event.set())
-        event.wait(timeout=10.0)
+        fired = event.wait(timeout=10.0)
+        if not fired:
+            self.get_logger().error('_call_service timeout (10s) — executor가 응답 못 받음')
         return future.result()
 
     def _cache_state(self, bridge_state: BridgeState) -> GripperState:
