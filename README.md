@@ -337,9 +337,26 @@ pgrep -af 'gripper_service|gripper_node'   # 출력 없으면 정상
 
 `pkill -9`로 `ros2_control_node` / 그리퍼를 직접 죽이지 마세요. DRCF authority가 컨트롤러에 남아 **재연결 시 로봇 전원 사이클**이 필요해질 수 있습니다.
 
-### 10.2 변경 이력 (2026-06-08)
+### 10.2 변경 이력 (날짜순)
 
-#### A. GUI — 아두이노(초음파) 상태 표시
+> 문제 → 원인 → 조치 형식으로 정리. Pick & Place는 `mini_project/` 기준, 학습 데이터 수집은 `~/ultralytics/collect_data.py` 기준.
+
+| 날짜 | 주요 영역 |
+|------|-----------|
+| [2026-06-08](#2026-06-08--pick--place-현장-1차) | GUI(초음파), FastSAM, 픽 하강, 종료/런치, 그리퍼 기동 |
+| [2026-06-09](#2026-06-09--워크스페이스-경로-이전) | `doosan_ws` → `sudo_ws` 이전, colcon 빌드, 환경 스크립트 |
+| [2026-06-10](#2026-06-10--그리퍼-통신-복원--비전) | DRL/TCP 복원, mm 단위 프로토콜, 장축/yaw 표시 |
+| [2026-06-11](#2026-06-11--그리퍼-초기화-속도--place-구역) | status3 초기화 단축, box_roi ↔ place zone 매핑 |
+| [2026-06-12 ~ 14](#2026-06-12--14--gui--place-시퀀스--빈칸-배치) | GUI 분리/스크롤, zone4 시퀀스, 동적 place 슬롯 |
+| [2026-06-15](#2026-06-15--학습-데이터-수집-gui) | `collect_data.py` 화살표 선택, 클래스 추가 |
+| [2026-06-15](#2026-06-15--proto_v3-모델-교체) | YOLO `proto_v2.pt` → `proto_v3.pt` |
+| [2026-06-15](#2026-06-15--proto_v2-전환-후-gui-검출-불가) | `proto_v2.pt` 런치 교체, GUI 물체 버튼·응답 없음 수정 |
+
+---
+
+#### 2026-06-08 — Pick & Place 현장 (1차)
+
+##### A. GUI — 아두이노(초음파) 상태 표시
 
 | 문제 | 조치 |
 |------|------|
@@ -349,7 +366,7 @@ pgrep -af 'gripper_service|gripper_node'   # 출력 없으면 정상
 
 관련 파일: `gui_node.py`, `ultrasonic_node.py`, `pick_place.launch.py`
 
-#### B. 비전 — FastSAM 디버그 화면·ROI
+##### B. 비전 — FastSAM 디버그 화면·ROI
 
 | 문제 | 조치 |
 |------|------|
@@ -359,7 +376,7 @@ pgrep -af 'gripper_service|gripper_node'   # 출력 없으면 정상
 
 관련 파일: `object_detector.py`, `pick_place_params.yaml`
 
-#### C. 픽 동작 — 초음파 기반 하강
+##### C. 픽 동작 — 초음파 기반 하강
 
 | 문제 | 조치 |
 |------|------|
@@ -368,7 +385,7 @@ pgrep -af 'gripper_service|gripper_node'   # 출력 없으면 정상
 
 관련 파일: `pick_place_node.py`, `ultrasonic_node.py`, `arduino/hc_sr04_sensor/`
 
-#### D. 로봇 연결 해제 후 재기동 실패 (근본 수정)
+##### D. 로봇 연결 해제 후 재기동 실패 (근본 수정)
 
 **증상:** ROS 노드를 한 번 끊으면 DRCF authority / DRL(그리퍼) 세션이 컨트롤러에 남아, PC만 재런치해도 joint 활성화·그리퍼 초기화가 실패하고 **로봇 전원을 꺼야만** 복구되는 경우가 잦았음.
 
@@ -393,7 +410,7 @@ pgrep -af 'gripper_service|gripper_node'   # 출력 없으면 정상
 | `scripts/restart_gripper_bridge.sh` | `kill -9` 즉시 실행 → DrlStop → SIGTERM(10s) → 필요 시에만 kill -9 |
 | `gui_node.py` | 시스템 리셋 시 `shutdown_nodes.sh --kill-launch` 사용 |
 
-#### E. 그리퍼 기동 — 이벤트 기반 launch (2026-06-08)
+##### E. 그리퍼 기동 — 이벤트 기반 launch
 
 고정 `TimerAction(10초)` 제거. `pick_place.launch.py`가 서비스 준비를 확인한 뒤 순서대로 기동합니다.
 
@@ -410,35 +427,17 @@ doosan_bringup ─┬─ wait_for_robot_ready.sh (/dsr01/drl/drl_start)
 
 런치 인자: `robot_ready_timeout_sec`(기본 120), `gripper_ready_timeout_sec`(기본 90).
 
-초기화 파이프라인 자체(DRL 정지 ~5s + INITIALIZE)는 그대로이나, **로봇이 10초보다 빨리 붙으면 그만큼 앞당겨집니다.**
-
 관련 파일: `pick_place.launch.py`, `scripts/wait_for_robot_ready.sh`, `scripts/wait_for_gripper_ready.py`
 
-#### F. Ctrl+C 종료 시 그리퍼 노드 잔류
+##### F. Ctrl+C 종료 시 그리퍼 노드 잔류
 
 **증상:** 터미널에서 `ros2 launch`를 Ctrl+C로 끊으면 `gripper_service_node` / `gripper_node`만 살아 남음.
 
-**원인:**
+**조치:** `launch_cleanup.sh` 신규, `OnShutdown` 연동, `gripper_service` sigterm_timeout **20초**, `os._exit(0)`로 `boot_bridge` 중에도 즉시 종료.
 
-1. **이벤트 핸들러 기동** — `OnProcessExit`로 늦게 뜬 그리퍼가 launch 종료 시 SIGTERM을 못 받고 고아 프로세스가 됨
-2. **`boot_bridge()` 블로킹** — DRL 초기화(수십 초) 중 `KeyboardInterrupt` 처리가 늦어 종료가 지연되거나 누락됨
-3. **짧은 sigterm_timeout** — launch 기본 5초 안에 DrlStop 정리가 끝나지 않음
+##### G. 초음파 파지 거리 설정
 
-**조치:**
-
-| 파일 | 내용 |
-|------|------|
-| `scripts/launch_cleanup.sh` | **신규** — `DrlStop` → gripper/pick_place/wait 스크립트 SIGTERM → 잔여 SIGKILL |
-| `pick_place.launch.py` | `OnShutdown` → Ctrl+C 시 `launch_cleanup.sh` 자동 실행 |
-| `gripper_service_node.py` | SIGINT/SIGTERM 시 `shutdown()` + **`os._exit(0)`** (`boot_bridge` 중에도 즉시 종료) |
-| `gripper_node.py` | 동일 — 토크 OFF 시도 후 즉시 종료 |
-| `pick_place.launch.py` | `gripper_service` sigterm_timeout **20초** (DRL 정리 여유) |
-
-`run_pick_place_real.sh` 사용 시에는 기존처럼 `shutdown_nodes.sh --kill-launch`도 함께 실행됩니다.
-
-#### G. 초음파 파지 거리 설정
-
-파지 높이 임계값은 `mini_project/config/pick_place_params.yaml`의 `pick_place_node` 섹션에서 수정합니다.
+`pick_place_params.yaml`의 `pick_place_node` 섹션:
 
 ```yaml
 grasp_distance_m: 0.07    # m 단위. 0.07 = 70mm 이하에서 파지
@@ -446,7 +445,247 @@ ultrasonic_step_m: 0.01   # 1회 하강량 (m)
 use_ultrasonic_grasp: true
 ```
 
-수정 후 `pick_place_node` 재시작 또는 launch 재실행 필요.
+---
+
+#### 2026-06-09 — 워크스페이스·경로 이전
+
+##### A. colcon build 실패
+
+| 문제 | 원인 | 조치 |
+|------|------|------|
+| `colcon build` 즉시 실패 | `build/`·`install/`·`log/`가 예전 경로 `/home/user/doosan_ws` CMake 캐시를 그대로 보유 | `rm -rf build install log && colcon build` 로 클린 빌드 (30패키지 성공) |
+
+##### B. 하드코딩 경로 → `sudo_ws` 통일
+
+| 문제 | 조치 |
+|------|------|
+| 스크립트가 `Sudo_finalproject-main`, `doosan_ws` install을 순회 | `mini_project/_source_workspace.sh` 추가 — 상위 디렉터리에서 `install/local_setup.bash` 자동 탐색, **`sudo_ws` 우선** |
+| `source_ws.bash`, `run_pick_place_real.sh`, `shutdown_nodes.sh` 등 경로 불일치 | 공통 헬퍼 `source` 로 통일 |
+| `.bashrc`가 `doosan_ws` + `sudo_ws` 동시 source → 패키지 경로 충돌 | `~/sudo_ws/install/local_setup.bash` 단일 source, Gazebo 리소스 경로도 `sudo_ws` 기준 |
+| `realsense_fastsam_segment.py` 모델 경로 고정 | `mini_project/models/proto.pt` 등 후보 경로 자동 탐색 |
+
+관련 파일: `mini_project/_source_workspace.sh`, `source_ws.bash`, `mini_project/setup.py`(install에 헬퍼 포함), `realsense_fastsam_segment.py`
+
+##### C. 경로 수정 후 launch 연결 실패 (1차)
+
+| 문제 | 원인 | 조치 |
+|------|------|------|
+| `run_pick_place_real.sh` 실행 시 ROS 패키지 못 찾음 | install된 스크립트가 존재하지 않는 `../../_source_workspace.sh` 참조 | `_source_workspace.sh`를 `mini_project/`에 두고 `setup.py`로 install share에 복사, 스크립트 경로 `../_source_workspace.sh`로 수정 |
+
+##### D. 그리퍼 연결·초기화 안정화 (1차)
+
+| 문제 | 조치 |
+|------|------|
+| `DrlStart failed` — 그리퍼가 ros2_control보다 먼저 기동 | launch 순서·대기 로직 보강, DRL 시작 재시도 안정화 |
+| 매번 `drl_stop → drl_start` 전체 재시작 | 실패 시 무한 재시작 루프 제거, respawn 남용 축소 — **세션 유지·재연결** 방향으로 변경 |
+| `INITIALIZE failed with status 3` (RS-485 IO) | `restart_gripper_bridge.sh`로 DRL/TCP만 재기동하는 복구 경로 정립 |
+
+로봇 IP: **`110.120.1.50`** (launch `host:=` 기본값과 동일)
+
+---
+
+#### 2026-06-10 — 그리퍼 통신 복원 · 비전
+
+##### A. flange serial 직결 실험 → DRL/TCP 복원
+
+| 문제 | 원인 | 조치 |
+|------|------|------|
+| GUI 전류값이 항상 일정 | PC `flange_serial_write`는 되지만 `flange_serial_read`가 **빈 응답** → 피드백 0 고정 | 검증된 **DRL/TCP 브릿지**로 복원 |
+| `modbus_gripper.py` dead code | 직결 실험 잔재 | 삭제 |
+
+| 파일 | 내용 |
+|------|------|
+| `gripper_node.py` | flange serial 직결 제거 → `gripper_service` 서비스 호출 래퍼로 복원 |
+| `pick_place.launch.py` | `gripper_service_node` 재추가 |
+| `package.xml` | `dsr_gripper_tcp` exec_depend |
+
+##### B. mm 기반 그리퍼 프로토콜 전환
+
+| 문제 | 조치 |
+|------|------|
+| raw 단위(0~1150)와 mm 혼용 | `gripper_tcp_protocol.py` / DRL 스크립트 mm 통일 |
+| 낙하 감지 단위 불일치 | `pick_place_node.py`에 `max_grip_pos_mm` 환산 추가 |
+
+##### C. 비전 — 장축(LONG) 오표시
+
+| 문제 | 원인 | 조치 |
+|------|------|------|
+| GUI에 엉뚱한 **LONG** 장축 선 | bbox 내부 depth 유사 픽셀 임시 마스크 + `use_object_yaw_for_grasp` 기본값 불일치 | `object_detector.py`에서 `use_object_yaw_for_grasp` 기본값 `False`로 yaml과 일치 |
+
+---
+
+#### 2026-06-11 — 그리퍼 초기화 속도 · Place 구역
+
+##### A. 그리퍼 INITIALIZE 수십 초 지연
+
+| 문제 | 원인 | 조치 |
+|------|------|------|
+| `Initialize attempt 1/3 failed: status 3` 반복 | DRL `gripper_init`이 FC06 **에코 8B** 성공을 필수 조건으로 둠 — 에코만 불안정 | `gripper_tcp_bridge.py` DRL: 토크/프로파일 **write-only** + **FC03 read_state**로 검증, 재시도 10→5회 |
+| CLI `init`은 1.6초, launch는 수십 초 | CLI는 write-only, launch는 에코 대기 | 위와 동일 수정 → **~1초 내외** 초기화 기대 |
+
+적용: `restart_gripper_bridge.sh 110.120.1.50` 로 DRL 스크립트 재업로드 필요.
+
+##### B. Place 구역 ↔ 카메라 `box_roi` 1:1 매핑
+
+| 문제 | 조치 |
+|------|------|
+| `sort_all`만 ROI 구역 배치, 단발 `run_once`는 고정 좌표 | `object_detector` → `/selected_object_place_zone` 발행, `pick_place_node`가 구역 번호 우선 |
+| 클래스별 목표 박스 불명확 | yaml `sort_class_names` / `sort_class_zones` — 클래스 → box_roi1~5 |
+| place ROI와 box ROI 불일치 | 테이블 pick / 박스 내 pick 각각 `place_zone` 계산, GUI `BOX Z1~Z5` 라벨 |
+
+관련 파일: `object_detector.py`, `pick_place_node.py`, `pick_place_params.yaml`
+
+##### C. ROS 드라이버 초기화 실패 (로봇 미기동)
+
+| 문제 | 원인 |
+|------|------|
+| launch 후 로봇 joint 비활성 | `ros2_control_node` DRCF 연결 실패 (전원/네트워크/authority 잔류) — 소프트웨어가 아닌 **드라이버·컨트롤러** 문제 |
+
+---
+
+#### 2026-06-12 ~ 14 — GUI · Place 시퀀스 · 빈칸 배치
+
+##### A. GUI — Known/Unknown 분리·스크롤·깜빡임
+
+| 문제 | 조치 |
+|------|------|
+| 객체 버튼 과다·깜빡임·창 높이 증가 | Known / Unknown **분리 패널**, 2×2 고정 + **세로 스크롤**, debounce·grace period |
+| 우측 XYZ/Yaw 텍스트 불필요 | `object_summary` 제거 (카메라 오버레이는 유지) |
+| `box`가 선택 버튼에 노출 | `gui_button_exclude_classes: ["box"]` — **세그멘테이션은 유지**, 버튼만 숨김 |
+
+관련 파일: `gui_node.py`, `pick_place_params.yaml`
+
+##### B. zone4(water) Place — 1206 IK / 시퀀스
+
+| 문제 | 조치 | 비고 |
+|------|------|------|
+| zone4 접근 시 1206 NOT REACHABLE | `sort_roi_zone_pre_place_dz`, transit waypoint, `place_staged_rpy` 등 **다수 실험** | box3/4 분기점·RPY 실험 후 **GUI만 남기고 place yaml/노드 원복** |
+| zone4만 pick 후 **접근 높이 상승 생략** | 다른 zone과 동일 FSM: LIFT → 접근상승 → transit → PLACE → POST_PLACE | zone4 ②만 `movej` 또는 waypoint movel |
+| LIFT 후 불필요하게 높음 | `pre_pick_z_offset` 0.14→**0.08** m | |
+| zone1/2도 place 전 과도 상승 | `sort_roi_zone_approach_z_offset`: z1/z2=**0.0**, z4=0.09 | z1/z2는 LIFT 높이 유지 후 수평 이동 |
+
+관련 파일: `pick_place_node.py`, `pick_place_params.yaml`
+
+##### C. Pick Z / 도달 불가 오진
+
+| 문제 | 원인 | 조치 |
+|------|------|------|
+| water pick z≈0.07m → 1206 | box_roi4 안 depth가 **바닥**으로 잘못 잡힘 (XY는 정상) | `min_pick_pose_z`, `box_roi_min_pick_pose_z` 하한 보정, 에러 문구 "작업영역 밖" → "IK/자세" |
+
+##### D. GUI 에러 복구 · status3
+
+| 문제 | 조치 |
+|------|------|
+| 에러 해제 버튼이 ERROR일 때만 활성 | status3(IO_ERROR)일 때도 활성, `restart_gripper_bridge.sh` 자동 호출 |
+| in-process reinit이 status6까지 악화 | status3 시 reinit 생략, 브릿지 재기동으로 복구 |
+
+관련 파일: `gui_node.py`, `pick_place_node.py`
+
+##### E. 동적 Place 슬롯 (camera 모드)
+
+| 문제 | 원인 | 조치 |
+|------|------|------|
+| 빈 크레이트인데 격자 빨강 | YOLO **`box`** 검출이 점유로 처리됨 | `place_slot_occupy_classes` — 상품 클래스만 점유, `box`/`unknown` 제외 |
+| depth 벽/무늬 오탐 | 크레이트 texture | `place_slot_use_depth_occupancy: false` |
+| pack 연속 place 시 **같은 칸** | 카메라가 박스 안 pack 미검출 | **로컬 place 기록** — 이전 slot 스킵, `[cam]`/`[local]` 로그 |
+| 6칸 격자 과밀 | 3×2 불필요 | **3×1**(가로 3칸) → 이후 **2×2**로 조정 |
+
+관련 파일: `object_detector.py`, `pick_place_node.py`, `pick_place_params.yaml`
+
+##### F. 운영 편의
+
+| 항목 | 내용 |
+|------|------|
+| `killros` alias | pick_place·doosan·gripper·vision 프로세스 일괄 종료 |
+| zone4 place 좌표 | yaml `sort_roi_zone_positions_*` — teach flange xyz (예: x=0.145, y=-0.543, z=0.316 m) |
+| box3/4 IK 실험 | 사용자 확인: box4 도달 가능, box3 특이점 이슈 — **코드 임의 수정 보류**, GUI 개선만 유지 |
+
+---
+
+#### 2026-06-15 — 학습 데이터 수집 GUI
+
+경로: `~/ultralytics/collect_data.py` (RealSense 학습용 촬영 도구)
+
+| 문제 | 조치 |
+|------|------|
+| 클래스 선택이 숫자키(1~9,0,M)만 가능 | **↑ / ↓** 화살표로 클래스 순환 선택 |
+| 새 클래스 추가 불가 | 패널 **"+ Add class"** 버튼 또는 **`+`/`=`** 키 → 이름 입력 → `dataset/<클래스>/` 폴더 생성 |
+| 클래스 추가 시 패널·창 높이 증가 | `PANEL_H=658` **고정**, 항목 높이 자동 축소(최소 24px), 초과 시 스크롤 (`1-20/25`) |
+| 재시작 시 수동 추가 클래스 유실 | `load_classes()` — `dataset/` 기존 폴더 자동 로드 (`mixed`는 항상 마지막) |
+
+**단축키 요약:** ↑/↓ 클래스 · + 클래스 추가 · SPACE 촬영 · DEL 삭제 · U undo · ESC 종료
+
+---
+
+#### 2026-06-15 — proto_v3 모델 교체
+
+| 파일 | 내용 |
+|------|------|
+| `launch/pick_place.launch.py` | `yolo_model` → `models/proto_v3.pt` |
+| `config/pick_place_params.yaml` | `yolo_model: proto_v3.pt` |
+
+`colcon build` 후 `op` 재실행. 클래스 목록이 v3와 다르면 `target_classes`·`known_classes`도 맞춰야 함.
+
+---
+
+#### 2026-06-15 — proto_v2 전환 후 GUI 검출 불가
+
+런치 YOLO 모델을 `proto.pt` → `proto_v2.pt`로 바꾼 뒤, **터미널 `object_detector` 로그에는 검출이 나오는데 GUI 물체 버튼은 비어 있고**, 창이 **「응답 없음」** 으로 멈추거나 종료 시 `gui_node`가 SIGKILL 되는 문제.
+
+##### 증상
+
+| 관찰 | 의미 |
+|------|------|
+| `[unknown_1] 절대좌표: x=0.356 …` 로그 반복 | `object_detector` 검출·토픽 발행은 **정상** |
+| GUI 상단 **DET** 빨강, Known/Unknown 버튼 없음 | GUI가 `/detected_objects`를 못 받거나 UI 갱신 실패 |
+| `gui_node failed to terminate … SIGKILL` | Qt 메인스레드 블로킹 → 종료·Ctrl+C 시 응답 없음 |
+
+##### 원인 (3가지 — 겹쳐서 발생)
+
+**1) yaml 클래스 목록 ↔ `proto_v2.pt` 불일치**
+
+- `proto_v2` 학습 클래스: `ramen, pack, …, boxsnack, **wafers**` (10개)
+- `pick_place_params.yaml`에는 마지막이 **`unknown`** 으로 남아 있음 (`wafers` 없음)
+- `object_detector`는 `target_classes`에 없는 클래스를 **검출 단계에서 제거** → `wafers` 등이 전부 필터됨
+- `known_classes`에도 없으면 YOLO가 잡아도 라벨이 `can_1`이 아니라 `unknown_N`으로만 표시됨
+
+**2) `gui_node.py` — `detected_snapshot` 변수 누락 (회귀 버그)**
+
+- 카메라 장축(LONG/Z) 오버레이 제거 시, `_update_ui()` 상단의  
+  `detected_snapshot = list(self.ros_node.detected_objects)` 줄이 **함께 삭제**됨
+- 하단 물체 버튼 갱신 코드는 `detected_snapshot`을 그대로 참조 → 매 100ms **`NameError`** → 버튼 패널만 갱신 실패 (카메라 영상은 그 위에서 먼저 그려져 검출은 된 것처럼 보임)
+
+**3) `gui_node` Qt 메인스레드 블로킹**
+
+- ROS `spin_once()`와 `_update_ui()`가 **같은 Qt 메인스레드**에서 돌아감
+- 시작 시 `_maybe_apply_saved_model_path()`가 `get_parameters.call()` **동기 RPC** 호출 → 메인스레드 대기
+- UI가 막히는 동안 `/detected_objects`·`/detection_debug_image` 콜백 처리 지연 → DET 빨강, 「응답 없음」
+
+##### 조치
+
+| 파일 | 내용 |
+|------|------|
+| `launch/pick_place.launch.py` | `yolo_model` → `models/proto_v2.pt` |
+| `config/pick_place_params.yaml` | `target_classes`·`known_classes`·`grip_class_names`에 **`wafers` 반영**, `unknown` 제거(그리퍼 fallback용 `unknown`은 grip 맵에만 유지). `confidence_threshold: 0.25` |
+| `gui_node.py` | **`detected_snapshot` 복구**. ROS spin을 **백그라운드 스레드**로 분리 + `_data_lock`. 시작 시 sync `get_parameters.call()` **제거**(launch가 이미 모델 로드). 카메라는 **새 프레임일 때만** `FastTransformation`으로 갱신. `request_shutdown()`·SIGTERM 처리로 정상 종료 |
+| `scripts/shutdown_nodes.sh` | `gui_node`를 vision 단계 SIGTERM/SIGKILL 대상에 포함 |
+| `scripts/verify_pick_place_graph.sh` | **신규** — 노드·토픽·서비스·`/detected_objects` 샘플 점검 |
+
+##### 검증 방법
+
+```bash
+cd ~/sudo_ws && source install/local_setup.bash && op
+# 30초 대기 후 다른 터미널:
+bash ~/sudo_ws/src/mini_project/scripts/verify_pick_place_graph.sh
+ros2 topic echo /detected_objects --once
+```
+
+- GUI 상단 **DET** 녹색, **미학습 물체**에 `unknown_1` 등 버튼 표시 → 연결·UI 정상
+- 터미널에 `can_1`·`ramen_1` 등이 안 보이고 `unknown_N`만 보이면 **연결 문제가 아니라** FastSAM unknown 위주 검출 — 카메라 화면 **초록 마스크(`can 0.85` 등)** 유무로 YOLO 동작 확인
+
+관련 파일: `gui_node.py`, `object_detector.py`, `pick_place_params.yaml`, `pick_place.launch.py`
+
+---
 
 ### 10.3 주요 패키지·스크립트
 
@@ -463,8 +702,12 @@ use_ultrasonic_grasp: true
 | `scripts/wait_for_robot_ready.sh` | 런치 — DRL 서비스 준비 대기 |
 | `scripts/wait_for_gripper_ready.py` | 런치 — gripper `ready` 대기 |
 | `scripts/restart_gripper_bridge.sh` | 그리퍼만 복구 |
+| `scripts/verify_pick_place_graph.sh` | Pick & Place 토픽·서비스·검출 연결 점검 |
 | `scripts/diagnose_drcf.py` | DRCF 연결 진단 |
-| `mini_project/config/pick_place_params.yaml` | 초음파 파지 거리·픽 파라미터 |
+| `mini_project/config/pick_place_params.yaml` | 초음파·place·슬롯·zone 파라미터 |
+| `mini_project/_source_workspace.sh` | ROS 워크스페이스 자동 source (`sudo_ws` 우선) |
+| `source_ws.bash` | 터미널용 환경 설정 |
+| `~/ultralytics/collect_data.py` | RealSense 학습 데이터 수집 GUI |
 
 ---
 

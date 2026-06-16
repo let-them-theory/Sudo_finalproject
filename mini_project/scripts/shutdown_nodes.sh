@@ -82,6 +82,10 @@ fi
 
 echo "[shutdown] [3/6] vision·보조 노드 SIGTERM..."
 term_pattern "lib/dsr_realsense_pick_place/object_detector"
+term_pattern "lib/dsr_realsense_pick_place/gui_node"
+term_pattern "gui_node"
+term_pattern "lib/dsr_realsense_pick_place/gui_node"
+term_pattern "gui_node"
 term_pattern "lib/dsr_realsense_pick_place/ultrasonic_node"
 term_pattern "object_detector"
 term_pattern "ultrasonic_node"
@@ -115,6 +119,7 @@ for pat in \
   gripper_node \
   pick_place_node \
   object_detector \
+  gui_node \
   ultrasonic_node \
   realsense2_camera_node \
   static_transform_publisher \

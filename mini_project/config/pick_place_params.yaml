@@ -15,26 +15,38 @@ object_detector:
 
     # --- YOLO 설정 ---
     use_yolo: true
-    # 런치 실행 시 launch가 패키지 내장 models/proto.pt 절대경로로 override한다(이 값보다 우선).
-    yolo_model: "proto.pt"
-    confidence_threshold: 0.5
+    # 런치 실행 시 launch가 패키지 내장 models/proto_v3.pt 절대경로로 override한다(이 값보다 우선).
+    yolo_model: "proto_v3.pt"
+    confidence_threshold: 0.25
 
 
-    # 인식할 클래스 목록 — 빈 문자열만 있으면 모든 클래스 통과로 처리(코드 측에서 strip 필터).
-    # ROS2 humble은 yaml의 진짜 빈 리스트 []의 타입 추론을 못해 노드 사망. [""]는 string array로 OK.
-    # 현재 모델(goods_yolo.pt)은 10개 클래스 멀티클래스 검출 모델이다.
-    target_classes: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "box", "can", "boxsnack", "unknown"]
+    # 인식할 클래스 목록 — proto_v3.pt 학습 클래스와 일치해야 함 (wafers 포함, unknown 제외).
+    target_classes: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "box", "can", "boxsnack", "wafers"]
 
     # known(정답·학습) 클래스 — 라벨에 클래스명 그대로 사용(예: "can_1").
     # 이 외 검출은 'unknown_N'으로 표시.
     # pick_place_node의 grip_class_names와 동일 값으로 유지해야 한다. 어긋나면 시작 시 warn 발행.
     # GUI 강도 편집기에서 저장 누르면 이 줄도 자동 동기화됨.
-    known_classes: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "box", "can", "boxsnack", "unknown"]
+    known_classes: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "box", "can", "boxsnack", "wafers"]
 
     # 클래스 → 배치 box_roi 구역(1~5). pick_place_node.sort_class_* 와 동일하게 유지.
     # box_roi1=zone1, box_roi2=zone2, ..., box_roi5=zone5
-    sort_class_names: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "can", "boxsnack", "unknown"]
-    sort_class_zones: [1,       2,      2,        3,        4,       1,       4,     5,          5]
+    sort_class_names: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "can", "boxsnack", "wafers", "unknown"]
+    sort_class_zones: [1,       2,      2,        3,        4,       1,       4,     5,          5,       5]
+
+    # --- 동적 place (box_roi 그리드 빈 칸 탐색) ---
+    # true: 카메라 depth+검출로 빈 칸 → /zone_dynamic_place_targets 발행. pick_place가 우선 사용.
+    use_dynamic_place_pose: true
+    place_slot_grid_cols: 2          # box_roi 가로 2칸
+    place_slot_grid_rows: 2          # 세로 2칸 → 2x2=4칸
+    place_slot_occupy_depth_margin_m: 0.025  # depth 점유 켤 때만: 바닥보다 이만큼 가까우면 점유
+    place_slot_floor_percentile: 70.0        # depth 점유 바닥 기준 백분위
+    place_slot_min_valid_pixels: 40
+    place_slot_mark_from_detections: true    # YOLO 검출 중심이 칸 안이면 점유
+    # 빈 크레이트가 'box'로 검출되면 빈 칸이 빨강 → box/unknown 제외, 상품만 점유
+    place_slot_occupy_classes: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "can", "boxsnack"]
+    place_slot_use_depth_occupancy: false    # 크레이트 벽·격자 무늬 depth 오판 방지
+    place_slot_z_offset_m: 0.03              # (카메라 xyz 모드용) pick_place 앵커 모드에서는 pick_place_node 값 사용
 
     # --- FastSAM unknown 검출 ---
     # proto.pt(YOLO)가 못 잡는(학습 안 된) 물체를 FastSAM 세그멘테이션으로 잡아
@@ -126,8 +138,8 @@ object_detector:
     depth_center_ratio: 0.6         # 샘플링 반경 내 사용 비율 (0~1)
     depth_outlier_mad_scale: 2.5    # MAD 이상치 제거 스케일 팩터
     selected_object_topic: "/selected_object_label"
-    # 마스크 기반 축(yaw) 추정 비활성화 — FastSAM 마스크 화면과 혼용 방지.
-    use_object_yaw_for_grasp: true
+    # 마스크 기반 축(yaw) 추정 비활성화 — GUI 장축/단축 오버레이 미사용.
+    use_object_yaw_for_grasp: false
     yaw_axis_reference: "long"
     yaw_depth_band_m: 0.03
     yaw_min_mask_pixels: 40
@@ -212,6 +224,17 @@ pick_place_gui:
 
 pick_place_node:
   ros__parameters:
+    # object_detector 동적 place(/zone_dynamic_place_targets) 우선. 없으면 sort_roi_zone_positions 폴백.
+    use_dynamic_place_pose: true
+    # round_robin=순환 / camera=카메라 빈칸 우선+place한 칸 로컬 기억(카메라 미인식 대비)
+    place_slot_use_yaml_anchor: true
+    place_slot_mode: camera
+    place_slot_grid_cols: 2
+    place_slot_grid_rows: 2             # 2x2=4칸
+    place_slot_cell_spacing_x_m: 0.09   # 칸 간격(m). zone 중심 기준 좌우
+    place_slot_cell_spacing_y_m: 0.08   # zone 중심 기준 앞뒤
+    place_slot_z_offset_m: 0.04       # zone yaml z + this. 깊으면 ↑ (0.05~0.06)
+
     # --- 로봇 설정 ---
     robot_namespace: "dsr01"
     robot_base_frame: "base_link"
@@ -251,8 +274,8 @@ pick_place_node:
     # 아래 값은 현장 튜닝 시작값 — 실기에서 물체별로 미끄러짐/손상 보며 조정할 것.
     # 강성 기준 추정 시작값. 봉지/웨하스 등 잘 찌그러지는 것은 낮게, 캔/병/박스 등 단단한 것은 높게.
     grip_current_default: 200
-    grip_class_names: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "can", "boxsnack", "unknown"]
-    grip_class_currents: [150, 150, 150, 120, 180, 140, 200, 170, 150]
+    grip_class_names: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "can", "boxsnack", "wafers", "unknown"]
+    grip_class_currents: [150, 150, 150, 120, 180, 140, 200, 170, 150, 150]
     grip_current_min: 100           # 안전 clamp 하한
     grip_current_max: 500           # 안전 clamp 상한
 
@@ -278,7 +301,7 @@ pick_place_node:
     place_position: [0.4, -0.3, 0.2]
     # zone4 transit 티치: approach_z = sort_roi_zone_positions_z[3] + place_approach_z_offset
     # scripts/teach_zone4_transit.py info → goto → (티치 미세조정) → capture --apply
-    place_approach_z_offset: 0.09   # MOVE_TO_PLACE 2차 상승 + zone4 transit 티치 Z 기준(m)
+    place_approach_z_offset: 0.09   # 미지정 구역 폴백. 구역별은 sort_roi_zone_approach_z_offset 사용
     pre_place_z_offset: 0.12        # POST_PLACE 복귀 높이만 = place_z + this
     # LIFT 높이에서 XY 수평 이동 → place 자세 정렬 → 접근 높이 하강 (zone4 IK 1206 완화).
     place_horizontal_transit: true
@@ -300,7 +323,11 @@ pick_place_node:
     #         zone1(roi1)  zone2(roi2)  zone3(roi3)  zone4(roi4)  zone5(roi5)
     sort_roi_zone_positions_x: [0.51,        0.20,        0.20,        0.145,       0.60]
     sort_roi_zone_positions_y: [-0.29,       -0.29,       -0.45,       -0.543,       0.0]
-    sort_roi_zone_positions_z: [0.20,        0.20,        0.45,        0.341,       0.20]
+    sort_roi_zone_positions_z: [0.25,        0.25,        0.45,        0.341,       0.25]
+    #                            zone1/2/5 바닥 높이(티치). 동적 place z = 이 값 + place_slot_z_offset_m
+    # 구역별 MOVE_TO_PLACE 접근 상승(place_z+). 0= LIFT 높이에서 수평이동 / zone4만 높게
+    sort_roi_zone_approach_z_offset: [0.0,     0.0,         0.0,         0.09,        0.0]
+    #                                 z1      z2          z3          z4          z5
 
     # box_roi1~5 Place 자세(rx,ry,rz deg). teach pendant flange 기준. 미설정 구역은 place_rpy와 동일.
     sort_roi_zone_place_rx: [0.0,   0.0,   0.0,   30.94,  0.0]
@@ -327,8 +354,8 @@ pick_place_node:
 
     # 클래스명별 배치 구역 번호(1~5). 0 또는 미등록이면 place_position(기본값)으로 폴백.
     # box_roi1=zone1, box_roi2=zone2, box_roi3=zone3, box_roi4=zone4, box_roi5=zone5
-    sort_class_names: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "can", "boxsnack", "unknown"]
-    sort_class_zones: [1,       2,      2,        3,        4,       1,       4,     5,          5]
+    sort_class_names: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "can", "boxsnack", "wafers", "unknown"]
+    sort_class_zones: [1,       2,      2,        3,        4,       1,       4,     5,          5,       5]
     #                  ^roi1     ^roi2   ^roi2     ^roi3     ^roi4    ^roi1    ^roi4  ^roi5       ^roi5
 
     sort_max_empty_cycles:     2         # 연속 검출 실패 N회 시 정렬 종료

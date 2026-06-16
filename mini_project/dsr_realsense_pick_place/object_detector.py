@@ -415,7 +415,7 @@ class ObjectDetectorNode(Node):
         self.declare_parameter('workspace_z_min', 0.0)
         self.declare_parameter('workspace_z_max', 0.60)
 
-        self.declare_parameter('use_object_yaw_for_grasp', True)
+        self.declare_parameter('use_object_yaw_for_grasp', False)
         self.declare_parameter('yaw_axis_reference', 'long')
         self.declare_parameter('yaw_depth_band_m', 0.03)
         self.declare_parameter('yaw_min_mask_pixels', 40)
@@ -506,6 +506,20 @@ class ObjectDetectorNode(Node):
         # 클래스 → box_roi 구역(1~5) 배치 대상. pick_place_node.sort_class_* 와 동일하게 유지.
         self.declare_parameter('sort_class_names', [''])
         self.declare_parameter('sort_class_zones', [0])
+        # box_roi 그리드 빈 칸 → 동적 place 좌표 (depth + 검출 기반). pick_place가 구독.
+        self.declare_parameter('use_dynamic_place_pose', True)
+        self.declare_parameter('place_slot_grid_cols', 3)
+        self.declare_parameter('place_slot_grid_rows', 2)
+        self.declare_parameter('place_slot_occupy_depth_margin_m', 0.025)
+        self.declare_parameter('place_slot_floor_percentile', 70.0)
+        self.declare_parameter('place_slot_min_valid_pixels', 40)
+        self.declare_parameter('place_slot_mark_from_detections', True)
+        # 격자 점유에 인정할 클래스만. 'box'(빈 크레이트) 제외 — 오검출 시 빈 칸이 빨강이 됨.
+        self.declare_parameter('place_slot_occupy_classes', [
+            'ramen', 'pack', 'ssnack', 'bsnack', 'water', 'jelly', 'can', 'boxsnack'])
+        # false: depth 점유 끔(크레이트 벽·격자 무늬 오판 방지). YOLO만으로 점유 판정.
+        self.declare_parameter('place_slot_use_depth_occupancy', False)
+        self.declare_parameter('place_slot_z_offset_m', 0.0)
 
         p = self.get_parameter
         # 자주 쓰는 파라미터는 멤버 변수로 꺼내 두고 이후 계산에 재사용한다.
@@ -574,6 +588,25 @@ class ObjectDetectorNode(Node):
         self.yaw_axis_reference = str(p('yaw_axis_reference').value).strip().lower()
         self.yaw_depth_band_m = float(p('yaw_depth_band_m').value)
         self.yaw_min_mask_pixels = int(p('yaw_min_mask_pixels').value)
+        self.use_dynamic_place_pose = bool(p('use_dynamic_place_pose').value)
+        self.place_slot_grid_cols = max(1, int(p('place_slot_grid_cols').value))
+        self.place_slot_grid_rows = max(1, int(p('place_slot_grid_rows').value))
+        self.place_slot_occupy_margin_m = float(
+            p('place_slot_occupy_depth_margin_m').value)
+        self.place_slot_floor_percentile = float(
+            p('place_slot_floor_percentile').value)
+        self.place_slot_min_valid_pixels = int(
+            p('place_slot_min_valid_pixels').value)
+        self.place_slot_mark_from_detections = bool(
+            p('place_slot_mark_from_detections').value)
+        _raw_occ = list(p('place_slot_occupy_classes').value)
+        self.place_slot_occupy_classes = {
+            c.strip() for c in _raw_occ if c and c.strip()}
+        self.place_slot_use_depth_occupancy = bool(
+            p('place_slot_use_depth_occupancy').value)
+        self.place_slot_z_offset_m = float(p('place_slot_z_offset_m').value)
+        self._zone_dynamic_targets: dict = {}
+        self._zone_slot_debug: dict = {}
 
         self.selected_object_label = ''
         self.last_logged_selected_label = None
@@ -715,9 +748,22 @@ class ObjectDetectorNode(Node):
         self.pub_selected_place_zone = self.create_publisher(
             Int32, '/selected_object_place_zone', 10)
         self.pub_objects = self.create_publisher(String, '/detected_objects', 10)
+        self.pub_zone_place_targets = self.create_publisher(
+            String, '/zone_dynamic_place_targets', 10)
         self.pub_debug = self.create_publisher(
             Image, '/detection_debug_image', qos_profile_sensor_data
         )
+
+        if self.use_dynamic_place_pose:
+            occ_src = 'YOLO'
+            if self.place_slot_use_depth_occupancy:
+                occ_src += '+depth'
+            occ_cls = (sorted(self.place_slot_occupy_classes)
+                       if self.place_slot_occupy_classes else '(전체 클래스)')
+            self.get_logger().info(
+                f'동적 place: box_roi 그리드 {self.place_slot_grid_cols}x'
+                f'{self.place_slot_grid_rows}, {occ_src} 빈칸 탐색, '
+                f'점유클래스={occ_cls}')
 
         self.get_logger().info('컬러/뎁스/카메라정보 토픽 동기화 대기 중...')
         self.get_logger().info('ObjectDetectorNode 시작')
@@ -942,6 +988,200 @@ class ObjectDetectorNode(Node):
             return zone
         return self._resolve_box_roi_zone_from_pixel(pixel_u, pixel_v, frame_w, frame_h)
 
+    def _zone_rect_by_id(self, zone_id: int, frame_w: int, frame_h: int):
+        fns = {
+            1: self._box_roi_rect,
+            2: self._box_roi2_rect,
+            3: self._box_roi3_rect,
+            4: self._box_roi4_rect,
+            5: self._box_roi5_rect,
+        }
+        fn = fns.get(zone_id)
+        if fn is None:
+            return None
+        return fn(frame_w, frame_h)
+
+    def _median_depth_in_rect(
+            self, depth_img: np.ndarray,
+            x1: int, y1: int, x2: int, y2: int) -> float | None:
+        if x2 <= x1 or y2 <= y1:
+            return None
+        roi = depth_img[y1:y2, x1:x2]
+        valid = roi > 0
+        if int(np.count_nonzero(valid)) < self.place_slot_min_valid_pixels:
+            return None
+        samples = roi[valid].astype(np.float32) * self.depth_scale
+        samples = samples[(samples >= self.min_depth) & (samples <= self.max_depth)]
+        if samples.size == 0:
+            return None
+        return float(np.median(samples))
+
+    def _base_xyz_from_pixel(self, u: int, v: int, depth_m: float):
+        pose_optical = self._pixel_to_optical_pose(u, v, depth_m)
+        pose_abs = self._to_absolute_pose(pose_optical)
+        if pose_abs is None:
+            return None
+        p = pose_abs.pose.position
+        z = float(p.z) + self.place_slot_z_offset_m
+        if not (self.workspace_x_min <= p.x <= self.workspace_x_max
+                and self.workspace_y_min <= p.y <= self.workspace_y_max
+                and self.workspace_z_min <= z <= self.workspace_z_max):
+            return None
+        return float(p.x), float(p.y), z
+
+    def _class_counts_for_slot_occupancy(self, label: str) -> bool:
+        cls = (label or '').strip()
+        if not cls:
+            return False
+        if not self.place_slot_occupy_classes:
+            return True
+        return cls in self.place_slot_occupy_classes
+
+    def _occupied_slot_cells_for_zone(
+            self, zone_id: int, frame_w: int, frame_h: int,
+            detections: list, candidates: list) -> set:
+        rect = self._zone_rect_by_id(zone_id, frame_w, frame_h)
+        if rect is None:
+            return set()
+        x1, y1, x2, y2 = rect
+        cols = self.place_slot_grid_cols
+        rows = self.place_slot_grid_rows
+        bw = max(1, x2 - x1)
+        bh = max(1, y2 - y1)
+        occupied: set = set()
+        points: list[tuple[int, int]] = []
+        for det in detections:
+            label = det[4] if len(det) > 4 else ''
+            if not self._class_counts_for_slot_occupancy(label):
+                continue
+            points.append((int(det[0]), int(det[1])))
+        if self.place_slot_mark_from_detections:
+            for item in candidates:
+                if not self._class_counts_for_slot_occupancy(
+                        item.get('class_name', '')):
+                    continue
+                points.append((int(item['pixel_u']), int(item['pixel_v'])))
+        for u, v in points:
+            if not (x1 <= u < x2 and y1 <= v < y2):
+                continue
+            c = min(cols - 1, max(0, (u - x1) * cols // bw))
+            r = min(rows - 1, max(0, (v - y1) * rows // bh))
+            occupied.add((r, c))
+        return occupied
+
+    def _find_empty_slot_in_zone(
+            self, zone_id: int, depth_img: np.ndarray,
+            frame_w: int, frame_h: int,
+            detections: list, candidates: list) -> dict | None:
+        rect = self._zone_rect_by_id(zone_id, frame_w, frame_h)
+        if rect is None:
+            return None
+        x1, y1, x2, y2 = rect
+        cols = self.place_slot_grid_cols
+        rows = self.place_slot_grid_rows
+        det_occ = self._occupied_slot_cells_for_zone(
+            zone_id, frame_w, frame_h, detections, candidates)
+
+        cells = []
+        for r in range(rows):
+            for c in range(cols):
+                cx1 = x1 + c * (x2 - x1) // cols
+                cy1 = y1 + r * (y2 - y1) // rows
+                cx2 = x1 + (c + 1) * (x2 - x1) // cols if c < cols - 1 else x2
+                cy2 = y1 + (r + 1) * (y2 - y1) // rows if r < rows - 1 else y2
+                depth = self._median_depth_in_rect(depth_img, cx1, cy1, cx2, cy2)
+                cells.append({
+                    'row': r, 'col': c,
+                    'x1': cx1, 'y1': cy1, 'x2': cx2, 'y2': cy2,
+                    'depth': depth,
+                    'det_occupied': (r, c) in det_occ,
+                })
+
+        depths = [c['depth'] for c in cells if c['depth'] is not None]
+        floor_depth = None
+        if depths:
+            floor_depth = float(np.percentile(
+                depths, self.place_slot_floor_percentile))
+
+        for c in cells:
+            occ = c['det_occupied']
+            if (self.place_slot_use_depth_occupancy
+                    and not occ and c['depth'] is not None and floor_depth is not None
+                    and c['depth'] < floor_depth - self.place_slot_occupy_margin_m):
+                occ = True
+            c['occupied'] = occ
+
+        self._zone_slot_debug[zone_id] = cells
+
+        for c in cells:
+            if c['occupied']:
+                continue
+            u = (c['x1'] + c['x2']) // 2
+            v = (c['y1'] + c['y2']) // 2
+            slot = {
+                'valid': True,
+                'u': u, 'v': v,
+                'row': c['row'], 'col': c['col'],
+                'all_full': False,
+            }
+            if c['depth'] is not None:
+                xyz = self._base_xyz_from_pixel(u, v, c['depth'])
+                if xyz is not None:
+                    slot['x'], slot['y'], slot['z'] = xyz
+            return slot
+
+        # 빈 칸 없음 — 중앙 칸 폴백 (pick_place yaml 앵커가 최종 좌표 산출)
+        cr, cc = rows // 2, cols // 2
+        fallback = next(
+            (c for c in cells if c['row'] == cr and c['col'] == cc), cells[0])
+        u = (fallback['x1'] + fallback['x2']) // 2
+        v = (fallback['y1'] + fallback['y2']) // 2
+        slot = {
+            'valid': True,
+            'u': u, 'v': v,
+            'row': fallback['row'], 'col': fallback['col'],
+            'all_full': True,
+        }
+        if fallback['depth'] is not None:
+            xyz = self._base_xyz_from_pixel(u, v, fallback['depth'])
+            if xyz is not None:
+                slot['x'], slot['y'], slot['z'] = xyz
+        return slot
+
+    def _update_dynamic_zone_place_targets(
+            self, depth_img: np.ndarray, detections: list,
+            candidates: list, frame_w: int, frame_h: int) -> None:
+        targets = {}
+        for zone_id, _rect in self._box_roi_zone_rects(frame_w, frame_h):
+            slot = self._find_empty_slot_in_zone(
+                zone_id, depth_img, frame_w, frame_h, detections, candidates)
+            if slot is not None:
+                targets[str(zone_id)] = slot
+        self._zone_dynamic_targets = targets
+        msg = String()
+        msg.data = json.dumps(targets)
+        self.pub_zone_place_targets.publish(msg)
+
+    def _draw_place_slot_grid(self, vis: np.ndarray, frame_w: int, frame_h: int):
+        if not self.use_dynamic_place_pose:
+            return
+        for zone_id, cells in self._zone_slot_debug.items():
+            pick = self._zone_dynamic_targets.get(str(zone_id))
+            pick_rc = None
+            if pick:
+                pick_rc = (pick.get('row'), pick.get('col'))
+            for c in cells:
+                color = (0, 220, 0) if not c.get('occupied') else (0, 0, 220)
+                if pick_rc == (c['row'], c['col']):
+                    color = (0, 255, 255)
+                cv2.rectangle(
+                    vis,
+                    (c['x1'], c['y1']), (c['x2'] - 1, c['y2'] - 1),
+                    color, 1)
+                if pick_rc == (c['row'], c['col']):
+                    u, v = pick.get('u', 0), pick.get('v', 0)
+                    cv2.circle(vis, (u, v), 5, (0, 255, 255), -1)
+
     def _active_roi_rects(self, frame_w: int, frame_h: int) -> list:
         """활성화된 모든 ROI 사각형 목록 (unknown + box1~5). 검출 필터/FastSAM 영역 공통 사용."""
         rects = []
@@ -1003,6 +1243,29 @@ class ObjectDetectorNode(Node):
         union = int(np.count_nonzero(seg_bin | bbox_mask))
         return inter / union if union > 0 else 0.0
 
+    def _format_instance_label(self, class_name: str, display_num, class_count: int) -> str:
+        """GUI 버튼과 동일 규칙: 동일 클래스 1개면 prefix만, 2+면 prefix_N."""
+        is_known = class_name != 'object' and class_name in self._known_classes
+        prefix = class_name if is_known else 'unknown'
+        if class_count <= 1 or display_num is None:
+            return prefix
+        return f'{prefix}_{display_num}'
+
+    @staticmethod
+    def _lookup_candidate_by_pixel(candidates, class_name: str, u: int, v: int, tol: int = 10):
+        best = None
+        best_dist = tol + 1
+        for c in candidates:
+            if c.get('class_name') != class_name:
+                continue
+            du = abs(int(c.get('pixel_u', -9999)) - u)
+            dv = abs(int(c.get('pixel_v', -9999)) - v)
+            dist = max(du, dv)
+            if dist <= tol and dist < best_dist:
+                best_dist = dist
+                best = c
+        return best
+
     def _render_scene(self, color_img, depth_img, yolo_dets, candidates):
         """GUI 카메라 화면(debug 이미지)을 realsense_fastsam_segment.py 스타일로 구성.
 
@@ -1025,10 +1288,13 @@ class ObjectDetectorNode(Node):
         RH, RW = roi.shape[:2]
 
         # YOLO bbox를 ROI-local 좌표로 변환 (마스크 매칭/그리기는 ROI 안에서 수행)
-        known_boxes = []   # (x1, y1, x2, y2, cls, conf)
+        known_boxes = []   # (x1, y1, x2, y2, cls, conf, u_full, v_full)
         for (u, v, w, h, cls, conf, *_r) in yolo_dets:
             known_boxes.append((u - w // 2 - rx1, v - h // 2 - ry1,
-                                u + w // 2 - rx1, v + h // 2 - ry1, cls, conf))
+                                u + w // 2 - rx1, v + h // 2 - ry1, cls, conf, u, v))
+
+        from collections import Counter
+        known_class_counts = Counter(c.get('class_name', '') for c in candidates)
 
         # ── FastSAM 세그 (ROI) — N프레임마다만 실행, 그 외엔 직전 마스크 재사용 ──
         sam_masks = self._sam_masks_cache
@@ -1056,9 +1322,9 @@ class ObjectDetectorNode(Node):
                     sam_masks = self._sam_masks_cache
 
         # ── YOLO bbox ↔ FastSAM 매칭: known / unknown 분리 ──
-        known_segs = []     # (mask_local, cls, conf)
+        known_segs = []     # (mask_local, cls, conf, u_full, v_full)
         matched = set()
-        for (x1, y1, x2, y2, cls, conf) in known_boxes:
+        for (x1, y1, x2, y2, cls, conf, u_full, v_full) in known_boxes:
             best_iou, best_idx = 0.0, -1
             for i, seg in enumerate(sam_masks):
                 if i in matched:
@@ -1067,7 +1333,7 @@ class ObjectDetectorNode(Node):
                 if iou > best_iou:
                     best_iou, best_idx = iou, i
             if best_iou >= self.unknown_match_iou and best_idx >= 0:
-                known_segs.append((sam_masks[best_idx], cls, conf))
+                known_segs.append((sam_masks[best_idx], cls, conf, u_full, v_full))
                 matched.add(best_idx)
             else:
                 # FastSAM 매칭 실패 시 bbox 자체를 마스크로 사용
@@ -1076,7 +1342,7 @@ class ObjectDetectorNode(Node):
                 xb, yb = min(RW, x2), min(RH, y2)
                 if xb > xa and yb > ya:
                     bm[ya:yb, xa:xb] = True
-                known_segs.append((bm, cls, conf))
+                known_segs.append((bm, cls, conf, u_full, v_full))
 
         unknown_masks = []
         # FastSAM 영역이 모든 ROI를 감싸는 큰 사각형이라, ROI 사이 gap의 마스크는 제외한다.
@@ -1155,7 +1421,7 @@ class ObjectDetectorNode(Node):
         roi_overlay = roi_base.copy()
         for seg, uid, cidx in unknown_draw:
             roi_overlay[seg] = UNKNOWN_PALETTE[cidx]
-        for seg, cls, conf in known_segs:
+        for seg, cls, conf, _u, _v in known_segs:
             roi_overlay[seg] = (0, 220, 0)
         roi_vis = cv2.addWeighted(roi_base, 0.45, roi_overlay, 0.55, 0)
 
@@ -1168,13 +1434,17 @@ class ObjectDetectorNode(Node):
                 cv2.putText(roi_vis, f'unknown{uid}', (x, max(y - 6, 10)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                             UNKNOWN_PALETTE[cidx], 1, cv2.LINE_AA)
-        for seg, cls, conf in known_segs:
+        for seg, cls, conf, u_full, v_full in known_segs:
             contours, _ = cv2.findContours(seg.astype(np.uint8),
                                            cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             cv2.drawContours(roi_vis, contours, -1, (0, 220, 0), 2)
             if contours:
                 x, y, _w, _h = cv2.boundingRect(contours[0])
-                cv2.putText(roi_vis, f'{cls} {conf:.2f}', (x, max(y - 6, 10)),
+                cand = self._lookup_candidate_by_pixel(candidates, cls, u_full, v_full)
+                disp = cand.get('display_num') if cand else None
+                inst = self._format_instance_label(
+                    cls, disp, known_class_counts.get(cls, 0))
+                cv2.putText(roi_vis, f'{inst} {conf:.2f}', (x, max(y - 6, 10)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 0), 1, cv2.LINE_AA)
 
         vis[ry1:ry2, rx1:rx2] = roi_vis
@@ -1213,6 +1483,8 @@ class ObjectDetectorNode(Node):
             cv2.putText(vis, 'BOX Z5', (fx1 + 4, fy1 + 22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
+        self._draw_place_slot_grid(vis, W, H)
+
         # HUD (FPS / known / unknown / ROI)
         now = time.perf_counter()
         last = getattr(self, '_render_last_t', None)
@@ -1247,6 +1519,8 @@ class ObjectDetectorNode(Node):
             if hasattr(self, '_track_manager'):
                 self._track_manager.reset()
             self.get_logger().info(f'YOLO 모델 로드 완료: {model_name}')
+            if hasattr(self.model, 'names'):
+                self.get_logger().info(f'YOLO 클래스({len(self.model.names)}): {list(self.model.names.values())}')
             return True
         except ImportError:
             self.get_logger().warn(
@@ -1543,6 +1817,10 @@ class ObjectDetectorNode(Node):
             # manager에 캐시 — grace 동안(다음 프레임 검출 빠질 때) 같은 후보를 재발행.
             if tid is not None:
                 self._track_manager.set_payload(tid, candidate)
+
+        if self.use_dynamic_place_pose:
+            self._update_dynamic_zone_place_targets(
+                depth_img, detections, candidates, Ww, Hh)
 
         # ── 화면 구성 (realsense_fastsam_segment.py 스타일) ───────────────
         # ROI 밖은 어둡게, ROI 안은 known(초록 마스크)+unknown(컬러 마스크)을

@@ -18,9 +18,8 @@ PyQt5 기반 Pick & Place GUI 노드.
 
 Qt-ROS 이벤트 루프 통합:
   QApplication.exec_()이 Qt 이벤트를 처리하는 메인 루프를 실행한다.
-  ROS 콜백은 QTimer(10ms 간격)가 rclpy.spin_once()를 호출해 처리한다.
-  UI 갱신은 별도 QTimer(100ms 간격)가 _update_ui()를 호출해 수행한다.
-  이 방식으로 Qt 이벤트와 ROS 메시지가 단일 스레드에서 안전하게 공존한다.
+  ROS 콜백은 별도 스레드에서 rclpy.spin_once()를 돌려 GUI 메인스레드 블로킹을 막는다.
+  UI 갱신은 QTimer(100ms 간격)가 _update_ui()를 호출해 수행한다.
 
 구독:
   /detection_debug_image  (sensor_msgs/Image)  - bbox가 그려진 디버그 영상
@@ -37,9 +36,11 @@ import json
 import re
 import yaml
 import subprocess
+import signal
 import sys
 import math
 import time
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -243,6 +244,7 @@ class PickPlaceGuiNode(Node):
         # 화면 표시용 상태를 멤버 변수로 유지한다.
         self.use_local_yolo = bool(self.get_parameter('use_local_yolo').value)
         self.bridge = CvBridge() if CvBridge is not None else None
+        self._data_lock = threading.Lock()
         self.latest_qimage = None
         self.detected_objects = []
         self._last_nonempty_objects = []
@@ -696,14 +698,15 @@ class PickPlaceGuiNode(Node):
         if self.bridge is None:
             return
         frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
-        # OpenCV BGR → Qt RGB: 채널 순서를 뒤집어 [:, :, ::-1]
         rgb = np.ascontiguousarray(frame[:, :, ::-1])
         height, width, channel = rgb.shape
-        bytes_per_line = channel * width   # 행당 바이트 수 (stride)
-        self.latest_qimage = QImage(
+        bytes_per_line = channel * width
+        qimage = QImage(
             rgb.data, width, height, bytes_per_line, QImage.Format_RGB888
-        ).copy()   # ndarray 수명 독립을 위해 QImage 복사본 보관
-        self.last_image_time = time.monotonic()
+        ).copy()
+        with self._data_lock:
+            self.latest_qimage = qimage
+            self.last_image_time = time.monotonic()
 
     def _cb_objects(self, msg: String):
         """object_detector가 발행한 검출 물체 목록(JSON)을 파싱해 멤버 변수를 갱신한다.
@@ -734,16 +737,17 @@ class PickPlaceGuiNode(Node):
             return
         objects = payload.get('objects', [])
         now = time.monotonic()
-        if objects:
-            self._last_nonempty_objects = objects
-            self._last_nonempty_objects_time = now
-            self.detected_objects = objects
-        elif now - self._last_nonempty_objects_time < 1.0:
-            self.detected_objects = list(self._last_nonempty_objects)
-        else:
-            self.detected_objects = []
-        self.selected_label = payload.get('selected_label', '')
-        self.last_objects_time = now
+        with self._data_lock:
+            if objects:
+                self._last_nonempty_objects = objects
+                self._last_nonempty_objects_time = now
+                self.detected_objects = objects
+            elif now - self._last_nonempty_objects_time < 1.0:
+                self.detected_objects = list(self._last_nonempty_objects)
+            else:
+                self.detected_objects = []
+            self.selected_label = payload.get('selected_label', '')
+            self.last_objects_time = now
 
     def _cb_state(self, msg: String):
         # 상태 문자열은 pick_place_node가 발행하는 값을 그대로 사용한다.
@@ -856,8 +860,8 @@ class PickPlaceGui(QWidget):
         self._unknown_candidate_labels = []
         self._known_candidate_hits = 0
         self._unknown_candidate_hits = 0
-        self._label_stable_frames_known = 3
-        self._label_stable_frames_unknown = 6
+        self._label_stable_frames_known = 1
+        self._label_stable_frames_unknown = 1
         self._label_hide_grace_sec = 0.75
         self._label_last_seen = {}
         self._settings_path = Path.home() / '.config' / 'dsr_realsense_pick_place' / 'gui_settings.json'
@@ -873,6 +877,11 @@ class PickPlaceGui(QWidget):
         self._system_reset_phase_until = 0.0
         self._gripper_bridge_restart_proc = None   # restart_gripper_bridge.sh 프로세스
         self._gripper_bridge_restart_until = 0.0   # 이 시각까지 버튼 비활성(재기동 진행 표시)
+        self._ros_spin_timer = None
+        self._ros_spin_stop = None
+        self._ros_spin_thread = None
+        self._shutting_down = False
+        self._last_rendered_image_time = 0.0
 
         # 좌측은 카메라 영상, 우측은 상태/선택 패널로 나누어 배치한다.
         self.setWindowTitle('DSR RealSense Pick & Place GUI')
@@ -1774,6 +1783,25 @@ class PickPlaceGui(QWidget):
         self.timer.timeout.connect(self._update_ui)
         self.timer.start(100)
 
+    def request_shutdown(self):
+        """SIGTERM/Ctrl+C/창 닫기 시 Qt·ROS 타이머를 먼저 멈춰 rcl_shutdown 이후 RCLError를 막는다."""
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+        if self._ros_spin_stop is not None:
+            self._ros_spin_stop.set()
+        if hasattr(self, 'timer') and self.timer is not None:
+            self.timer.stop()
+        if self._ros_spin_timer is not None:
+            self._ros_spin_timer.stop()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
+    def closeEvent(self, event):
+        self.request_shutdown()
+        super().closeEvent(event)
+
     def _select_label(self, label: str):
         self.ros_node.publish_selected_label(label)
         if label:
@@ -2585,10 +2613,10 @@ class PickPlaceGui(QWidget):
         if self._saved_model_applied:
             return
         model_path = str(self._settings.get('yolo_model_path', '')).strip()
-        if not model_path or not self.ros_node.cli_object_set_parameters.service_is_ready():
-            return
+        if model_path and not self.model_path_edit.text().strip():
+            self.model_path_edit.setText(model_path)
+        # launch가 yolo_model을 이미 세팅 — 시작 시 sync RPC/재로드 생략(메인스레드 블로킹 방지)
         self._saved_model_applied = True
-        self._model_apply(save=False, silent=True)
 
     def _calib_load(self):
         cli = self.ros_node.cli_object_get_parameters
@@ -2791,20 +2819,32 @@ class PickPlaceGui(QWidget):
         )
 
     def _update_ui(self):
+        if self._shutting_down or not rclpy.ok():
+            return
+        try:
+            self._update_ui_body()
+        except Exception as exc:
+            if not rclpy.ok() or self._shutting_down:
+                return
+            raise exc
+
+    def _update_ui_body(self):
         # 시스템 리셋 진행 상태 폴링
         self._poll_system_reset()
 
         self.ros_node.refresh_system_status()
         self._maybe_load_object_settings()
         self._maybe_apply_saved_model_path()
-        detected_snapshot = list(self.ros_node.detected_objects)
 
-        # 카메라 영상은 최신 프레임이 있을 때만 갱신한다.
-        if self.ros_node.latest_qimage is not None:
-            pixmap = QPixmap.fromImage(self.ros_node.latest_qimage)
-            self._draw_object_frames_on_pixmap(pixmap, detected_snapshot)
+        # 카메라 영상은 새 프레임이 올 때만 갱신한다(매 tick SmoothTransformation 금지).
+        with self.ros_node._data_lock:
+            qimage = self.ros_node.latest_qimage
+            image_time = self.ros_node.last_image_time
+        if qimage is not None and image_time != self._last_rendered_image_time:
+            self._last_rendered_image_time = image_time
+            pixmap = QPixmap.fromImage(qimage)
             scaled = pixmap.scaled(
-                self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+                self.image_label.size(), Qt.KeepAspectRatio, Qt.FastTransformation
             )
             self.image_label.setPixmap(scaled)
         self._update_system_status_bar()
@@ -3113,6 +3153,9 @@ class PickPlaceGui(QWidget):
         else:
             self.setStyleSheet('')
 
+        detected_snapshot = []
+        with self.ros_node._data_lock:
+            detected_snapshot = list(self.ros_node.detected_objects)
 
         # 도달 가능한 물체만 통과 — 버튼·요약 모두 같은 필터 사용.
         reachable_snapshot = [
@@ -3127,7 +3170,7 @@ class PickPlaceGui(QWidget):
             if self._is_gui_button_excluded(item):
                 continue
             label = item.get('label', 'unknown')
-            if label.startswith('unknown_'):
+            if label.startswith('unknown_') or label == 'unknown':
                 if label not in unknown_labels:
                     unknown_labels.append(label)
             else:
@@ -3319,59 +3362,6 @@ class PickPlaceGui(QWidget):
                 'border-radius: 3px; font-size: 11px; font-weight: bold;'
             )
 
-    def _draw_object_frames_on_pixmap(self, pixmap: QPixmap, detected_objects: list):
-        """검출 물체의 픽셀 중심에 간단한 좌표계(X/Z) 오버레이를 그린다."""
-        if pixmap.isNull():
-            return
-        painter = QPainter(pixmap)
-        try:
-            painter.setRenderHint(QPainter.Antialiasing, True)
-
-            x_pen = QPen(QColor(255, 90, 90), 3)      # X축: 빨강
-            z_pen = QPen(QColor(80, 220, 255), 3)     # Z축(테이블 법선): 하늘색
-            center_pen = QPen(QColor(255, 255, 0), 3)
-            text_pen = QPen(QColor(255, 255, 255), 1)
-            axis_len = 42
-
-            for item in detected_objects:
-                u = int(item.get('pixel_u', -1))
-                v = int(item.get('pixel_v', -1))
-                if u < 0 or v < 0:
-                    continue
-
-                pose = item.get('pose', {})
-                yaw_deg = pose.get('yaw_deg', None)
-
-                painter.setPen(center_pen)
-                painter.drawEllipse(u - 3, v - 3, 6, 6)
-
-                if isinstance(yaw_deg, (int, float)):
-                    yaw_rad = math.radians(float(yaw_deg))
-                    dx = axis_len * math.cos(yaw_rad)
-                    dy = -axis_len * math.sin(yaw_rad)
-                    painter.setPen(x_pen)
-                    painter.drawLine(u, v, int(round(u + dx)), int(round(v + dy)))
-                    painter.drawText(int(round(u + dx + 6)), int(round(v + dy - 6)), 'LONG')
-
-                painter.setPen(z_pen)
-                painter.drawLine(u, v, u, v - axis_len)
-                painter.drawText(u + 4, v - axis_len - 4, 'Z')
-
-                label = item.get('label', 'obj')
-                yaw_text = f'{float(yaw_deg):+.1f}deg' if isinstance(yaw_deg, (int, float)) else 'yaw=N/A'
-                tag_text = f'{label} | {yaw_text}'
-                tag_x = u + 10
-                tag_y = v + 10
-                tag_w = max(118, 8 * len(tag_text))
-                tag_h = 24
-                painter.fillRect(tag_x, tag_y, tag_w, tag_h, QColor(20, 20, 20, 180))
-                painter.setPen(QPen(QColor(255, 190, 60), 1))
-                painter.drawRect(tag_x, tag_y, tag_w, tag_h)
-                painter.setPen(text_pen)
-                painter.drawText(tag_x + 8, tag_y + 16, tag_text)
-        finally:
-            painter.end()
-
     def _build_selection_status(self):
         # 사용자가 아무 것도 고르지 않았으면 자동 선택 모드 상태를 명확히 보여 준다.
         if not self.ros_node.selected_label:
@@ -3385,17 +3375,10 @@ class PickPlaceGui(QWidget):
 
 
 def main(args=None):
-    """Qt 이벤트 루프와 ROS 2 spin을 단일 프로세스에서 통합 실행한다.
+    """Qt 이벤트 루프와 ROS 2 spin을 통합 실행한다.
 
-    통합 방식:
-      - QApplication.exec_()이 Qt 이벤트 루프를 점유하므로
-        rclpy.spin()을 별도 스레드에서 돌리는 대신
-        QTimer로 10ms마다 spin_once()를 호출하는 방식을 사용한다.
-      - 이렇게 하면 ROS 콜백과 Qt 이벤트가 모두 메인 스레드에서 처리되어
-        스레드 안전성 문제 없이 공유 데이터(latest_qimage 등)에 접근할 수 있다.
-
-    종료 흐름:
-      사용자가 창을 닫으면 app.exec_() 반환 → destroy_node() → shutdown() 순서로 정리.
+    ROS 콜백은 백그라운드 스레드에서 spin_once()를 호출하고,
+    Qt 메인 스레드는 UI만 담당한다(블로킹 시 '응답 없음' 방지).
     """
     rclpy.init(args=args)
     node = PickPlaceGuiNode()
@@ -3406,14 +3389,32 @@ def main(args=None):
     gui.raise_()
     gui.activateWindow()
 
-    # ROS 콜백 처리용 타이머: 10ms마다 spin_once() 호출
-    # timeout_sec=0.0: 대기 없이 현재 큐에 있는 콜백만 즉시 처리
-    timer = QTimer()
-    timer.timeout.connect(lambda: rclpy.spin_once(node, timeout_sec=0.0))
-    timer.start(10)   # 10ms = 약 100Hz, 카메라 30fps에 비해 충분히 빠름
+    ros_spin_stop = threading.Event()
+    gui._ros_spin_stop = ros_spin_stop
 
-    exit_code = app.exec_()   # Qt 이벤트 루프 진입 (창 닫힐 때까지 블로킹)
-    timer.stop()
+    def _spin_loop():
+        while not ros_spin_stop.is_set() and rclpy.ok():
+            try:
+                rclpy.spin_once(node, timeout_sec=0.05)
+            except Exception:
+                break
+
+    ros_spin_thread = threading.Thread(
+        target=_spin_loop, name='gui_ros_spin', daemon=True)
+    gui._ros_spin_thread = ros_spin_thread
+    ros_spin_thread.start()
+
+    def _handle_signal(_signum, _frame):
+        gui.request_shutdown()
+
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+
+    exit_code = app.exec_()
+    gui.request_shutdown()
+    ros_spin_stop.set()
+    if ros_spin_thread.is_alive():
+        ros_spin_thread.join(timeout=2.0)
     node.cleanup_hardware()
     if rclpy.ok():
         node.destroy_node()

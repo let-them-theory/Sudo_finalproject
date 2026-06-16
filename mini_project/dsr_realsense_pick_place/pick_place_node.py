@@ -21,6 +21,7 @@ Doosan 서비스 클라이언트 (namespace: /dsr01/):
 그리퍼: /gripper/open, /gripper/close 서비스 경유
 """
 
+import json
 import threading
 import time
 import math
@@ -165,6 +166,9 @@ class PickPlaceNode(Node):
         self.declare_parameter('sort_roi_zone_positions_x', [0.4, 0.4, 0.4, 0.4, 0.4])
         self.declare_parameter('sort_roi_zone_positions_y', [-0.4, -0.2, 0.0, 0.2, 0.4])
         self.declare_parameter('sort_roi_zone_positions_z', [0.1, 0.1, 0.1, 0.1, 0.1])
+        # 구역별 MOVE_TO_PLACE 접근 상승 = place_z + this. 0이면 LIFT 높이에서 바로 수평 이동.
+        self.declare_parameter('sort_roi_zone_approach_z_offset',
+                               [0.0, 0.0, 0.0, 0.15, 0.0])
         # box_roi(i+1) 구역별 Place 자세(rx,ry,rz deg). place_rpy와 동일하면 그대로 두면 됨.
         self.declare_parameter('sort_roi_zone_place_rx', [0.0, 0.0, 0.0, 0.0, 0.0])
         self.declare_parameter('sort_roi_zone_place_ry', [180.0, 180.0, 180.0, 180.0, 180.0])
@@ -191,6 +195,17 @@ class PickPlaceNode(Node):
         self.declare_parameter('sort_max_empty_cycles',   2)
         # 한 사이클당 물체 검출 대기 최대 시간(초)
         self.declare_parameter('sort_detect_timeout_sec', 5.0)
+        # true면 object_detector /zone_dynamic_place_targets(빈 칸) 우선, 없으면 yaml 폴백.
+        self.declare_parameter('use_dynamic_place_pose', True)
+        # true: 빈 칸(row,col)만 카메라, 최종 xyz는 sort_roi_zone_positions 앵커+격자 간격.
+        self.declare_parameter('place_slot_use_yaml_anchor', True)
+        # round_robin: place마다 다음 칸(ramen 연속 배치). camera: 카메라 빈칸(픽 위치에선 부정확할 수 있음).
+        self.declare_parameter('place_slot_mode', 'round_robin')
+        self.declare_parameter('place_slot_grid_cols', 3)
+        self.declare_parameter('place_slot_grid_rows', 2)
+        self.declare_parameter('place_slot_cell_spacing_x_m', 0.07)
+        self.declare_parameter('place_slot_cell_spacing_y_m', 0.05)
+        self.declare_parameter('place_slot_z_offset_m', 0.04)
 
         ns = self.get_parameter('robot_namespace').value
         self.jvel         = self.get_parameter('joint_vel').value
@@ -273,6 +288,7 @@ class PickPlaceNode(Node):
         _zpx = list(self.get_parameter('sort_roi_zone_positions_x').value)
         _zpy = list(self.get_parameter('sort_roi_zone_positions_y').value)
         _zpz = list(self.get_parameter('sort_roi_zone_positions_z').value)
+        _zapz = list(self.get_parameter('sort_roi_zone_approach_z_offset').value)
         _zrx = list(self.get_parameter('sort_roi_zone_place_rx').value)
         _zry = list(self.get_parameter('sort_roi_zone_place_ry').value)
         _zrz = list(self.get_parameter('sort_roi_zone_place_rz').value)
@@ -288,11 +304,15 @@ class PickPlaceNode(Node):
         _zw1y = list(self.get_parameter('sort_roi_zone_transit_wp1_y').value)
         _zw2x = list(self.get_parameter('sort_roi_zone_transit_wp2_x').value)
         _zw2y = list(self.get_parameter('sort_roi_zone_transit_wp2_y').value)
-        _nz  = min(len(_zpx), len(_zpy), len(_zpz), len(_zrx), len(_zry), len(_zrz),
+        _nz  = min(len(_zpx), len(_zpy), len(_zpz), len(_zapz), len(_zrx), len(_zry), len(_zrz),
                    len(_zuj), len(_zj1), len(_zj2), len(_zj3), len(_zj4), len(_zj5), len(_zj6),
                    len(_zwc), len(_zw1x), len(_zw1y), len(_zw2x), len(_zw2y))
         # 인덱스 0 = box_roi1, 1 = box_roi2, ...
         self.sort_zone_positions: list = [[_zpx[i], _zpy[i], _zpz[i]] for i in range(_nz)]
+        self.sort_zone_approach_dz: list = [
+            float(_zapz[i]) if i < len(_zapz) else float(self.place_approach_dz)
+            for i in range(_nz)
+        ]
         self.sort_zone_rpy: list = [
             [float(_zrx[i]), float(_zry[i]), float(_zrz[i])] for i in range(_nz)
         ]
@@ -320,6 +340,28 @@ class PickPlaceNode(Node):
         }
         self.sort_max_empty_cycles  = int(self.get_parameter('sort_max_empty_cycles').value)
         self.sort_detect_timeout    = float(self.get_parameter('sort_detect_timeout_sec').value)
+        self.use_dynamic_place_pose = bool(
+            self.get_parameter('use_dynamic_place_pose').value)
+        self.place_slot_use_yaml_anchor = bool(
+            self.get_parameter('place_slot_use_yaml_anchor').value)
+        self.place_slot_grid_cols = max(
+            1, int(self.get_parameter('place_slot_grid_cols').value))
+        self.place_slot_grid_rows = max(
+            1, int(self.get_parameter('place_slot_grid_rows').value))
+        self.place_slot_cell_spacing_x_m = float(
+            self.get_parameter('place_slot_cell_spacing_x_m').value)
+        self.place_slot_cell_spacing_y_m = float(
+            self.get_parameter('place_slot_cell_spacing_y_m').value)
+        self.place_slot_z_offset_m = float(
+            self.get_parameter('place_slot_z_offset_m').value)
+        self.place_slot_mode = str(
+            self.get_parameter('place_slot_mode').value).strip().lower()
+        self._dynamic_zone_targets: dict = {}
+        self._dynamic_zone_targets_t: float = 0.0
+        # zone_idx → 다음 round_robin 칸 번호 (0 .. cols*rows-1)
+        self._zone_slot_index: dict[int, int] = {}
+        # zone_idx → 이번 세션에 place 완료한 (row,col). 카메라 미인식 시 중복 방지.
+        self._zone_filled_slots: dict[int, set] = {}
 
         self.ws = {
             'x': (self.get_parameter('workspace_x_min').value,
@@ -427,6 +469,9 @@ class PickPlaceNode(Node):
         self.create_subscription(String, '/selected_object_class', self._cb_selected_class, 10)
         self.create_subscription(
             Int32, '/selected_object_place_zone', self._cb_selected_place_zone, 10)
+        self.create_subscription(
+            String, '/zone_dynamic_place_targets',
+            self._cb_zone_dynamic_place_targets, 10)
         # 사용자가 GUI에서 클릭한 라벨 — pose race 방지 검증용 (사용자 선택과 일관된 pose만 채택)
         self.create_subscription(String, '/selected_object_label', self._cb_selected_label, 10)
         self.create_subscription(
@@ -605,6 +650,118 @@ class PickPlaceNode(Node):
         # object_detector가 결정한 배치 box_roi 구역(1~5). 카메라 box_roi와 1:1 대응.
         self._target_place_zone = int(msg.data)
 
+    def _cb_zone_dynamic_place_targets(self, msg: String):
+        try:
+            self._dynamic_zone_targets = json.loads(msg.data or '{}')
+            self._dynamic_zone_targets_t = time.monotonic()
+        except json.JSONDecodeError:
+            self.get_logger().warn('zone_dynamic_place_targets JSON 파싱 실패')
+
+    def _wait_dynamic_zone_targets(self, timeout_sec: float = 0.35) -> None:
+        """camera 모드: 최신 /zone_dynamic_place_targets 수신까지 잠깐 대기."""
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            if self._dynamic_zone_targets:
+                return
+            time.sleep(0.05)
+
+    def _place_from_slot_yaml_anchor(self, zone_idx: int, tgt: dict) -> list:
+        """카메라가 고른 빈 칸(row,col) + yaml zone 중심·격자 간격으로 place xyz 산출."""
+        px0, py0, pz0 = self.sort_zone_positions[zone_idx]
+        cols = self.place_slot_grid_cols
+        rows = self.place_slot_grid_rows
+        col = int(tgt.get('col', 0))
+        row = int(tgt.get('row', 0))
+        x = px0 + (col - (cols - 1) / 2.0) * self.place_slot_cell_spacing_x_m
+        y = py0 + (row - (rows - 1) / 2.0) * self.place_slot_cell_spacing_y_m
+        z = float(pz0) + self.place_slot_z_offset_m
+        return [x, y, z]
+
+    def _zone_filled_slot_set(self, zone_idx: int) -> set:
+        return self._zone_filled_slots.setdefault(zone_idx, set())
+
+    def _first_unfilled_slot(
+            self, zone_idx: int, start_idx: int = 0) -> tuple[int, int, int]:
+        cols = self.place_slot_grid_cols
+        rows = self.place_slot_grid_rows
+        n_slots = max(1, cols * rows)
+        filled = self._zone_filled_slot_set(zone_idx)
+        for k in range(n_slots):
+            idx = (start_idx + k) % n_slots
+            row, col = idx // cols, idx % cols
+            if (row, col) not in filled:
+                return row, col, idx
+        idx = start_idx % n_slots
+        return idx // cols, idx % cols, idx
+
+    def _slot_row_col_for_zone(self, zone_idx: int) -> tuple[int, int, int]:
+        """(row, col, slot_index). round_robin 또는 카메라 빈칸(+로컬 place 기억)."""
+        cols = self.place_slot_grid_cols
+        rows = self.place_slot_grid_rows
+        n_slots = cols * rows
+        filled = self._zone_filled_slot_set(zone_idx)
+        start = self._zone_slot_index.get(zone_idx, 0) % max(1, n_slots)
+        if self.place_slot_mode == 'camera':
+            tgt = self._dynamic_zone_targets.get(str(zone_idx + 1), {})
+            if tgt.get('valid') and 'row' in tgt and 'col' in tgt:
+                row, col = int(tgt['row']), int(tgt['col'])
+                if (row, col) not in filled:
+                    self._last_slot_from_camera = True
+                    self._last_slot_source = 'cam'
+                    if tgt.get('all_full'):
+                        self.get_logger().warn(
+                            f'box_roi{zone_idx + 1}: 카메라 빈 칸 없음 → 중앙 칸 폴백 '
+                            f'slot({row},{col})')
+                    return row, col, row * cols + col
+                self.get_logger().warn(
+                    f'box_roi{zone_idx + 1}: 카메라 빈칸 slot({row},{col})은 '
+                    f'이미 place됨 → 로컬 다음 칸 탐색')
+            else:
+                age = (time.monotonic() - self._dynamic_zone_targets_t
+                       if self._dynamic_zone_targets_t > 0 else -1.0)
+                self.get_logger().warn(
+                    f'camera 빈칸 데이터 없음 (zone{zone_idx + 1}, '
+                    f'keys={list(self._dynamic_zone_targets.keys())}, '
+                    f'last_update={age:.1f}s ago) → 로컬 빈칸 탐색')
+            row, col, idx = self._first_unfilled_slot(zone_idx, start)
+            self._last_slot_from_camera = False
+            self._last_slot_source = 'local'
+            if filled:
+                self.get_logger().info(
+                    f'box_roi{zone_idx + 1}: 로컬 빈칸 slot({row},{col}) '
+                    f'(이미 놓은 칸 {sorted(filled)})')
+            return row, col, idx
+        idx = start
+        row, col = idx // cols, idx % cols
+        self._last_slot_source = 'round_robin'
+        return row, col, idx
+
+    def _advance_zone_slot(self, zone_idx: int | None) -> None:
+        if zone_idx is None or not self.use_dynamic_place_pose:
+            return
+        row = int(getattr(self, '_last_slot_row', 0))
+        col = int(getattr(self, '_last_slot_col', 0))
+        self._zone_filled_slot_set(zone_idx).add((row, col))
+        n = max(1, self.place_slot_grid_cols * self.place_slot_grid_rows)
+        cur = int(getattr(self, '_last_slot_index', 0))
+        self._zone_slot_index[zone_idx] = (cur + 1) % n
+
+    def _dynamic_place_for_zone(self, zone_idx: int) -> list | None:
+        if not self.use_dynamic_place_pose:
+            return None
+        if self.place_slot_use_yaml_anchor:
+            row, col, idx = self._slot_row_col_for_zone(zone_idx)
+            place = self._place_from_slot_yaml_anchor(
+                zone_idx, {'row': row, 'col': col})
+            self._last_slot_index = idx
+            self._last_slot_row = row
+            self._last_slot_col = col
+            return place
+        tgt = self._dynamic_zone_targets.get(str(zone_idx + 1))
+        if tgt and tgt.get('valid') and all(k in tgt for k in ('x', 'y', 'z')):
+            return [float(tgt['x']), float(tgt['y']), float(tgt['z'])]
+        return None
+
     def _resolve_place_pos(self, object_class: str = '', place_zone: int = 0):
         """box_roi 구역(1~5) → Place 좌표. 미지정이면 클래스 맵, 그래도 없으면 place_position.
 
@@ -624,7 +781,18 @@ class PickPlaceNode(Node):
             cls = (object_class or '').strip()
             zone_idx = self.sort_class_zone_map.get(cls)
         if zone_idx is not None and zone_idx < len(self.sort_zone_positions):
-            place = list(self.sort_zone_positions[zone_idx])
+            place = self._dynamic_place_for_zone(zone_idx)
+            if place is None:
+                place = list(self.sort_zone_positions[zone_idx])
+            else:
+                cam_tag = getattr(self, '_last_slot_source', self.place_slot_mode)
+                slot = (
+                    f"slot({getattr(self, '_last_slot_row', 0)},"
+                    f"{getattr(self, '_last_slot_col', 0)})"
+                    f" idx={getattr(self, '_last_slot_index', 0)} [{cam_tag}]")
+                self.get_logger().info(
+                    f'동적 place box_roi{zone_idx + 1} {slot}: '
+                    f'({place[0]:.3f}, {place[1]:.3f}, {place[2]:.3f})')
             rpy = self._place_rpy_for_zone(zone_idx)
             joints = self._place_joints_for_zone(zone_idx)
             use_j = self._place_use_joints_for_zone(zone_idx)
@@ -662,6 +830,11 @@ class PickPlaceNode(Node):
                 and 0 <= zone_idx < len(self.sort_zone_use_joints)
                 and self.sort_zone_use_joints[zone_idx])
 
+    def _place_approach_dz_for_zone(self, zone_idx: int | None) -> float:
+        if zone_idx is not None and 0 <= zone_idx < len(self.sort_zone_approach_dz):
+            return float(self.sort_zone_approach_dz[zone_idx])
+        return float(self.place_approach_dz)
+
     def _place_transit_waypoints_for_zone(self, zone_idx: int | None) -> list:
         """구역별 MOVE_TO_PLACE ② 중간 movel waypoint [(x,y), ...]. movej보다 우선순위 낮음."""
         if zone_idx is None or not (0 <= zone_idx < len(self.sort_zone_transit_wp_count)):
@@ -687,21 +860,26 @@ class PickPlaceNode(Node):
         ② 수평: movej(구역별) > waypoint movel(구역별) > 직선 movel.
         place RPY 전환은 PLACE 하강 시 적용.
         """
-        approach_z = pz + self.place_approach_dz
+        approach_dz = self._place_approach_dz_for_zone(zone_idx)
+        approach_z = pz + approach_dz
         if grasp_rpy is None:
             grasp_rpy = place_rpy
 
         use_movej_transit = self._place_use_joints_for_zone(zone_idx)
         transit_waypoints = self._place_transit_waypoints_for_zone(zone_idx)
 
-        # ① pick 위치에서 접근 높이 상승 (모든 zone 공통, LIFT z < approach_z 일 때)
-        if self.place_horizontal_transit and current_z < approach_z - 1e-4:
+        # ① pick 위치 접근 상승 — 구역별 approach_dz>0 일 때만 (zone1/2=0 → LIFT 높이 유지)
+        if (approach_dz > 1e-4 and self.place_horizontal_transit
+                and current_z < approach_z - 1e-4):
             self.get_logger().info(
                 f'Place 접근 — 접근 높이 상승 z={current_z:.3f}→{approach_z:.3f}')
             self._move_to_cart(current_x, current_y, approach_z, grasp_rpy)
             current_z = approach_z
+        elif approach_dz <= 1e-4 and self.place_horizontal_transit:
+            self.get_logger().info(
+                f'Place 접근 — LIFT 높이 유지 z={current_z:.3f} (구역 접근상승=0)')
 
-        transit_z = max(current_z, approach_z)
+        transit_z = current_z if approach_dz <= 1e-4 else max(current_z, approach_z)
 
         def _needs_move(tx, ty, tz):
             return (abs(current_x - tx) > 1e-4 or abs(current_y - ty) > 1e-4
@@ -1095,6 +1273,13 @@ class PickPlaceNode(Node):
                         self._set_state(State.MOVE_TO_PLACE)
 
                 elif current == State.MOVE_TO_PLACE:
+                    if self.place_slot_mode == 'camera':
+                        self._wait_dynamic_zone_targets()
+                        self._active_place_pos, self._active_place_zone_idx = (
+                            self._resolve_place(
+                                self._target_object_class, self._target_place_zone))
+                        self._active_place_rpy = self._place_rpy_for_zone(
+                            self._active_place_zone_idx)
                     px, py, pz = self._active_place_pos
                     pose = self.target_pose
                     cur_x = float(pose.pose.position.x)
@@ -1113,6 +1298,7 @@ class PickPlaceNode(Node):
                     self._move_to_cart(
                         px, py, pz, self._active_place_rpy, vel=50.0, acc=100.0)
                     self._gripper_open()
+                    self._advance_zone_slot(self._active_place_zone_idx)
                     self._set_state(State.POST_PLACE)
 
                 elif current == State.POST_PLACE:
@@ -1330,6 +1516,11 @@ class PickPlaceNode(Node):
 
             # ── 6. MOVE_TO_PLACE ──────────────────────────────────────────
             self._set_state(State.MOVE_TO_PLACE)
+            if self.place_slot_mode == 'camera':
+                self._wait_dynamic_zone_targets()
+                place, place_zone_idx = self._resolve_place(
+                    object_class, self._target_place_zone)
+                place_rpy = self._place_rpy_for_zone(place_zone_idx)
             px, py, pz = place
             lift_z = pz_obj + self.pre_pick_dz
             self._execute_move_to_place(
@@ -1340,6 +1531,7 @@ class PickPlaceNode(Node):
             self._set_state(State.PLACE)
             self._move_to_cart(px, py, pz, place_rpy, vel=50.0, acc=100.0)
             self._gripper_open()
+            self._advance_zone_slot(place_zone_idx)
 
             # ── 8. POST_PLACE ─────────────────────────────────────────────
             self._set_state(State.POST_PLACE)
