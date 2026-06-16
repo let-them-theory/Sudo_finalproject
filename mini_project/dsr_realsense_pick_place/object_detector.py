@@ -30,6 +30,7 @@ import math
 import queue
 import threading
 import time
+from collections import Counter, deque
 from pathlib import Path
 
 import rclpy
@@ -42,7 +43,7 @@ import pyrealsense2 as rs
 
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PoseStamped
-from std_msgs.msg import Int32, String
+from std_msgs.msg import Bool, Int32, String
 from cv_bridge import CvBridge, CvBridgeError
 import message_filters
 import tf2_ros
@@ -312,21 +313,23 @@ class CentroidTracker:
     per-ROI predict 검출(추적 미포함)에 일관된 ID를 부여하기 위해 사용한다.
     """
 
-    def __init__(self, max_dist: int = 60, max_age: int = 12):
+    def __init__(self, max_dist: int = 60, max_age: int = 12, class_window: int = 10):
         self.max_dist = max_dist
         self.max_age = max_age
-        self._tracks: dict = {}     # id → {cx, cy, age}
+        # class_window: 트랙별 최근 N프레임 클래스 히스토리 길이. 다수결로 단발 오분류 흡수.
+        self.class_window = class_window
+        self._tracks: dict = {}     # id → {cx, cy, age, classes:deque}
         self._next_id = 1
 
-    def update(self, centroids: list) -> list:
-        """centroids: [(cx,cy),...]. 반환: [id,...] (입력 순서와 동일)."""
+    def update(self, centroids: list, classes: list | None = None) -> list:
+        """centroids: [(cx,cy),...], classes: [class_name,...] (선택). 반환: [id,...] (입력 순서)."""
         for tid in list(self._tracks):
             self._tracks[tid]['age'] += 1
             if self._tracks[tid]['age'] > self.max_age:
                 del self._tracks[tid]
         used = set()
         ids = []
-        for cx, cy in centroids:
+        for i, (cx, cy) in enumerate(centroids):
             best_tid, best_dist = None, self.max_dist
             for tid, tr in self._tracks.items():
                 if tid in used:
@@ -336,15 +339,26 @@ class CentroidTracker:
                     best_dist, best_tid = dist, tid
             if best_tid is not None:
                 self._tracks[best_tid].update(cx=cx, cy=cy, age=0)
-                used.add(best_tid)
-                ids.append(best_tid)
+                tid = best_tid
             else:
-                nid = self._next_id
+                tid = self._next_id
                 self._next_id += 1
-                self._tracks[nid] = dict(cx=cx, cy=cy, age=0)
-                used.add(nid)
-                ids.append(nid)
+                self._tracks[tid] = dict(
+                    cx=cx, cy=cy, age=0, classes=deque(maxlen=self.class_window))
+            used.add(tid)
+            # 트랙별 클래스 히스토리 누적 (다수결용). 매 프레임 push — 지연 없음.
+            if classes is not None:
+                self._tracks[tid].setdefault(
+                    'classes', deque(maxlen=self.class_window)).append(classes[i])
+            ids.append(tid)
         return ids
+
+    def stable_class(self, tid: int, fallback: str = '') -> str:
+        """트랙의 최근 클래스 히스토리 다수결. 히스토리 없으면 fallback(단발 클래스)."""
+        tr = self._tracks.get(tid)
+        if not tr or not tr.get('classes'):
+            return fallback
+        return Counter(tr['classes']).most_common(1)[0][0]
 
 
 class ObjectDetectorNode(Node):
@@ -613,6 +627,8 @@ class ObjectDetectorNode(Node):
 
         # pick_place 상태 구독 — LIFT/MOVE_TO_PLACE 중에는 "검출되지 않음" WARN을 억제한다.
         self._pick_place_state = ''
+        # 자동 분류(sort_all) 중 True — 자동선택을 ws(박스밖) 물체로만 제한. pick_place가 토글.
+        self._sort_ws_only = False
 
         # RealSense SDK의 deproject 함수를 쓰기 위해 rs.intrinsics 객체를 저장한다.
         self.intrinsics = None
@@ -728,6 +744,9 @@ class ObjectDetectorNode(Node):
                                  self._cb_selected_object, 10)
         self.create_subscription(String, '/pick_place_state',
                                  self._cb_pick_place_state, 10)
+        # 자동 분류 중 ws-only 자동선택 토글 (pick_place sort_all이 발행).
+        self.create_subscription(Bool, '/sort_ws_only',
+                                 self._cb_sort_ws_only, 10)
 
         # ── 검출 워커 스레드 ─────────────────────────────────────────────
         # 카메라 콜백은 프레임을 큐에 넣고 즉시 반환 → ApproximateTimeSynchronizer 드랍 방지
@@ -1368,6 +1387,25 @@ class ObjectDetectorNode(Node):
             if any(sx1 <= _fu < sx2 and sy1 <= _fv < sy2
                    for (sx1, sy1, sx2, sy2) in _suppress_rects):
                 continue
+            # (C) 이중검출 제거 — unknown 마스크 중심이 YOLO known bbox 안에 있고
+            # 마스크 면적의 과반이 그 bbox 안이면 같은 객체로 보고 unknown에서 제외한다.
+            # (중심만으로 판정하면 큰 bbox가 옆 물체를 오억제 → 과반 overlap 가드로 완화)
+            _cu_l = (int(_uxs.min()) + int(_uxs.max())) // 2
+            _cv_l = (int(_uys.min()) + int(_uys.max())) // 2
+            _dup_known = False
+            for (kx1, ky1, kx2, ky2, *_k) in known_boxes:
+                if not (kx1 <= _cu_l < kx2 and ky1 <= _cv_l < ky2):
+                    continue
+                ix1, iy1 = max(0, kx1), max(0, ky1)
+                ix2, iy2 = min(RW, kx2), min(RH, ky2)
+                if ix2 <= ix1 or iy2 <= iy1:
+                    continue
+                _inside = int(np.count_nonzero(seg[iy1:iy2, ix1:ix2]))
+                if _inside / max(1, area) > 0.5:
+                    _dup_known = True
+                    break
+            if _dup_known:
+                continue
             unknown_masks.append(seg)
 
         track_ids = self._unknown_tracker.update(unknown_masks)
@@ -1410,6 +1448,8 @@ class ObjectDetectorNode(Node):
                 'pixel_u': u,
                 'pixel_v': v,
                 'place_zone': self._resolve_place_zone('object', u, v, W, H),
+                # 소스 위치: 픽셀이 든 box_roi(1~5), 0=ws(박스밖). sort_ws_only 필터용.
+                'source_zone': self._resolve_box_roi_zone_from_pixel(u, v, W, H),
                 'pose': pose_abs,
                 'pose_dict': {'x': pos.x, 'y': pos.y, 'z': pos.z, 'yaw_deg': yaw_deg},
             })
@@ -1723,6 +1763,10 @@ class ObjectDetectorNode(Node):
     def _cb_pick_place_state(self, msg: String):
         self._pick_place_state = msg.data.strip()
 
+    def _cb_sort_ws_only(self, msg: Bool):
+        # 자동 분류 중 자동선택을 ws(박스밖) 물체로만 제한.
+        self._sort_ws_only = bool(msg.data)
+
     # ────────────────────────────────────────────────────────────────────
     # 메인 검출 루프
     # ────────────────────────────────────────────────────────────────────
@@ -1805,6 +1849,8 @@ class ObjectDetectorNode(Node):
                 'pixel_u': u,
                 'pixel_v': v,
                 'place_zone': place_zone,    # 배치 대상 box_roi 구역(1~5), 0=미지정
+                # 소스 위치: 픽셀이 든 box_roi(1~5), 0=ws(박스밖). sort_ws_only 필터용.
+                'source_zone': self._resolve_box_roi_zone_from_pixel(u, v, Ww, Hh),
                 'pose': pose_abs,
                 'pose_dict': {
                     'x': pos.x,
@@ -2227,7 +2273,16 @@ class ObjectDetectorNode(Node):
         # 자동 선택 — 가장 가까운 것
         if not candidates:
             return None
-        return min(candidates, key=lambda item: item['depth_m'])
+        # 자동 분류(sort_all) 중: ws(박스밖, source_zone==0) + known 클래스만 대상.
+        # unknown('object')은 검출 z가 허공으로 튀는 노이즈가 많고 목적지도 없어 제외(인식되는것만).
+        pool = candidates
+        if self._sort_ws_only:
+            pool = [c for c in candidates
+                    if c.get('source_zone', 0) == 0
+                    and (c.get('class_name') or '') != 'object']
+            if not pool:
+                return None
+        return min(pool, key=lambda item: item['depth_m'])
 
     # ────────────────────────────────────────────────────────────────────
     # YOLO 검출
@@ -2275,9 +2330,13 @@ class ObjectDetectorNode(Node):
                 continue
             kept.append(d)
 
-        # 위치기반 트래커로 일관 ID 부여 (predict는 추적 ID가 없으므로)
-        tids = self._known_tracker.update([(d[0], d[1]) for d in kept])
-        return [(d[0], d[1], d[2], d[3], d[4], d[5], tid)
+        # 위치기반 트래커로 일관 ID 부여 (predict는 추적 ID가 없으므로) + 클래스 다수결.
+        # 정지 물체라 ID 안정 → 프레임마다 흔들리는 단발 클래스(jelly↔pack↔object)를
+        # 트랙 히스토리 다수결로 고정 → 오배치/unknown 깜빡임 완화. 추가 지연 없음.
+        tids = self._known_tracker.update(
+            [(d[0], d[1]) for d in kept], classes=[d[4] for d in kept])
+        return [(d[0], d[1], d[2], d[3],
+                 self._known_tracker.stable_class(tid, d[4]), d[5], tid)
                 for d, tid in zip(kept, tids)]
 
     def _detect_yolo(self, img: np.ndarray) -> list:

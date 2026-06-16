@@ -37,6 +37,7 @@ import re
 import yaml
 import subprocess
 import signal
+import socket
 import sys
 import math
 import time
@@ -285,6 +286,7 @@ class PickPlaceGuiNode(Node):
         self.pub_selected = self.create_publisher(String, '/selected_object_label', 10)
 
         self.cli_run_once      = self.create_client(Trigger, '/pick_place/run_once')
+        self.cli_sort_all      = self.create_client(Trigger, '/pick_place/sort_all')
         self.cli_go_home       = self.create_client(Trigger, '/pick_place/go_home')
         self.cli_gripper_open  = self.create_client(Trigger, '/gripper/open')
         self.cli_gripper_close = self.create_client(Trigger, '/gripper/close')
@@ -864,6 +866,8 @@ class PickPlaceGui(QWidget):
             self._order_repo = JsonRepository()
         except Exception:
             self._order_repo = None
+        # 키오스크 서버(web_kiosk) 서브프로세스 핸들 — USER 탭에서 on/off.
+        self._kiosk_proc = None
         self._reset_in_progress = False
         self._reset_deadline = 0.0
         self._manual_command = None
@@ -1724,9 +1728,15 @@ class PickPlaceGui(QWidget):
 
         object_group = QGroupBox('검출된 물체 선택')
         object_layout = QVBoxLayout(object_group)
+        auto_row = QHBoxLayout()
         self.auto_button = QPushButton('자동 선택 사용')
         self.auto_button.clicked.connect(lambda: self._select_label(''))
-        object_layout.addWidget(self.auto_button)
+        # 자동 분류(Sort All) — 검출 물체를 클래스별 box 구역으로 일괄 정렬.
+        self.sort_all_button = QPushButton('🔄 자동 분류')
+        self.sort_all_button.clicked.connect(self._on_sort_all)
+        auto_row.addWidget(self.auto_button)
+        auto_row.addWidget(self.sort_all_button)
+        object_layout.addLayout(auto_row)
 
         btn_row_h = 34
         scroll_visible_rows = 2
@@ -2868,6 +2878,21 @@ class PickPlaceGui(QWidget):
         top.addWidget(self.queue_clear_button)
         lay.addLayout(top)
 
+        # ── 키오스크 서버 on/off ──────────────────────────────────────
+        ops = QHBoxLayout()
+        self.kiosk_server_button = QPushButton('▶ 키오스크 서버 ON')
+        self.kiosk_server_button.setFixedHeight(28)
+        self.kiosk_server_button.clicked.connect(self._toggle_kiosk_server)
+        ops.addStretch(1)
+        ops.addWidget(self.kiosk_server_button)
+        lay.addLayout(ops)
+
+        # 키오스크 서버 상태 + 모바일 접속 주소 (마우스로 선택/복사 가능).
+        self.kiosk_addr_label = QLabel('키오스크 서버: 확인 중…')
+        self.kiosk_addr_label.setStyleSheet('font-size: 12px;')
+        self.kiosk_addr_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        lay.addWidget(self.kiosk_addr_label)
+
         # 주문 단위 트리 — 부모=주문(번호표·수량·시간·상태), 자식=품목 내역. 펼치기/접기.
         self.queue_tree = QTreeWidget()
         self.queue_tree.setHeaderLabels(['주문', '수량', '시간', '상태'])
@@ -3023,6 +3048,78 @@ class PickPlaceGui(QWidget):
         self._refresh_queue()
         self.queue_status_label.setText('큐 재개됨' if now else '큐 보류됨 (새 주문 투입 정지)')
 
+    # ── 자동 정렬 + 키오스크 서버 제어 ────────────────────────────────
+    KIOSK_PORT = 8000
+
+    def _on_sort_all(self):
+        # ws/검출 물체를 클래스별 box 구역으로 자동 분류 — 로봇 즉시 동작.
+        reply = QMessageBox.question(
+            self, '자동 정렬',
+            '검출된 물체를 클래스별 box 구역으로 자동 분류합니다.\n'
+            '로봇이 즉시 동작합니다. 진행할까요?',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        self.ros_node.call_trigger_service(
+            self.ros_node.cli_sort_all, 'pick_place/sort_all')
+        self.queue_status_label.setText('자동 정렬(Sort All) 요청 전송')
+
+    def _lan_ip(self) -> str:
+        # 기본 라우트 인터페이스의 LAN IP (모바일 접속용). 실패 시 localhost.
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(('8.8.8.8', 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return 'localhost'
+
+    def _kiosk_port_open(self) -> bool:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(0.2)
+            rc = s.connect_ex(('127.0.0.1', self.KIOSK_PORT))
+            s.close()
+            return rc == 0
+        except Exception:
+            return False
+
+    def _toggle_kiosk_server(self):
+        if self._kiosk_port_open():
+            # 실행 중 → 중지. 우리가 띄운 프로세스만 종료 가능.
+            if self._kiosk_proc is not None and self._kiosk_proc.poll() is None:
+                try:
+                    os.killpg(os.getpgid(self._kiosk_proc.pid), signal.SIGINT)
+                except Exception as e:
+                    self.ros_node.get_logger().warn(f'키오스크 종료 실패: {e}')
+                self._kiosk_proc = None
+            else:
+                QMessageBox.information(
+                    self, '키오스크 서버',
+                    '외부(터미널/launch)에서 시작된 서버입니다.\n해당 터미널에서 종료하세요.')
+        else:
+            # 중지 → 시작. 자체 프로세스 그룹으로 띄워 OFF 시 그룹 종료.
+            try:
+                self._kiosk_proc = subprocess.Popen(
+                    ['ros2', 'launch', 'dsr_realsense_pick_place', 'web_kiosk.launch.py',
+                     f'kiosk_port:={self.KIOSK_PORT}', 'open_browser:=false'],
+                    start_new_session=True)
+            except Exception as e:
+                QMessageBox.warning(self, '키오스크 서버', f'시작 실패: {e}')
+        self._refresh_kiosk_status()
+
+    def _refresh_kiosk_status(self):
+        if self._kiosk_port_open():
+            url = f'http://{self._lan_ip()}:{self.KIOSK_PORT}'
+            self.kiosk_addr_label.setText(f'🟢 키오스크 ON — 모바일 접속: {url}')
+            self.kiosk_addr_label.setStyleSheet('font-size: 12px; color: #2e7d32;')
+            self.kiosk_server_button.setText('■ 키오스크 서버 OFF')
+        else:
+            self.kiosk_addr_label.setText('🔴 키오스크 서버 OFF')
+            self.kiosk_addr_label.setStyleSheet('font-size: 12px; color: #999;')
+            self.kiosk_server_button.setText('▶ 키오스크 서버 ON')
+
 
     def _update_ui(self):
         if self._shutting_down or not rclpy.ok():
@@ -3038,6 +3135,7 @@ class PickPlaceGui(QWidget):
         # 주문 큐 탭이 보일 때만 큐를 주기 갱신 (불필요한 DB 읽기 방지).
         if self.tabs.currentIndex() == self.tabs.count() - 1:
             self._refresh_queue()
+            self._refresh_kiosk_status()
         # 시스템 리셋 진행 상태 폴링
         self._poll_system_reset()
 
@@ -3163,6 +3261,7 @@ class PickPlaceGui(QWidget):
         full_system_ready  = command_enabled and is_idle and pick_svc and gripper_hw_ready
         object_buttons_enabled = full_system_ready
         self.auto_button.setEnabled(full_system_ready)
+        self.sort_all_button.setEnabled(full_system_ready)
         object_param_ready = (
             self.ros_node.cli_object_get_parameters.service_is_ready()
             and self.ros_node.cli_object_set_parameters.service_is_ready()

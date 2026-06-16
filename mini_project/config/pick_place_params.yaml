@@ -256,10 +256,12 @@ pick_place_node:
     # 센서 미연결/임계 미달 시 카메라 기반 안전바닥(pose.z + pick_z_offset)에서 파지.
     use_ultrasonic_grasp: true
     grasp_distance_m: 0.05          # 50mm 이하 감지 시 파지
-    ultrasonic_step_m: 0.01         # 1회 하강 스텝(m) — 작을수록 정밀/느림
-    ultrasonic_settle_sec: 0.05     # 스텝 후 센서 갱신 대기(s)
+    ultrasonic_step_m: 0.01         # (구 동기 하강용, 비동기에선 미사용)
+    ultrasonic_settle_sec: 0.05     # move_stop 후 정착 대기(s)
+    # 비동기 연속 하강 속도(mm/s) — 느릴수록 move_stop overshoot↓·파지 정확. 끊김 없이 내려감.
+    ultrasonic_descend_vel_mmps: 25.0
     ultrasonic_range_topic: "/ultrasonic_range"
-    ultrasonic_max_age_sec: 0.5     # 이보다 오래된 거리값은 무효 처리
+    ultrasonic_max_age_sec: 1.0     # 이보다 오래된 거리값은 무효. 아두이노 ~2Hz(0.5s)라 0.5면 항상 stale → 1.0로
 
     # --- 그리퍼 설정 ---
     # gripper_node의 motion_wait(1.5s)보다 길게 설정해야
