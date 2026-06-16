@@ -1,0 +1,17 @@
+# Python 캐시
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# colcon 산출물(워크스페이스 루트에 있지만 안전하게 무시)
+/build/
+/install/
+/log/
+.colcon/
+
+# 에디터/OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

@@ -448,12 +448,26 @@ use_ultrasonic_grasp: true
 
 수정 후 `pick_place_node` 재시작 또는 launch 재실행 필요.
 
+#### H. GUI → SQLite + HTTP 웹 제어 전환 (2026-06-16)
+
+기존 PyQt5 GUI(`gui_node.py`)가 담당하던 모든 제어 기능을 **화면 없이 SQLite 데이터베이스 + HTTP(웹 페이지/REST)** 로 수행하는 신규 노드 `web_control_node.py`로 옮겼습니다. 자세한 사용·구조는 [10.4](#104-웹-제어-sqlite--http--gui-대체)를 참고하세요.
+
+| 문제/요구 | 조치 |
+|------|------|
+| GUI(Qt) 의존 없이 원격·헤드리스 제어 필요 | `web_control_node` 신규 — 표준 라이브러리 `http.server` 기반(추가 의존성 없음) |
+| 설정·상태·명령을 DB로 일원화 | SQLite 4개 테이블(`settings`/`command_queue`/`state`/`detected_objects`)로 관리 |
+| Qt-ROS 단일 스레드 결합 제거 | HTTP 스레드 ↔ ROS 스레드를 **SQLite 명령 큐**로 분리(스레드 안전) |
+| 튜닝값 영구 저장 | DB 저장 + `pick_place_params.yaml` 해당 라인 자동 기록(인라인 주석 보존, 기존 GUI 동작 유지) |
+
+GUI는 **일시 중단**(런치 기본 `gui:=false`)이며 제거하지 않았습니다. `gui:=true`로 언제든 기존 GUI를 다시 띄울 수 있습니다. 변경 파일: `web_control_node.py`(신규), `pick_place.launch.py`, `setup.py`. 기존 코드는 주석으로 보존했습니다.
+
 ### 10.3 주요 패키지·스크립트
 
 | 경로 | 역할 |
 |------|------|
-| `mini_project/launch/pick_place.launch.py` | 전체 노드 런치 |
-| `mini_project/dsr_realsense_pick_place/gui_node.py` | PyQt GUI |
+| `mini_project/launch/pick_place.launch.py` | 전체 노드 런치 (`web:=true` 기본 → HTTP 자동 기동) |
+| `mini_project/dsr_realsense_pick_place/web_control_node.py` | **웹 제어 (SQLite + HTTP)** — GUI 대체, [10.4](#104-웹-제어-sqlite--http--gui-대체) |
+| `mini_project/dsr_realsense_pick_place/gui_node.py` | PyQt GUI (일시 중단, `gui:=true`로 사용 가능) |
 | `mini_project/dsr_realsense_pick_place/object_detector.py` | YOLO + FastSAM 검출 |
 | `mini_project/dsr_realsense_pick_place/pick_place_node.py` | 픽 FSM |
 | `dsr_gripper_tcp/` | 그리퍼 TCP 브릿지 |
@@ -465,6 +479,116 @@ use_ultrasonic_grasp: true
 | `scripts/restart_gripper_bridge.sh` | 그리퍼만 복구 |
 | `scripts/diagnose_drcf.py` | DRCF 연결 진단 |
 | `mini_project/config/pick_place_params.yaml` | 초음파 파지 거리·픽 파라미터 |
+
+### 10.4 웹 제어 (SQLite + HTTP) — GUI 대체
+
+기존 PyQt5 GUI가 하던 **물체 선택 · 로봇/그리퍼 제어 · 파라미터 튜닝 · 상태 모니터링**을 화면 없이 **SQLite 데이터베이스 + HTTP(웹 페이지/REST API)** 로 수행합니다. 노드: `web_control_node.py`.
+
+#### 실행 — 런치하면 HTTP가 자동으로 뜸
+
+`pick_place.launch.py`의 인자 `web` 기본값이 `true`라서 **런치만 하면 HTTP 서버가 자동 기동**됩니다. 별도 명령이 필요 없습니다.
+
+```bash
+# 전체 스택 실행 (웹 제어 자동 기동, GUI는 비활성)
+ros2 launch dsr_realsense_pick_place pick_place.launch.py mode:=real
+# → 브라우저에서 http://<로봇PC IP>:8080 접속
+
+# 기존 PyQt GUI를 다시 쓰고 싶으면
+ros2 launch dsr_realsense_pick_place pick_place.launch.py gui:=true web:=false
+
+# 웹 노드만 단독 실행 (포트/DB 경로 지정 예시)
+ros2 run dsr_realsense_pick_place web_control_node \
+  --ros-args -p http_port:=8080 -p db_path:=~/.config/dsr_realsense_pick_place/web_control.db
+```
+
+**런치 인자**
+
+| 인자 | 기본값 | 설명 |
+|------|--------|------|
+| `web` | `true` | 웹 제어 노드(`web_control_node`) 실행 여부 |
+| `web_host` | `0.0.0.0` | HTTP 바인드 주소 (`0.0.0.0` = 외부 접속 허용) |
+| `web_port` | `8080` | HTTP 포트 |
+| `gui` | `false` | 기존 PyQt GUI 실행 여부 (대체되어 기본 비활성) |
+
+#### 아키텍처 — SQLite를 "명령 버스 + 상태 저장소"로
+
+HTTP 요청은 요청마다 별도 스레드에서 처리되고 ROS 콜백은 `rclpy.spin` 단일 스레드에서 돕니다. 이 둘을 직접 호출로 엮으면 rclpy 객체 스레드 안전 문제가 생기므로, **모든 동작을 SQLite를 거쳐** 주고받습니다.
+
+```
+HTTP 스레드 (요청마다)              ROS 스레드 (rclpy.spin)
+─────────────────────              ─────────────────────────
+POST /api/command  ──INSERT──▶  command_queue (pending)
+                                     │  50ms 타이머가 drain
+                                     ▼  ROS 서비스/파라미터 호출
+                                command_queue (done/failed) ◀─ done_callback
+GET /api/command/{id} ◀─SELECT──────┘
+
+ROS 콜백(상태/검출물체) ──UPSERT──▶  state / detected_objects
+GET /api/state         ◀──SELECT────┘
+```
+
+- HTTP 스레드는 **DB만** 읽고 쓴다. rclpy 객체는 ROS 스레드만 만진다.
+- SQLite는 WAL 모드 + `busy_timeout`으로 교차 연결 동시 접근을 처리.
+
+#### DB 테이블 (`~/.config/dsr_realsense_pick_place/web_control.db`)
+
+| 테이블 | 역할 |
+|--------|------|
+| `settings` | 설정값(JSON)의 **단일 출처**. 부팅 시 DB값을 각 노드에 자동 적용 |
+| `command_queue` | 명령 큐 겸 **감사 로그** (`pending→running→done/failed`, 결과 메시지 포함) |
+| `state` | 실시간 상태 스냅샷(픽 상태/HW/속도/그리퍼 전류·위치/초음파/시스템 상태점) |
+| `detected_objects` | 검출 물체(도달가능 필터 결과 포함, 매 갱신마다 교체) |
+
+#### HTTP 엔드포인트
+
+| 메서드·경로 | 설명 |
+|------|------|
+| `GET /` | 제어용 웹 페이지(브라우저 "창") |
+| `GET /api/state` | 실시간 상태 + 검출 물체 + 시스템 상태점 |
+| `GET /api/settings` | 저장된 설정값 전체 |
+| `GET /api/commands` | 최근 명령 로그(30개) |
+| `GET /api/command/{id}` | 단일 명령 결과(폴링용) |
+| `GET /api/image.jpg` | 디버그 영상 1프레임(JPEG, `serve_image:=true`) |
+| `POST /api/command` | `{"action": "...", "payload": {...}}` → 명령 큐에 적재, `{id}` 반환 |
+
+```bash
+# 예: 한 번 실행 / 긴급정지 / 신뢰도 변경
+curl -X POST http://localhost:8080/api/command -H 'Content-Type: application/json' -d '{"action":"run_once"}'
+curl -X POST http://localhost:8080/api/command -H 'Content-Type: application/json' -d '{"action":"e_stop"}'
+curl -X POST http://localhost:8080/api/command -H 'Content-Type: application/json' -d '{"action":"set_confidence","payload":{"value":0.4}}'
+```
+
+#### 지원 명령(action) — 기존 GUI 버튼 전체 대응
+
+| 분류 | action |
+|------|--------|
+| 긴급 제어 | `e_stop`, `cancel`, `e_stop_reset`, `clear_error` |
+| 로봇 동작 | `run_once`, `go_home`, `recover_to_home`, `speed_normal`, `speed_reduced`, `servo_on`, `servo_off`, `safety_normal`, `safety_backdrive` |
+| 그리퍼 | `gripper_open`, `gripper_close`, `gripper_enable`(`{enable}`), `gripper_reinit`, `restart_gripper_bridge` |
+| 물체 선택 | `select_object`(`{label}`, 빈 문자열=자동) |
+| 검출·카메라 | `set_confidence`(`{value}`), `set_camera_auto_exposure`(`{enable}`), `set_camera_exposure`(`{value}`) |
+| 캘리브레이션 | `set_calibration`(`{x,y,z}`, IDLE 전용), `load_calibration` |
+| 그리퍼 정밀/안전 | `set_gripper_params`(`{open_current,close_current,transport_current,profile_velocity,profile_acceleration}`), `set_min_safe_z`(`{value}`, IDLE 전용) |
+| 물체별 파지 강도 | `set_grip_strength`(`{names,currents,default}` — `object_detector.known_classes`도 동기화) |
+| 모델/시스템 | `set_model`(`{path}`), `save_yaml`, `system_reset` |
+
+#### 설정 영속화 — DB + yaml 동시 기록
+
+설정 변경 명령(`set_confidence` / `set_calibration` / `set_gripper_params` / `set_min_safe_z` / `set_grip_strength`)은 **DB에 즉시 저장**되고, 동시에 `config/pick_place_params.yaml`의 해당 라인을 **인라인 주석을 보존하며** 자동 갱신합니다(기존 GUI의 "yaml 저장" 동작 유지). 웹 페이지의 **`💾 전체 yaml 저장`** 버튼(또는 `save_yaml` action)으로 현재 DB 설정 전체를 수동으로 yaml에 다시 쓸 수도 있습니다.
+
+- yaml↔DB 매핑: `confidence_threshold`, `absolute_calib_{x,y,z}_mm`, `open_current`, `close_current`, `transport_current`, `profile_velocity`, `profile_acceleration`, `min_safe_z`, `grip_current_default`, `grip_class_names`, `grip_class_currents`, `known_classes`(= `grip_class_names` 미러).
+- 부팅 시 DB→노드 재적용 명령은 yaml을 건드리지 않습니다(부팅마다 파일 churn 방지).
+
+#### 참고 / 주의
+
+- **카메라 영상**: `serve_image:=true`(기본)일 때 `/detection_debug_image`를 JPEG로 인코딩해 `/api/image.jpg`로 제공. `cv_bridge`/`cv2` 미가용 시 자동 비활성.
+- **IDLE 전용 동작**: 캘리브레이션·`min_safe_z` 적용은 픽 상태가 `IDLE`일 때만 허용(기존 GUI와 동일).
+- **명령이 `running`에 머물 때**: 대상 노드가 응답해야 완료됩니다. 예) `pick_place_node`는 기동 시 로봇 모션 서비스를 기다리느라(`_wait_for_services`) **로봇 미연결 상태에서는 파라미터 요청에 응답하지 못해** 명령이 `running`으로 남을 수 있습니다. 로봇 연결 후 정상 처리됩니다.
+- **도달 불가 물체**: 워크스페이스/반경 필터(`workspace_*`, `reach_radius_max`) 밖 물체는 `reachable:false`로 표시되어 웹에서 선택 비활성.
+
+#### 검증(하드웨어 미연결 상태)
+
+웹/DB/yaml 계층은 로봇·카메라·아두이노 없이도 동작 확인됨: 웹 페이지·REST 응답, 설정 시드, 명령 큐 drain, 상태 스냅샷, **설정→DB+yaml 기록**(인라인 주석 보존) 모두 정상. `object_detector`·`rh_p12_rna_gripper` 파라미터 적용(`set_confidence`/`set_calibration`/`set_gripper_params`)은 해당 노드만 헤드리스로 띄워도 `적용 완료` 확인됨. `pick_place_node` 파라미터는 위 "주의"대로 로봇 연결 후 적용됩니다.
 
 ---
 

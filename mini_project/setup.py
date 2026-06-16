@@ -38,7 +38,10 @@ setup(
             # ros2 run 으로 실행할 엔트리포인트 등록
             'object_detector = dsr_realsense_pick_place.object_detector:main',
             'pick_place_node = dsr_realsense_pick_place.pick_place_node:main',
+            # gui_node(PyQt5)는 SQLite+HTTP 웹 제어(web_control_node)로 대체되어 일시 중단.
+            # 엔트리포인트는 유지하므로 필요 시 `ros2 run ... gui_node` 로 여전히 실행 가능.
             'gui_node = dsr_realsense_pick_place.gui_node:main',
+            'web_control_node = dsr_realsense_pick_place.web_control_node:main',
             'gripper_node = dsr_realsense_pick_place.gripper_node:main',
             'ultrasonic_node = dsr_realsense_pick_place.ultrasonic_node:main',
         ],
