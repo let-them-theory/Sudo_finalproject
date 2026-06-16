@@ -99,7 +99,9 @@ from std_msgs.msg import Int32, String
 from std_srvs.srv import SetBool, Trigger
 from dsr_gripper_tcp_interfaces.msg import GripperState
 
-from PyQt5.QtWidgets import QTreeWidget, QTreeWidgetItem, QMessageBox
+from PyQt5.QtWidgets import (
+    QTreeWidget, QTreeWidgetItem, QMessageBox, QListWidget, QListWidgetItem, QSplitter)
+from collections import deque as _deque
 from dsr_realsense_pick_place.task_repository import JsonRepository, OrderStatus, ItemStatus
 
 # 상태 영문 → 한글 (USER 탭 표시).
@@ -269,6 +271,9 @@ class PickPlaceGuiNode(Node):
         self.selected_label = ''
         self.pick_place_state = 'IDLE'
         self.last_error_text = ''
+        # USER 탭 에러로그 버퍼 (seq, 시각, 메시지) — _cb_error가 적재, GUI가 새 seq만 표시.
+        self._error_log = _deque(maxlen=200)
+        self._error_seq = 0
         self._latest_raw_detections = []
         self.last_image_time = 0.0
         self.last_objects_time = 0.0
@@ -775,6 +780,9 @@ class PickPlaceGuiNode(Node):
     def _cb_error(self, msg: String):
         # ERROR 진입 시 분류된 에러 사유 — _update_ui에서 좌상단 배너에 표시(GUI 스레드 안전).
         self.last_error_text = msg.data
+        # USER 탭 에러로그용 버퍼 (최근 200개). _seq로 GUI가 새 항목만 추가.
+        self._error_seq += 1
+        self._error_log.append((self._error_seq, time.strftime('%H:%M:%S'), msg.data))
 
     def _cb_ultrasonic(self, msg: Range):
         if msg.range is not None and msg.range > 0.0:
@@ -2893,23 +2901,84 @@ class PickPlaceGui(QWidget):
         self.kiosk_addr_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         lay.addWidget(self.kiosk_addr_label)
 
-        # 주문 단위 트리 — 부모=주문(번호표·수량·시간·상태), 자식=품목 내역. 펼치기/접기.
+        # ── 상/하 분할: 상부=주문 큐, 하부=에러 로그 ──────────────────
+        splitter = QSplitter(Qt.Vertical)
+
+        # [상부] 주문 큐
+        q_box = QWidget()
+        q_lay = QVBoxLayout(q_box)
+        q_lay.setContentsMargins(0, 0, 0, 0)
+        q_lay.addWidget(QLabel('📋 주문 큐 (진행중=초록)'))
         self.queue_tree = QTreeWidget()
         self.queue_tree.setHeaderLabels(['주문', '수량', '시간', '상태'])
         self.queue_tree.setColumnWidth(0, 120)
         self.queue_tree.setColumnWidth(1, 56)
         self.queue_tree.setColumnWidth(2, 64)
         self.queue_tree.setRootIsDecorated(True)
-        # 체크박스 선택 보존 — 100ms 갱신으로 트리가 clear돼도 체크 유지.
         self._checked_orders: set = set()
         self._building_queue = False
         self.queue_tree.itemChanged.connect(self._on_queue_check)
-        lay.addWidget(self.queue_tree)
-
+        q_lay.addWidget(self.queue_tree)
         self.queue_status_label = QLabel('주문 0건')
         self.queue_status_label.setStyleSheet('color: #aaa; font-size: 12px;')
-        lay.addWidget(self.queue_status_label)
+        q_lay.addWidget(self.queue_status_label)
+        splitter.addWidget(q_box)
+
+        # [하부] 에러/경고 로그 — 🔴 ERR(시스템 마비) / 🟠 WAR(실패하나 진행가능)
+        e_box = QWidget()
+        e_lay = QVBoxLayout(e_box)
+        e_lay.setContentsMargins(0, 0, 0, 0)
+        e_top = QHBoxLayout()
+        e_top.addWidget(QLabel('🚨 에러 로그  (🔴ERR 마비 / 🟠WAR 실패·진행가능)'))
+        e_top.addStretch(1)
+        self.error_clear_button = QPushButton('로그 지우기')
+        self.error_clear_button.setFixedHeight(24)
+        self.error_clear_button.clicked.connect(self._clear_error_log)
+        e_top.addWidget(self.error_clear_button)
+        e_lay.addLayout(e_top)
+        self.error_log_list = QListWidget()
+        self.error_log_list.setStyleSheet(
+            'QListWidget{background:#1b1b1b; font-family:monospace; font-size:12px;}')
+        self._error_log_last_seq = 0   # 표시한 마지막 seq
+        e_lay.addWidget(self.error_log_list)
+        splitter.addWidget(e_box)
+
+        splitter.setStretchFactor(0, 3)   # 큐를 더 크게
+        splitter.setStretchFactor(1, 2)
+        lay.addWidget(splitter)
         return w
+
+    def _clear_error_log(self):
+        self.error_log_list.clear()
+        # 이후 들어오는 항목만 다시 표시 (버퍼는 ros_node쪽, 표시 커서만 최신으로).
+        self._error_log_last_seq = self.ros_node._error_seq
+
+    def _error_severity(self, text: str):
+        """에러 메시지 → (심각도, 색). ERR=시스템 마비(빨강), WAR=실패하나 진행가능(주황)."""
+        t = (text or '').lower()
+        # 시스템 마비급 — status3, 도달불가(IK), 충돌, 긴급정지, 명시 [ERR]
+        if ('status 3' in t or 'status3' in t or 'io_error' in t or '🔴' in text
+                or 'reachable' in t or '1206' in t or 'collision' in t or '충돌' in t
+                or 'emergency' in t or '[err]' in t):
+            return 'ERR', '#ff5555'
+        # 실패하나 진행 가능 — 파지실패, 검출 타임아웃, 명시 [WAR]
+        return 'WAR', '#ffa033'
+
+    def _refresh_error_log(self):
+        # ros_node 버퍼에서 아직 표시 안 한 seq만 추가 (색·아이콘 부여).
+        for seq, ts, text in list(self.ros_node._error_log):
+            if seq <= self._error_log_last_seq:
+                continue
+            self._error_log_last_seq = seq
+            sev, color = self._error_severity(text)
+            icon = '🔴' if sev == 'ERR' else '🟠'
+            item = QListWidgetItem(f'{icon} [{ts}] {sev}  {text}')
+            item.setForeground(QColor(color))
+            self.error_log_list.addItem(item)
+            self.error_log_list.scrollToBottom()
+        # 200개 넘으면 오래된 것 제거
+        while self.error_log_list.count() > 200:
+            self.error_log_list.takeItem(0)
 
     def _refresh_queue(self):
         if self._order_repo is None:
@@ -2956,6 +3025,13 @@ class PickPlaceGui(QWidget):
             hhmm = o.created_at[11:16] if len(o.created_at) >= 16 else ''
             parent = QTreeWidgetItem([
                 o.ticket_no, f'{len(items)}개', hhmm, _KR_STATUS.get(o.status, o.status)])
+            # 진행중(RUNNING)=초록, 일시정지=주황 — 가독성.
+            if o.status == OrderStatus.RUNNING:
+                for _c in range(4):
+                    parent.setForeground(_c, QColor('#33cc66'))
+            elif o.status == OrderStatus.PAUSED:
+                for _c in range(4):
+                    parent.setForeground(_c, QColor('#ffa033'))
             parent.setData(0, Qt.UserRole, o.order_id)   # 취소용 order_id
             parent.setFlags(parent.flags() | Qt.ItemIsUserCheckable)
             parent.setCheckState(
@@ -3136,6 +3212,7 @@ class PickPlaceGui(QWidget):
         if self.tabs.currentIndex() == self.tabs.count() - 1:
             self._refresh_queue()
             self._refresh_kiosk_status()
+            self._refresh_error_log()
         # 시스템 리셋 진행 상태 폴링
         self._poll_system_reset()
 

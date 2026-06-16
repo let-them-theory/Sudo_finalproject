@@ -1190,8 +1190,9 @@ class PickPlaceNode(Node):
                 except _Unreachable as ue:
                     # status3 방어: 도달불가(1206)가 sort_all 등 명령 경로로 빠져나와도 여기서
                     # RESET_ALARM으로 잔존알람을 끊는다(안 그러면 DRL/그리퍼 status3 cascade).
-                    self.get_logger().warn(f'🔴 도달 불가({command}) — 알람 리셋 후 정지: {ue}')
-                    self._publish_error(str(ue))
+                    self._log_failure('도달불가(명령경로)', str(ue),
+                                      obj=self._target_object_class, dest=self._dest_str(),
+                                      severity='ERR')
                     self._reset_controller_alarm('도달불가 후 알람 리셋(명령 경로)')
                     self._set_state(State.ERROR)
                 except Exception as e:
@@ -1215,7 +1216,9 @@ class PickPlaceNode(Node):
 
                     if hasattr(self, 'detecting_start_time') and self.detecting_start_time > 0:
                         if time.monotonic() - self.detecting_start_time > 10.0:
-                            self.get_logger().error('타겟 좌표 수신 타임아웃 (10초 초과). 카메라 연결 또는 검출 실패. IDLE 상태로 복귀합니다.')
+                            self._log_failure(
+                                'DETECTING', '타겟 좌표 수신 타임아웃(10s) — 검출 실패/물체 없음',
+                                obj=self._selected_object_label or 'auto')
                             self._finish_cycle()
                             continue
 
@@ -1267,12 +1270,14 @@ class PickPlaceNode(Node):
                     # close 순간의 지터·통신노이즈를 피해 안정된 시점에 판정한다.
                     grasp_pos = self._gripper_last_pos
                     if grasp_pos <= self.grasp_min_pos:
-                        self.get_logger().error(
-                            f'파지 실패 — 그리퍼 안 닫힘 (pos={grasp_pos:.0f} ≤ {self.grasp_min_pos}). HOME 복귀.')
+                        self._log_failure(
+                            'LIFT', f'그리퍼 안 닫힘 (pos={grasp_pos:.0f} ≤ {self.grasp_min_pos})',
+                            obj=self._target_object_class, dest=self._dest_str())
                         self._set_state(State.HOME)
                     elif grasp_pos > self.max_grip_pos:
-                        self.get_logger().error(
-                            f'파지 실패 — 빈손 완전닫힘 (pos={grasp_pos:.0f} > {self.max_grip_pos}). HOME 복귀.')
+                        self._log_failure(
+                            'LIFT', f'빈손 완전닫힘 (pos={grasp_pos:.0f} > {self.max_grip_pos})',
+                            obj=self._target_object_class, dest=self._dest_str())
                         self._set_state(State.HOME)
                     else:
                         self.get_logger().info(f'파지 확정 (pos={grasp_pos:.0f}).')
@@ -1365,11 +1370,14 @@ class PickPlaceNode(Node):
                     self._finish_cycle()
 
             except _Unreachable as ue:
-                self.get_logger().warn(f'🔴 도달 불가 — 물체 건너뜀: {ue}')
-                self._publish_error(str(ue))
                 with self.state_lock:
                     st = self.state
-                if st in (State.LIFT, State.MOVE_TO_PLACE, State.PLACE):
+                # 파지 후면 ERR(물체 든 채 마비급), 잡기 전이면 WAR(스킵 가능).
+                _post_grasp = st in (State.LIFT, State.MOVE_TO_PLACE, State.PLACE)
+                self._log_failure('도달불가', str(ue), obj=self._target_object_class,
+                                  dest=self._dest_str(),
+                                  severity='ERR' if _post_grasp else 'WAR')
+                if _post_grasp:
                     # 이미 파지한 뒤 → 허공 낙하 방지 위해 그리퍼 안 건드리고 ERROR(수동 복구)
                     self.get_logger().warn('이미 파지 상태 — 안전하게 ERROR로 정지(물체 든 채).')
                     self._set_state(State.ERROR)
@@ -1539,8 +1547,9 @@ class PickPlaceNode(Node):
 
             grasp_pos = self._gripper_last_pos
             if grasp_pos <= self.grasp_min_pos or grasp_pos > self.max_grip_pos:
-                self.get_logger().error(
-                    f'파지 실패 (pos={grasp_pos:.0f}) — 홈 복귀 후 다음 물체 시도')
+                self._log_failure('LIFT(sort)', f'파지 실패 pos={grasp_pos:.0f}',
+                                  obj=object_class, dest=f'box_roi{(place_zone_idx or 0) + 1}'
+                                  if place_zone_idx is not None else '')
                 with self.state_lock:
                     self.pick_requested = False
                 self._set_state(State.HOME)
@@ -2232,6 +2241,33 @@ class PickPlaceNode(Node):
         msg = String()
         msg.data = self._classify_error(text)
         self.pub_error.publish(msg)
+
+    def _log_failure(self, stage: str, reason: str, obj: str = '',
+                     dest: str = '', severity: str = 'WAR'):
+        """작업 실패를 구조화 로그 + /pick_place_error 발행. (어느 작업/시퀀스/물체/목적지/이유)
+        severity: WAR=실패하나 진행가능 / ERR=시스템 마비(status3 등). 목적지(place) 있으면 함께 남김."""
+        cmd = self.pending_command or ('package' if self._package_mode
+                                       else ('sort_all' if self._sort_active else 'run_once'))
+        dest_s = f' dest={dest}' if dest else ''
+        detail = f'[{severity}] cmd={cmd} stage={stage} obj={obj or "?"}{dest_s} 사유={reason}'
+        if severity == 'ERR':
+            self.get_logger().error(detail)
+        else:
+            self.get_logger().warn(detail)
+        msg = String()
+        msg.data = detail
+        self.pub_error.publish(msg)
+
+    def _dest_str(self):
+        """현재 사이클의 place 목적지 문자열 — package/zone/좌표. 로그용."""
+        if self._package_mode:
+            return f'package{list(self.package_pos)}'
+        zi = self._active_place_zone_idx
+        if zi is not None:
+            return f'box_roi{zi + 1}'
+        if self._target_place_zone:
+            return f'box_roi{self._target_place_zone}'
+        return ''
 
     def _set_motion_active(self, active: bool):
         """모션(movel/movej/move_stop) 진행을 그리퍼 폴링에 알림 → 모션 중 폴링 skip(컨트롤러 경합·소켓 오염 회피)."""

@@ -29,7 +29,9 @@ PRODUCT_DISPLAY = {
 KNOWN_CLASSES = list(PRODUCT_DISPLAY.keys())
 
 ABNORMAL_STATES = {'ERROR', 'EMERGENCY_STOP'}
-GRASPED_STATES = {'LIFT', 'MOVE_TO_PLACE', 'PLACE', 'POST_PLACE'}
+# 성공(파지+이송) 판정 — MOVE_TO_PLACE 도달 = LIFT 파지판정 통과 후 이송 시작 = 진짜 파지 성공.
+# LIFT는 파지판정 단계라(여기서 실패하면 HOME行) 성공으로 보면 false-DONE 발생 → 제외.
+GRASPED_STATES = {'MOVE_TO_PLACE', 'PLACE', 'POST_PLACE'}
 INJECT_REPLY_TIMEOUT = 5.0   # run_once 응답 대기 한계(s). 초과 시 큐 영구정지 방지 복구.
 
 
@@ -131,7 +133,12 @@ class KioskBackend(Node):
                 self._item_grasped = False
                 self.repo.set_item_status(
                     iid, ItemStatus.DONE if done else ItemStatus.FAILED)
-                self.get_logger().info(f'item {iid} {"완료" if done else "미파지→FAILED"}')
+                if done:
+                    self.get_logger().info(f'item {iid} 완료(DONE)')
+                else:
+                    # DONE으로 두지 않고 실패 사유를 남긴다(어느 작업/시퀀스/이유).
+                    self.get_logger().error(
+                        f'item {iid} FAILED — 사유: {self.last_error_text or "미상(파지/이송 미완)"}')
                 self._emit_queue_if_changed()
             return
         if state != 'IDLE':
