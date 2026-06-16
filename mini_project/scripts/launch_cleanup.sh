@@ -8,7 +8,7 @@ ROBOT_NS="${ROBOT_NS:-dsr01}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
-source "${SCRIPT_DIR}/../../_source_workspace.sh"
+source "${SCRIPT_DIR}/../_source_workspace.sh"
 
 echo "[launch_cleanup] launch 종료 — 그리퍼·pick_place 잔여 프로세스 정리"
 

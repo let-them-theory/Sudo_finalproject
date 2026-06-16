@@ -48,7 +48,7 @@ class UltrasonicNode(Node):
         baudrate = int(self.get_parameter('baudrate').value)
         self._frame_id = self.get_parameter('frame_id').value
 
-        self._pub = self.create_publisher(Range, 'ultrasonic_range', 10)
+        self._pub = self.create_publisher(Range, '/ultrasonic_range', 10)
 
         try:
             self._ser = serial.Serial(port, baudrate, timeout=1.0)

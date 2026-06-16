@@ -8,7 +8,7 @@ from launch_ros.actions import Node
 
 def generate_launch_description() -> LaunchDescription:
     args = [
-        DeclareLaunchArgument('controller_host', default_value='110.120.1.56'),
+        DeclareLaunchArgument('controller_host', default_value='110.120.1.50'),
         DeclareLaunchArgument('tcp_port', default_value='20002'),
         DeclareLaunchArgument('namespace', default_value='dsr01'),
         DeclareLaunchArgument('service_prefix', default_value=''),

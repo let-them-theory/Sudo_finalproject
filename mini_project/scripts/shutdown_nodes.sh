@@ -3,7 +3,7 @@
 #
 # 종료 순서 (재연결 실패 방지):
 #   0. pick_place 정지
-#   1. DrlStop 서비스 (ros2_control 살아있을 때 — 플랜지 RS-485 해제)
+#   1. DrlStop 서비스 (잔여 DRL 있으면 정지)
 #   2. gripper_service / gripper_node SIGTERM (bridge.close → DrlStop 재시도)
 #   3. vision·보조 노드
 #   4. ros2_control_node SIGTERM (Drfl.close_connection — DRCF authority 해제)
@@ -31,7 +31,7 @@ done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
-source "${SCRIPT_DIR}/../../_source_workspace.sh"
+source "${SCRIPT_DIR}/../_source_workspace.sh"
 
 wait_gone() {
   local pattern="$1"
@@ -82,6 +82,10 @@ fi
 
 echo "[shutdown] [3/6] vision·보조 노드 SIGTERM..."
 term_pattern "lib/dsr_realsense_pick_place/object_detector"
+term_pattern "lib/dsr_realsense_pick_place/gui_node"
+term_pattern "gui_node"
+term_pattern "lib/dsr_realsense_pick_place/gui_node"
+term_pattern "gui_node"
 term_pattern "lib/dsr_realsense_pick_place/ultrasonic_node"
 term_pattern "object_detector"
 term_pattern "ultrasonic_node"
@@ -115,6 +119,7 @@ for pat in \
   gripper_node \
   pick_place_node \
   object_detector \
+  gui_node \
   ultrasonic_node \
   realsense2_camera_node \
   static_transform_publisher \
