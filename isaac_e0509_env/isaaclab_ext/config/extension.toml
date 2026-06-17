@@ -1,0 +1,21 @@
+[package]
+
+version = "0.1.0"
+category = "isaaclab"
+readme = "README.md"
+
+title = "Isaac E0509 Pick Place"
+author = "sudo_ws"
+maintainer = "sudo_ws"
+description = "Doosan E0509 + RH-P12 gripper environments for Isaac Lab"
+repository = "https://github.com/isaac-sim/IsaacLab"
+keywords = ["doosan", "e0509", "manipulation", "reach", "isaaclab"]
+
+[dependencies]
+"isaaclab" = {}
+"isaaclab_assets" = {}
+"isaaclab_tasks" = {}
+"isaaclab_rl" = {}
+
+[[python.module]]
+name = "isaac_e0509_pick_place"

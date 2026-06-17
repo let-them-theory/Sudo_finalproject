@@ -1473,7 +1473,8 @@ class PickPlaceNode(Node):
         self.pub_sort_ws_only.publish(msg)
 
     def _execute_sort_all_impl(self):
-        """
+        """작업공간 내 모든 물체를 클래스별 지정 위치로 정렬한다 (실제 루프).
+
         동작:
           1. AUTO 모드 확인
           2. 자동(nearest) 검출 → 해당 클래스의 sort place pos 선택

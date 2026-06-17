@@ -755,6 +755,13 @@ class ObjectDetectorNode(Node):
         self._detect_thread = threading.Thread(target=self._detect_worker, daemon=True)
         self._detect_thread.start()
 
+        # ── 검출 워커 스레드 ─────────────────────────────────────────────
+        # 카메라 콜백은 프레임을 큐에 넣고 즉시 반환 → ApproximateTimeSynchronizer 드랍 방지
+        # 워커 스레드가 큐에서 프레임을 꺼내 YOLO+FastSAM 추론(100-500ms)을 수행한다.
+        self._detect_queue: queue.Queue = queue.Queue(maxsize=1)
+        self._detect_thread = threading.Thread(target=self._detect_worker, daemon=True)
+        self._detect_thread.start()
+
         # ── 발행 ────────────────────────────────────────────────────────
         self.pub_pose = self.create_publisher(PoseStamped,
                                               '/detected_object_pose', 10)

@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+assets/usd/*.usd
+assets/urdf/e0509_gripper_isaac/
