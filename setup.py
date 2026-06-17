@@ -30,7 +30,8 @@ setup(
         (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
         (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
         (os.path.join('share', package_name, 'scripts'), glob('scripts/*.sh') + glob('scripts/*.py')),
-        (os.path.join('share', package_name, 'models'), glob('models/*.pt')),
+        (os.path.join('share', package_name, 'models'),
+         glob('models/*.pt') + glob('mini_project/models/*.pt')),
         # user web 키오스크 백엔드(스크립트)를 share에 설치 — launch에서 절대경로로 실행.
         (os.path.join('share', package_name, 'web_kiosk', 'backend'),
          glob('web_kiosk/backend/*.py')),

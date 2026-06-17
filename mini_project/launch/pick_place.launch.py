@@ -19,7 +19,7 @@ from ament_index_python.packages import get_package_share_directory
 
 
 ARGUMENTS = [
-    DeclareLaunchArgument('mode',  default_value='virtual',
+    DeclareLaunchArgument('mode',  default_value='real',
                           description='virtual | real'),
 
     DeclareLaunchArgument('host',  default_value='110.120.1.50',
@@ -58,7 +58,7 @@ ARGUMENTS = [
                           description='Fallback: launch에서 set_robot_mode service call 실행 여부'),
     DeclareLaunchArgument('gripper_tcp_port', default_value='20002',
                           description='그리퍼 TCP 서버 포트'),
-    DeclareLaunchArgument('use_ultrasonic', default_value='true',
+    DeclareLaunchArgument('use_ultrasonic', default_value='false',
                           description='아두이노 HC-SR04 초음파 거리 노드 실행 여부'),
     DeclareLaunchArgument('ultrasonic_port', default_value='/dev/ttyACM0',
                           description='아두이노 시리얼 포트'),

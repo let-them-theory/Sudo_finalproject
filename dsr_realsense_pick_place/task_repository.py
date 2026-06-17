@@ -13,6 +13,8 @@ User GUI 데이터 계층. ROS 비의존 순수 모듈 — User_gui_node가 impo
 from __future__ import annotations
 
 import json
+import random
+import string
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, asdict
@@ -56,6 +58,7 @@ class OrderItem:
     order_id: str
     class_name: str
     status: str = ItemStatus.QUEUED
+    retry_count: int = 0
 
 
 @dataclass
@@ -65,6 +68,7 @@ class Order:
     status: str = OrderStatus.QUEUED
     created_at: str = ''
     item_ids: list = field(default_factory=list)
+    pickup_code: str = ''      # 수령 확인 코드 (예: "A3K9")
 
 
 # ─── 리포지토리 인터페이스 ──────────────────────────────────
@@ -103,6 +107,8 @@ class TaskRepository(ABC):
     @abstractmethod
     def set_item_status(self, item_id: str, status: str) -> None: ...
     @abstractmethod
+    def retry_or_fail(self, item_id: str, max_retries: int = 3) -> bool: ...
+    @abstractmethod
     def cancel_item(self, item_id: str) -> None: ...
     @abstractmethod
     def reorder_item(self, item_id: str, new_index: int) -> None:
@@ -111,6 +117,26 @@ class TaskRepository(ABC):
     # history
     @abstractmethod
     def list_history(self) -> list[dict]: ...
+
+    # pick stats
+    @abstractmethod
+    def record_pick_result(self, class_name: str, success: bool, reason: str = '') -> None: ...
+    @abstractmethod
+    def get_pick_stats(self) -> list[dict]: ...
+
+    # zone occupancy
+    @abstractmethod
+    def get_zones(self, max_zones: int = 6) -> list[dict]: ...
+    @abstractmethod
+    def occupy_next_zone(self, class_name: str, order_id: str, max_zones: int = 6) -> int | None: ...
+    @abstractmethod
+    def clear_zone(self, zone_id: int) -> None: ...
+    @abstractmethod
+    def is_all_zones_full(self, max_zones: int = 6) -> bool: ...
+
+    # stock management
+    @abstractmethod
+    def set_stock(self, class_name: str, qty: int) -> None: ...
 
 
 # ─── JSON 구현 ──────────────────────────────────────────────
@@ -189,11 +215,21 @@ class JsonRepository(TaskRepository):
     # ── order ──
     def create_order(self, lines: list[tuple[str, int]]) -> Order:
         with self._lock:
+            # 재고 검증: 주문 수량 > 현재 재고면 ValueError
+            for class_name, qty in lines:
+                cat = self._data['catalog'].get(class_name)
+                stock = int(cat.get('stock', 0)) if cat else 0
+                if stock < max(0, int(qty)):
+                    display = (cat.get('display_name', class_name) if cat else class_name)
+                    raise ValueError(
+                        f"재고 부족: '{display}' 재고={stock}, 주문={int(qty)}")
+
             self._data['order_counter'] += 1
             self._data['ticket_counter'] += 1
             oid = f"order{self._data['order_counter']}"
             ticket = f"A-{self._data['ticket_counter']:03d}"
-            order = Order(order_id=oid, ticket_no=ticket,
+            pickup_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
+            order = Order(order_id=oid, ticket_no=ticket, pickup_code=pickup_code,
                           status=OrderStatus.QUEUED, created_at=self._now())
             k = 0
             for class_name, qty in lines:
@@ -291,6 +327,30 @@ class JsonRepository(TaskRepository):
             self._refresh_order_status(it['order_id'])
             self._save()
 
+    def retry_or_fail(self, item_id: str, max_retries: int = 3) -> bool:
+        """픽 실패 후 재시도 여부 결정. True=재시도(큐 뒤로 이동), False=FAILED 확정."""
+        with self._lock:
+            it = self._data['items'].get(item_id)
+            if it is None:
+                return False
+            count = int(it.get('retry_count', 0))
+            if count < max_retries:
+                it['retry_count'] = count + 1
+                it['status'] = ItemStatus.QUEUED
+                q = self._data['queue']
+                if item_id in q:
+                    q.remove(item_id)
+                q.append(item_id)
+                self._save()
+                return True
+            else:
+                it['status'] = ItemStatus.FAILED
+                self._append_history_locked(it, ItemStatus.FAILED)
+                self._remove_from_queue(item_id)
+                self._refresh_order_status(it['order_id'])
+                self._save()
+                return False
+
     def cancel_item(self, item_id: str) -> None:
         self.set_item_status(item_id, ItemStatus.CANCELED)
 
@@ -308,6 +368,75 @@ class JsonRepository(TaskRepository):
     def list_history(self) -> list[dict]:
         with self._lock:
             return list(self._data['history'])
+
+    # ── pick stats ──
+    def record_pick_result(self, class_name: str, success: bool, reason: str = '') -> None:
+        with self._lock:
+            stats = self._data.setdefault('pick_stats', {})
+            s = stats.setdefault(class_name, {'success': 0, 'fail': 0,
+                                               'last_fail_reason': '', 'last_fail_at': ''})
+            if success:
+                s['success'] = int(s.get('success', 0)) + 1
+            else:
+                s['fail'] = int(s.get('fail', 0)) + 1
+                s['last_fail_reason'] = reason
+                s['last_fail_at'] = self._now()
+            self._save()
+
+    def get_pick_stats(self) -> list[dict]:
+        with self._lock:
+            return [{'class_name': cn, **s}
+                    for cn, s in self._data.get('pick_stats', {}).items()]
+
+    # ── zone occupancy ──
+    def get_zones(self, max_zones: int = 6) -> list[dict]:
+        with self._lock:
+            zones = self._data.get('zones', {})
+            result = []
+            for i in range(max_zones):
+                z = zones.get(str(i), {})
+                result.append({
+                    'zone_id': i,
+                    'occupied': bool(z.get('occupied', False)),
+                    'class_name': z.get('class_name', ''),
+                    'order_id': z.get('order_id', ''),
+                    'placed_at': z.get('placed_at', ''),
+                })
+            return result
+
+    def occupy_next_zone(self, class_name: str, order_id: str, max_zones: int = 6) -> int | None:
+        with self._lock:
+            zones = self._data.setdefault('zones', {})
+            for i in range(max_zones):
+                key = str(i)
+                if not zones.get(key, {}).get('occupied', False):
+                    zones[key] = {'occupied': True, 'class_name': class_name,
+                                  'order_id': order_id, 'placed_at': self._now()}
+                    self._save()
+                    return i
+            return None  # 모든 zone 점유됨
+
+    def clear_zone(self, zone_id: int) -> None:
+        with self._lock:
+            self._data.setdefault('zones', {})[str(zone_id)] = {
+                'occupied': False, 'class_name': '', 'order_id': '', 'placed_at': ''
+            }
+            self._save()
+
+    def is_all_zones_full(self, max_zones: int = 6) -> bool:
+        with self._lock:
+            zones = self._data.get('zones', {})
+            occupied = sum(1 for z in zones.values() if z.get('occupied', False))
+            return occupied >= max_zones
+
+    # ── stock management ──
+    def set_stock(self, class_name: str, qty: int) -> None:
+        with self._lock:
+            d = self._data['catalog'].get(class_name)
+            if d is None:
+                return
+            d['stock'] = max(0, int(qty))
+            self._save()
 
     # ── 내부 헬퍼 (락 보유 중 호출) ──
     def _remove_from_queue(self, item_id: str) -> None:

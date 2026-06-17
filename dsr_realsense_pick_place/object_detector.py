@@ -51,6 +51,25 @@ import tf2_geometry_msgs  # noqa: F401  (transform 메서드 등록용)
 from rcl_interfaces.msg import SetParametersResult
 
 
+def _resolve_inference_device() -> str:
+    """CUDA sm_120(Blackwell RTX 5080 등) 미지원 GPU 환경에서 CPU로 자동 fallback.
+    torch.cuda.is_available()은 True여도 실제 커널 실행이 불가할 수 있으므로
+    더미 텐서 연산으로 직접 확인한다."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return 'cpu'
+        t = torch.zeros(1, device='cuda')
+        _ = t + t
+        torch.cuda.synchronize()
+        return '0'
+    except Exception:
+        return 'cpu'
+
+
+_INFER_DEVICE = _resolve_inference_device()
+
+
 class TrackedDetectionManager:
     """ultralytics tracker ID를 사람이 읽기 쉬운 표시 번호로 매핑한다 (클래스별 격리).
 
@@ -907,11 +926,7 @@ class ObjectDetectorNode(Node):
         try:
             from ultralytics import FastSAM
             self.fastsam = FastSAM(weights)
-            try:
-                import torch
-                self.fastsam_device = 0 if torch.cuda.is_available() else 'cpu'
-            except Exception:
-                self.fastsam_device = 'cpu'
+            self.fastsam_device = _INFER_DEVICE
             self.get_logger().info(
                 f'FastSAM 로드 완료: {weights} (device={self.fastsam_device}) — unknown 검출 ON')
             return True
@@ -2388,7 +2403,8 @@ class ObjectDetectorNode(Node):
             masked[y1:y2, x1:x2] = img[y1:y2, x1:x2]   # ROI만 남기고 검정 (전체 크기 유지)
             try:
                 results = self.model.predict(
-                    masked, conf=self.conf_thresh, verbose=False)
+                    masked, conf=self.conf_thresh, verbose=False,
+                    device=_INFER_DEVICE)
             except Exception as e:
                 self.get_logger().warn(f'per-ROI predict 실패: {e}',
                                        throttle_duration_sec=5.0)
@@ -2433,7 +2449,8 @@ class ObjectDetectorNode(Node):
           - tracker_id는 ultralytics BoT-SORT/ByteTrack이 부여하는 고유 ID(int).
           - tracker가 ID 미부여 상태(첫 프레임 일부)면 그 검출은 skip.
         """
-        track_kwargs = dict(conf=self.conf_thresh, persist=True, verbose=False)
+        track_kwargs = dict(conf=self.conf_thresh, persist=True, verbose=False,
+                            device=_INFER_DEVICE)
         if self._tracker_yaml_path:
             track_kwargs['tracker'] = self._tracker_yaml_path
         results = self.model.track(img, **track_kwargs)
