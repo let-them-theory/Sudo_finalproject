@@ -452,10 +452,12 @@ use_ultrasonic_grasp: true
 
 | 경로 | 역할 |
 |------|------|
-| `mini_project/launch/pick_place.launch.py` | 전체 노드 런치 |
-| `mini_project/dsr_realsense_pick_place/gui_node.py` | PyQt GUI |
-| `mini_project/dsr_realsense_pick_place/object_detector.py` | YOLO + FastSAM 검출 |
-| `mini_project/dsr_realsense_pick_place/pick_place_node.py` | 픽 FSM |
+| `mini_project/launch/pick_place.launch.py` | 전체 노드 런치 (`gui:=false`/`web:=true` 기본) |
+| `mini_project/dsr_realsense_pick_place/web_control_node.py` | **관리자 웹 제어 (SQLite+HTTP, 포트 8080) — PyQt GUI 대체** |
+| `mini_project/web_kiosk/` | **유저 주문 키오스크 (React + FastAPI, 포트 8000)** |
+| `mini_project/dsr_realsense_pick_place/gui_node.py` | PyQt GUI (web_control로 대체, `gui:=true`로 사용 가능) |
+| `mini_project/dsr_realsense_pick_place/object_detector.py` | YOLO + FastSAM 검출 (클래스 다수결 안정화) |
+| `mini_project/dsr_realsense_pick_place/pick_place_node.py` | 픽 FSM (package/비동기 하강/status3 방어) |
 | `dsr_gripper_tcp/` | 그리퍼 TCP 브릿지 |
 | `scripts/shutdown_nodes.sh` | 정상 종료 (DRCF/DRL 순서 해제) |
 | `scripts/run_pick_place_real.sh` | 권장 기동 래퍼 (종료 시 shutdown 자동) |
@@ -465,6 +467,54 @@ use_ultrasonic_grasp: true
 | `scripts/restart_gripper_bridge.sh` | 그리퍼만 복구 |
 | `scripts/diagnose_drcf.py` | DRCF 연결 진단 |
 | `mini_project/config/pick_place_params.yaml` | 초음파 파지 거리·픽 파라미터 |
+
+### 10.4 웹 UI 통합 + 픽 안정화 (2026-06-17)
+
+UI를 **유저 키오스크(web_kiosk)** 와 **관리자 웹제어(web_control_node)** 로 분리하고, PyQt GUI를 웹으로 대체했습니다. 픽 동작은 package place·비동기 초음파 하강·status3 자동복구로 안정화했습니다.
+
+#### A. 유저 키오스크 (`web_kiosk/`, 포트 8000)
+
+React(Vite) + FastAPI. 고객이 상품을 주문하면 `task_repository`(JSON, 추후 SQLite) DB에 적재되고, 백엔드가 큐를 `/pick_place/run_once_package`로 투입합니다.
+
+| 기능 | 내용 |
+|------|------|
+| 주문 흐름 | welcome(대기현황) → select → confirm → done(영수증) |
+| 큐 표시 | 첫 화면에 진행중 주문(처리중=초록), 새로고침 버튼 |
+| 수량 | 카드 탭=+, 카드 −(주황)로 감소, 이전=선택 초기화 |
+| box 제외 | 박스는 판매/이동 대상 아님 → 선택 버튼 미노출 (검출은 유지) |
+| 접속 | PC `http://localhost:8000`, 모바일 동일 wifi `http://<PC_IP>:8000` |
+
+#### B. 관리자 웹 제어 (`web_control_node.py`, 포트 8080)
+
+PyQt `gui_node` 대체. 임베드 HTTP 서버 + SQLite(`~/.config/dsr_realsense_pick_place/web_control.db`). 대시보드에서 객체 선택 + 로봇/그리퍼 제어 + 파라미터 + **유저 주문 큐 표시**.
+
+| 기능 | 내용 |
+|------|------|
+| 명령 | run_once / sort_all / run_once_package / go_home / e_stop / 그리퍼 등 (command_queue → 서비스) |
+| 객체 선택 | 검출 물체 버튼(선택 시 색 강조), box 제외, 자동 선택 |
+| 유저 큐 | `/api/orders` — 키오스크 주문 표시(RUNNING 초록/PAUSED 주황) + 취소/보류 |
+| 설정 | confidence·calibration·그리퍼 강도·모델 경로 등 (yaml 영구 저장) |
+| 캘리브 시드 | DB 캘리브를 yaml `absolute_calib_*`에서 UPSERT (플레이스홀더가 실측값 덮어쓰는 버그 수정), 빈 모델 경로는 launch 포터블 경로 유지 |
+
+launch: `gui:=false`(기본, PyQt 미기동) / `web:=true`(기본) / `web_host` / `web_port`(기본 8080).
+
+#### C. 픽 동작 안정화 (`pick_place_node.py`)
+
+| 기능 | 내용 |
+|------|------|
+| package place | `/pick_place/run_once_package` — 유저 주문은 sort zone 무시하고 `package_position`으로 place (`_package_mode` 게이팅, IDLE/ERROR/cancel서 리셋) |
+| 비동기 하강 | 동기 step 대신 연속 movel(`sync_type=1`, `ultrasonic_descend_vel_mmps`) + 병렬 초음파 감시 → `grasp_distance` 도달 시 SSTOP 정지 |
+| 초음파 신선도 | `ultrasonic_max_age_sec` 0.5→1.0 (아두이노 ~2Hz라 0.5면 항상 stale) |
+| settle | close 후 그리퍼 위치 안정까지 대기 후 LIFT (빈손 상승 방지) |
+| status3 방어 | 도달불가(alarm 1206) 등 발생 시 자동 `RESET_ALARM` → 그리퍼 DRL status3 cascade 차단 |
+| 자동 분류 | `sort_all` — ws(박스밖)+known 클래스만 클래스별 box로 정렬 |
+| 실패 로그 | `[ERR]/[WAR]` 심각도 + 작업/시퀀스/물체/목적지/사유 → `/pick_place_error` (관리자 에러로그) |
+
+#### D. 검출 안정화 (`object_detector.py`)
+
+- CentroidTracker 트랙별 **클래스 다수결** — 단발 오분류(jelly↔pack) 완화.
+- unknown(FastSAM) 마스크가 YOLO bbox와 겹치면 억제 (이중검출 제거).
+- 모델은 `proto_v3.pt`, launch가 `pkg_share`로 포터블 주입(절대경로 제거).
 
 ---
 
