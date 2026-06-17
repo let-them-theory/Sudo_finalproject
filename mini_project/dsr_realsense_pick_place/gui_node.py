@@ -37,6 +37,7 @@ import re
 import yaml
 import subprocess
 import signal
+import socket
 import sys
 import math
 import time
@@ -97,6 +98,24 @@ from std_msgs.msg import Int32, String
 
 from std_srvs.srv import SetBool, Trigger
 from dsr_gripper_tcp_interfaces.msg import GripperState
+
+from PyQt5.QtWidgets import (
+    QTreeWidget, QTreeWidgetItem, QMessageBox, QListWidget, QListWidgetItem, QSplitter)
+from collections import deque as _deque
+from dsr_realsense_pick_place.task_repository import JsonRepository, OrderStatus, ItemStatus
+
+# 상태 영문 → 한글 (USER 탭 표시).
+_KR_STATUS = {
+    'QUEUED': '대기', 'RUNNING': '진행중', 'DONE': '완료',
+    'FAILED': '실패', 'CANCELED': '취소', 'PAUSED': '일시정지',
+}
+
+# 상품 class → 한글 표시명 (큐 탭 표시용).
+PRODUCT_KR = {
+    'ramen': '라면', 'pack': '팩음료', 'ssnack': '스낵', 'bsnack': '봉지과자',
+    'water': '생수', 'jelly': '젤리', 'box': '박스', 'can': '캔',
+    'boxsnack': '박스과자', 'wafers': '웨하스',
+}
 
 os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = QLibraryInfo.location(QLibraryInfo.PluginsPath)
 
@@ -252,6 +271,9 @@ class PickPlaceGuiNode(Node):
         self.selected_label = ''
         self.pick_place_state = 'IDLE'
         self.last_error_text = ''
+        # USER 탭 에러로그 버퍼 (seq, 시각, 메시지) — _cb_error가 적재, GUI가 새 seq만 표시.
+        self._error_log = _deque(maxlen=200)
+        self._error_seq = 0
         self._latest_raw_detections = []
         self.last_image_time = 0.0
         self.last_objects_time = 0.0
@@ -269,6 +291,7 @@ class PickPlaceGuiNode(Node):
         self.pub_selected = self.create_publisher(String, '/selected_object_label', 10)
 
         self.cli_run_once      = self.create_client(Trigger, '/pick_place/run_once')
+        self.cli_sort_all      = self.create_client(Trigger, '/pick_place/sort_all')
         self.cli_go_home       = self.create_client(Trigger, '/pick_place/go_home')
         self.cli_gripper_open  = self.create_client(Trigger, '/gripper/open')
         self.cli_gripper_close = self.create_client(Trigger, '/gripper/close')
@@ -757,6 +780,9 @@ class PickPlaceGuiNode(Node):
     def _cb_error(self, msg: String):
         # ERROR 진입 시 분류된 에러 사유 — _update_ui에서 좌상단 배너에 표시(GUI 스레드 안전).
         self.last_error_text = msg.data
+        # USER 탭 에러로그용 버퍼 (최근 200개). _seq로 GUI가 새 항목만 추가.
+        self._error_seq += 1
+        self._error_log.append((self._error_seq, time.strftime('%H:%M:%S'), msg.data))
 
     def _cb_ultrasonic(self, msg: Range):
         if msg.range is not None and msg.range > 0.0:
@@ -843,6 +869,13 @@ class PickPlaceGui(QWidget):
     def __init__(self, ros_node: PickPlaceGuiNode):
         super().__init__()
         self.ros_node = ros_node
+        # 유저 주문 큐 DB (web 백엔드와 공유). 읽기 + 큐 비우기.
+        try:
+            self._order_repo = JsonRepository()
+        except Exception:
+            self._order_repo = None
+        # 키오스크 서버(web_kiosk) 서브프로세스 핸들 — USER 탭에서 on/off.
+        self._kiosk_proc = None
         self._reset_in_progress = False
         self._reset_deadline = 0.0
         self._manual_command = None
@@ -1703,9 +1736,15 @@ class PickPlaceGui(QWidget):
 
         object_group = QGroupBox('검출된 물체 선택')
         object_layout = QVBoxLayout(object_group)
+        auto_row = QHBoxLayout()
         self.auto_button = QPushButton('자동 선택 사용')
         self.auto_button.clicked.connect(lambda: self._select_label(''))
-        object_layout.addWidget(self.auto_button)
+        # 자동 분류(Sort All) — 검출 물체를 클래스별 box 구역으로 일괄 정렬.
+        self.sort_all_button = QPushButton('🔄 자동 분류')
+        self.sort_all_button.clicked.connect(self._on_sort_all)
+        auto_row.addWidget(self.auto_button)
+        auto_row.addWidget(self.sort_all_button)
+        object_layout.addLayout(auto_row)
 
         btn_row_h = 34
         scroll_visible_rows = 2
@@ -1755,6 +1794,7 @@ class PickPlaceGui(QWidget):
         self.tabs.addTab(_tab_op, '운전')
         self.tabs.addTab(_tab_grip, 'gripper')
         self.tabs.addTab(_tab_set, '수동·설정')
+        self.tabs.addTab(self._build_queue_tab(), 'USER')
 
         # 카메라 영상은 어느 탭에서나 항상 보이도록 본문 좌측에 고정, 탭은 우측에 배치
         body = QHBoxLayout()
@@ -2818,6 +2858,345 @@ class PickPlaceGui(QWidget):
             ' padding: 2px 8px; font-size: 12px; font-weight: bold;'
         )
 
+    def _build_queue_tab(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(8, 8, 8, 8)
+
+        top = QHBoxLayout()
+        title = QLabel('유저 주문 큐')
+        title.setStyleSheet('font-size: 14px; font-weight: bold;')
+        self.queue_refresh_button = QPushButton('새로고침')
+        self.queue_refresh_button.setFixedHeight(28)
+        self.queue_refresh_button.clicked.connect(self._refresh_queue)
+        self.queue_pause_button = QPushButton('⏸ 큐 보류')
+        self.queue_pause_button.setFixedHeight(28)
+        self.queue_pause_button.clicked.connect(self._toggle_queue_pause)
+        self.queue_cancel_button = QPushButton('✓ 체크 주문 취소')
+        self.queue_cancel_button.setFixedHeight(28)
+        self.queue_cancel_button.clicked.connect(self._cancel_selected_order)
+        self.queue_clear_button = QPushButton('🗑 큐 비우기')
+        self.queue_clear_button.setFixedHeight(28)
+        self.queue_clear_button.clicked.connect(self._clear_queue)
+        top.addWidget(title)
+        top.addStretch(1)
+        top.addWidget(self.queue_refresh_button)
+        top.addWidget(self.queue_pause_button)
+        top.addWidget(self.queue_cancel_button)
+        top.addWidget(self.queue_clear_button)
+        lay.addLayout(top)
+
+        # ── 키오스크 서버 on/off ──────────────────────────────────────
+        ops = QHBoxLayout()
+        self.kiosk_server_button = QPushButton('▶ 키오스크 서버 ON')
+        self.kiosk_server_button.setFixedHeight(28)
+        self.kiosk_server_button.clicked.connect(self._toggle_kiosk_server)
+        ops.addStretch(1)
+        ops.addWidget(self.kiosk_server_button)
+        lay.addLayout(ops)
+
+        # 키오스크 서버 상태 + 모바일 접속 주소 (마우스로 선택/복사 가능).
+        self.kiosk_addr_label = QLabel('키오스크 서버: 확인 중…')
+        self.kiosk_addr_label.setStyleSheet('font-size: 12px;')
+        self.kiosk_addr_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        lay.addWidget(self.kiosk_addr_label)
+
+        # ── 상/하 분할: 상부=주문 큐, 하부=에러 로그 ──────────────────
+        splitter = QSplitter(Qt.Vertical)
+
+        # [상부] 주문 큐
+        q_box = QWidget()
+        q_lay = QVBoxLayout(q_box)
+        q_lay.setContentsMargins(0, 0, 0, 0)
+        q_lay.addWidget(QLabel('📋 주문 큐 (진행중=초록)'))
+        self.queue_tree = QTreeWidget()
+        self.queue_tree.setHeaderLabels(['주문', '수량', '시간', '상태'])
+        self.queue_tree.setColumnWidth(0, 120)
+        self.queue_tree.setColumnWidth(1, 56)
+        self.queue_tree.setColumnWidth(2, 64)
+        self.queue_tree.setRootIsDecorated(True)
+        self._checked_orders: set = set()
+        self._building_queue = False
+        self.queue_tree.itemChanged.connect(self._on_queue_check)
+        q_lay.addWidget(self.queue_tree)
+        self.queue_status_label = QLabel('주문 0건')
+        self.queue_status_label.setStyleSheet('color: #aaa; font-size: 12px;')
+        q_lay.addWidget(self.queue_status_label)
+        splitter.addWidget(q_box)
+
+        # [하부] 에러/경고 로그 — 🔴 ERR(시스템 마비) / 🟠 WAR(실패하나 진행가능)
+        e_box = QWidget()
+        e_lay = QVBoxLayout(e_box)
+        e_lay.setContentsMargins(0, 0, 0, 0)
+        e_top = QHBoxLayout()
+        e_top.addWidget(QLabel('🚨 에러 로그  (🔴ERR 마비 / 🟠WAR 실패·진행가능)'))
+        e_top.addStretch(1)
+        self.error_clear_button = QPushButton('로그 지우기')
+        self.error_clear_button.setFixedHeight(24)
+        self.error_clear_button.clicked.connect(self._clear_error_log)
+        e_top.addWidget(self.error_clear_button)
+        e_lay.addLayout(e_top)
+        self.error_log_list = QListWidget()
+        self.error_log_list.setStyleSheet(
+            'QListWidget{background:#1b1b1b; font-family:monospace; font-size:12px;}')
+        self._error_log_last_seq = 0   # 표시한 마지막 seq
+        e_lay.addWidget(self.error_log_list)
+        splitter.addWidget(e_box)
+
+        splitter.setStretchFactor(0, 3)   # 큐를 더 크게
+        splitter.setStretchFactor(1, 2)
+        lay.addWidget(splitter)
+        return w
+
+    def _clear_error_log(self):
+        self.error_log_list.clear()
+        # 이후 들어오는 항목만 다시 표시 (버퍼는 ros_node쪽, 표시 커서만 최신으로).
+        self._error_log_last_seq = self.ros_node._error_seq
+
+    def _error_severity(self, text: str):
+        """에러 메시지 → (심각도, 색). ERR=시스템 마비(빨강), WAR=실패하나 진행가능(주황)."""
+        t = (text or '').lower()
+        # 시스템 마비급 — status3, 도달불가(IK), 충돌, 긴급정지, 명시 [ERR]
+        if ('status 3' in t or 'status3' in t or 'io_error' in t or '🔴' in text
+                or 'reachable' in t or '1206' in t or 'collision' in t or '충돌' in t
+                or 'emergency' in t or '[err]' in t):
+            return 'ERR', '#ff5555'
+        # 실패하나 진행 가능 — 파지실패, 검출 타임아웃, 명시 [WAR]
+        return 'WAR', '#ffa033'
+
+    def _refresh_error_log(self):
+        # ros_node 버퍼에서 아직 표시 안 한 seq만 추가 (색·아이콘 부여).
+        for seq, ts, text in list(self.ros_node._error_log):
+            if seq <= self._error_log_last_seq:
+                continue
+            self._error_log_last_seq = seq
+            sev, color = self._error_severity(text)
+            icon = '🔴' if sev == 'ERR' else '🟠'
+            item = QListWidgetItem(f'{icon} [{ts}] {sev}  {text}')
+            item.setForeground(QColor(color))
+            self.error_log_list.addItem(item)
+            self.error_log_list.scrollToBottom()
+        # 200개 넘으면 오래된 것 제거
+        while self.error_log_list.count() > 200:
+            self.error_log_list.takeItem(0)
+
+    def _refresh_queue(self):
+        if self._order_repo is None:
+            self.queue_status_label.setText('⚠ 주문 DB 연결 실패')
+            return
+        # web 백엔드가 쓴 최신 주문을 반영하려면 디스크에서 재읽기(다중 프로세스 공유 DB).
+        self._order_repo.reload()
+        try:
+            # 미완료(대기/진행/일시정지) 주문만, 최신순.
+            orders = self._order_repo.list_orders(
+                {OrderStatus.QUEUED, OrderStatus.RUNNING, OrderStatus.PAUSED})
+        except Exception as e:
+            self.queue_status_label.setText(f'⚠ 큐 읽기 실패: {e}')
+            return
+        orders.sort(key=lambda o: o.created_at, reverse=True)
+        paused = self._order_repo.is_queue_paused()
+
+        # 각 주문의 품목까지 미리 모음 (시그니처 + 렌더 공용).
+        order_items = {o.order_id: [it for it in
+                       (self._order_repo.get_item(i) for i in o.item_ids) if it]
+                       for o in orders}
+
+        # 변화 없으면 트리를 다시 그리지 않는다 — 100ms마다 clear하면 체크박스 조작이 불가능해진다.
+        sig = (paused, tuple(
+            (o.order_id, o.ticket_no, o.status,
+             tuple(it.status for it in order_items[o.order_id]))
+            for o in orders))
+        if sig == getattr(self, '_last_queue_sig', None):
+            return
+        self._last_queue_sig = sig
+
+        # 펼쳐둔 주문은 갱신 후에도 펼침 유지 (깜빡임 방지).
+        expanded = {
+            self.queue_tree.topLevelItem(i).text(0)
+            for i in range(self.queue_tree.topLevelItemCount())
+            if self.queue_tree.topLevelItem(i).isExpanded()
+        }
+        # 존재하는 주문만 체크 set에 유지(사라진 주문 정리).
+        self._checked_orders &= {o.order_id for o in orders}
+        self._building_queue = True   # 프로그램적 setCheckState가 핸들러 안 타게
+        self.queue_tree.clear()
+        for o in orders:
+            items = order_items[o.order_id]
+            hhmm = o.created_at[11:16] if len(o.created_at) >= 16 else ''
+            parent = QTreeWidgetItem([
+                o.ticket_no, f'{len(items)}개', hhmm, _KR_STATUS.get(o.status, o.status)])
+            # 진행중(RUNNING)=초록, 일시정지=주황 — 가독성.
+            if o.status == OrderStatus.RUNNING:
+                for _c in range(4):
+                    parent.setForeground(_c, QColor('#33cc66'))
+            elif o.status == OrderStatus.PAUSED:
+                for _c in range(4):
+                    parent.setForeground(_c, QColor('#ffa033'))
+            parent.setData(0, Qt.UserRole, o.order_id)   # 취소용 order_id
+            parent.setFlags(parent.flags() | Qt.ItemIsUserCheckable)
+            parent.setCheckState(
+                0, Qt.Checked if o.order_id in self._checked_orders else Qt.Unchecked)
+            for it in items:
+                parent.addChild(QTreeWidgetItem([
+                    PRODUCT_KR.get(it.class_name, it.class_name), '', '',
+                    _KR_STATUS.get(it.status, it.status)]))
+            self.queue_tree.addTopLevelItem(parent)
+            if o.ticket_no in expanded:
+                parent.setExpanded(True)
+        self._building_queue = False
+        self.queue_pause_button.setText('▶ 큐 재개' if paused else '⏸ 큐 보류')
+        self.queue_status_label.setText(
+            f'주문 {len(orders)}건' + ('  ·  ⏸ 보류 중' if paused else ''))
+
+    def _clear_queue(self):
+        if self._order_repo is None:
+            return
+        reply = QMessageBox.question(
+            self, '큐 비우기', '대기/진행 중인 모든 유저 주문을 취소할까요?',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            self._order_repo.reload()   # web 백엔드 최신 상태 반영 후 취소(덮어쓰기 방지).
+            oids = {it.order_id for it in self._order_repo.get_queue()}
+            done, skipped = 0, 0
+            for oid in oids:
+                # 이미 처리 중(RUNNING) 주문은 취소하지 않음 — 로봇이 집는 중.
+                if self._order_repo.cancel_order(oid, protect_running=True):
+                    done += 1
+                else:
+                    skipped += 1
+        except Exception as e:
+            self.queue_status_label.setText(f'⚠ 비우기 실패: {e}')
+            return
+        self._refresh_queue()
+        msg = f'큐 비움 ({done}건 취소'
+        msg += f', {skipped}건 처리 중이라 보존)' if skipped else ')'
+        self.queue_status_label.setText(msg)
+
+    def _on_queue_check(self, item, _col):
+        # 부모(주문)의 체크 변화만 set에 반영. 갱신 중 프로그램 변경은 무시.
+        if self._building_queue or item.parent() is not None:
+            return
+        oid = item.data(0, Qt.UserRole)
+        if oid is None:
+            return
+        if item.checkState(0) == Qt.Checked:
+            self._checked_orders.add(oid)
+        else:
+            self._checked_orders.discard(oid)
+
+    def _cancel_selected_order(self):
+        if self._order_repo is None:
+            return
+        oids = set(self._checked_orders)
+        if not oids:
+            self.queue_status_label.setText('취소할 주문을 체크하세요')
+            return
+        reply = QMessageBox.question(
+            self, '주문 취소', f'체크한 {len(oids)}건을 취소할까요?',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        self._order_repo.reload()
+        done, skipped = 0, 0
+        for oid in oids:
+            # 이미 로봇이 처리 중(RUNNING)인 주문은 취소 안 함.
+            if self._order_repo.cancel_order(oid, protect_running=True):
+                done += 1
+            else:
+                skipped += 1
+        self._checked_orders.clear()
+        self._refresh_queue()
+        if skipped:
+            QMessageBox.warning(
+                self, '일부 취소 불가',
+                f'{done}건 취소. {skipped}건은 로봇이 처리 중이라 취소할 수 없습니다.')
+        self.queue_status_label.setText(
+            f'{done}건 취소' + (f', {skipped}건 보존' if skipped else ''))
+
+    def _toggle_queue_pause(self):
+        if self._order_repo is None:
+            return
+        self._order_repo.reload()
+        now = self._order_repo.is_queue_paused()
+        self._order_repo.set_queue_paused(not now)
+        self._refresh_queue()
+        self.queue_status_label.setText('큐 재개됨' if now else '큐 보류됨 (새 주문 투입 정지)')
+
+    # ── 자동 정렬 + 키오스크 서버 제어 ────────────────────────────────
+    KIOSK_PORT = 8000
+
+    def _on_sort_all(self):
+        # ws/검출 물체를 클래스별 box 구역으로 자동 분류 — 로봇 즉시 동작.
+        reply = QMessageBox.question(
+            self, '자동 정렬',
+            '검출된 물체를 클래스별 box 구역으로 자동 분류합니다.\n'
+            '로봇이 즉시 동작합니다. 진행할까요?',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        self.ros_node.call_trigger_service(
+            self.ros_node.cli_sort_all, 'pick_place/sort_all')
+        self.queue_status_label.setText('자동 정렬(Sort All) 요청 전송')
+
+    def _lan_ip(self) -> str:
+        # 기본 라우트 인터페이스의 LAN IP (모바일 접속용). 실패 시 localhost.
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(('8.8.8.8', 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return 'localhost'
+
+    def _kiosk_port_open(self) -> bool:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(0.2)
+            rc = s.connect_ex(('127.0.0.1', self.KIOSK_PORT))
+            s.close()
+            return rc == 0
+        except Exception:
+            return False
+
+    def _toggle_kiosk_server(self):
+        if self._kiosk_port_open():
+            # 실행 중 → 중지. 우리가 띄운 프로세스만 종료 가능.
+            if self._kiosk_proc is not None and self._kiosk_proc.poll() is None:
+                try:
+                    os.killpg(os.getpgid(self._kiosk_proc.pid), signal.SIGINT)
+                except Exception as e:
+                    self.ros_node.get_logger().warn(f'키오스크 종료 실패: {e}')
+                self._kiosk_proc = None
+            else:
+                QMessageBox.information(
+                    self, '키오스크 서버',
+                    '외부(터미널/launch)에서 시작된 서버입니다.\n해당 터미널에서 종료하세요.')
+        else:
+            # 중지 → 시작. 자체 프로세스 그룹으로 띄워 OFF 시 그룹 종료.
+            try:
+                self._kiosk_proc = subprocess.Popen(
+                    ['ros2', 'launch', 'dsr_realsense_pick_place', 'web_kiosk.launch.py',
+                     f'kiosk_port:={self.KIOSK_PORT}', 'open_browser:=false'],
+                    start_new_session=True)
+            except Exception as e:
+                QMessageBox.warning(self, '키오스크 서버', f'시작 실패: {e}')
+        self._refresh_kiosk_status()
+
+    def _refresh_kiosk_status(self):
+        if self._kiosk_port_open():
+            url = f'http://{self._lan_ip()}:{self.KIOSK_PORT}'
+            self.kiosk_addr_label.setText(f'🟢 키오스크 ON — 모바일 접속: {url}')
+            self.kiosk_addr_label.setStyleSheet('font-size: 12px; color: #2e7d32;')
+            self.kiosk_server_button.setText('■ 키오스크 서버 OFF')
+        else:
+            self.kiosk_addr_label.setText('🔴 키오스크 서버 OFF')
+            self.kiosk_addr_label.setStyleSheet('font-size: 12px; color: #999;')
+            self.kiosk_server_button.setText('▶ 키오스크 서버 ON')
+
+
     def _update_ui(self):
         if self._shutting_down or not rclpy.ok():
             return
@@ -2829,6 +3208,11 @@ class PickPlaceGui(QWidget):
             raise exc
 
     def _update_ui_body(self):
+        # 주문 큐 탭이 보일 때만 큐를 주기 갱신 (불필요한 DB 읽기 방지).
+        if self.tabs.currentIndex() == self.tabs.count() - 1:
+            self._refresh_queue()
+            self._refresh_kiosk_status()
+            self._refresh_error_log()
         # 시스템 리셋 진행 상태 폴링
         self._poll_system_reset()
 
@@ -2954,6 +3338,7 @@ class PickPlaceGui(QWidget):
         full_system_ready  = command_enabled and is_idle and pick_svc and gripper_hw_ready
         object_buttons_enabled = full_system_ready
         self.auto_button.setEnabled(full_system_ready)
+        self.sort_all_button.setEnabled(full_system_ready)
         object_param_ready = (
             self.ros_node.cli_object_get_parameters.service_is_ready()
             and self.ros_node.cli_object_set_parameters.service_is_ready()

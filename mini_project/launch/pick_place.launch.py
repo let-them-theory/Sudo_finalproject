@@ -14,6 +14,7 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
+from launch_ros.parameter_descriptions import ParameterValue
 from ament_index_python.packages import get_package_share_directory
 
 
@@ -45,8 +46,14 @@ ARGUMENTS = [
     DeclareLaunchArgument('cam_tf_qy', default_value='0.707'),
     DeclareLaunchArgument('cam_tf_qz', default_value='0.0'),
     DeclareLaunchArgument('cam_tf_qw', default_value='0.707'),
-    DeclareLaunchArgument('gui', default_value='true',
-                          description='PyQt GUI 실행 여부'),
+    DeclareLaunchArgument('gui', default_value='false',
+                          description='PyQt GUI 실행 여부 (web_control_node로 대체, 기본 false)'),
+    DeclareLaunchArgument('web', default_value='true',
+                          description='SQLite+HTTP 웹 제어 노드(web_control_node) 실행 여부'),
+    DeclareLaunchArgument('web_host', default_value='0.0.0.0',
+                          description='웹 제어 HTTP 바인드 호스트'),
+    DeclareLaunchArgument('web_port', default_value='8080',
+                          description='웹 제어 HTTP 포트'),
     DeclareLaunchArgument('use_launch_set_robot_mode', default_value='false',
                           description='Fallback: launch에서 set_robot_mode service call 실행 여부'),
     DeclareLaunchArgument('gripper_tcp_port', default_value='20002',
@@ -155,6 +162,24 @@ def generate_launch_description():
         ],
     )
 
+    # 신규: SQLite + HTTP 웹 제어 노드 (PyQt GUI 대체). 기본 web:=true.
+    web_control_node = TimerAction(
+        period=2.0,
+        actions=[
+            Node(
+                package='dsr_realsense_pick_place',
+                executable='web_control_node',
+                name='web_control_node',
+                output='screen',
+                parameters=[params_file, {
+                    'http_host': LaunchConfiguration('web_host'),
+                    'http_port': ParameterValue(LaunchConfiguration('web_port'), value_type=int),
+                }],
+                condition=IfCondition(LaunchConfiguration('web')),
+            )
+        ],
+    )
+
     wait_robot = TimerAction(
         period=10.0,
         actions=[
@@ -238,6 +263,7 @@ def generate_launch_description():
         static_tf,
         object_detector,
         gui_node,
+        web_control_node,
         ultrasonic,
         wait_robot,
         gripper,
