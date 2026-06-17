@@ -55,6 +55,8 @@ setup(
             'object_detector = dsr_realsense_pick_place.object_detector:main',
             'pick_place_node = dsr_realsense_pick_place.pick_place_node:main',
             'gui_node = dsr_realsense_pick_place.gui_node:main',
+            # SQLite+HTTP 웹 제어 노드 (PyQt gui_node 대체, launch web:=true 기본).
+            'web_control_node = dsr_realsense_pick_place.web_control_node:main',
             'gripper_node = dsr_realsense_pick_place.gripper_node:main',
             'ultrasonic_node = dsr_realsense_pick_place.ultrasonic_node:main',
         ],

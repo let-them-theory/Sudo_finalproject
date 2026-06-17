@@ -6,7 +6,7 @@ import {
 } from './api'
 import { nameOf, emojiOf } from './products'
 import {
-  ChevronUp, ChevronDown, Plus, Minus, Check, AlertTriangle, Clock,
+  ChevronUp, ChevronDown, ChevronLeft, RefreshCw, Plus, Minus, Check, AlertTriangle, Clock,
 } from 'lucide-react'
 
 type Page = 'welcome' | 'select' | 'confirm' | 'done'
@@ -139,7 +139,10 @@ export default function App() {
         </div>
       )}
       <main className="flex-1 overflow-hidden">
-        {page === 'welcome' && <Welcome board={board} onStart={() => setPage('select')} />}
+        {page === 'welcome' && (
+          <Welcome board={board} onStart={() => setPage('select')}
+            onRefresh={() => getCatalog().then(setCatalog).catch(() => {})} />
+        )}
         {page === 'select' && (
           <SelectPage
             catalog={catalog} cart={cart} total={total} kinds={kinds} cartOpen={cartOpen}
@@ -147,6 +150,7 @@ export default function App() {
             onToggleCart={() => setCartOpen((v) => !v)}
             onAdd={add} onSub={sub} onClear={() => setCart({})}
             onNext={() => total > 0 && setPage('confirm')}
+            onBack={() => { setCart({}); setCartOpen(false); setPage('welcome') }}
           />
         )}
         {page === 'confirm' && (
@@ -217,20 +221,28 @@ function QueueBoard({ board, myId }: { board: BoardRow[]; myId?: string }) {
         <Clock size={13} /> 현재 대기 {board.length}건
       </div>
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[15px]">
-        {board.map((b, i) => (
-          <span key={b.order_id} className="flex items-center gap-2">
-            {i > 0 && <span className="text-line">|</span>}
-            <span className={b.order_id === myId ? 'font-bold text-brand' : 'font-semibold text-sub'}>
-              {b.ticket} {b.status}
+        {board.map((b, i) => {
+          const running = b.status === ORDER_STATUS_KR.RUNNING   // 처리 중 → 초록 강조
+          return (
+            <span key={b.order_id} className="flex items-center gap-2">
+              {i > 0 && <span className="text-line">|</span>}
+              <span className={
+                b.order_id === myId ? 'font-bold text-brand'
+                : running ? 'font-bold text-emerald-600'
+                : 'font-semibold text-sub'}>
+                {b.ticket} {b.status}
+              </span>
             </span>
-          </span>
-        ))}
+          )
+        })}
       </div>
     </div>
   )
 }
 
-function Welcome({ board, onStart }: { board: BoardRow[]; onStart: () => void }) {
+function Welcome({ board, onStart, onRefresh }: {
+  board: BoardRow[]; onStart: () => void; onRefresh: () => void
+}) {
   return (
     <div className="page-fade flex h-full flex-col px-6">
       <div className="flex flex-1 flex-col items-center justify-center gap-6">
@@ -243,6 +255,13 @@ function Welcome({ board, onStart }: { board: BoardRow[]; onStart: () => void })
         </div>
       </div>
       <div className="space-y-3 pb-8">
+        {/* 진행중인 큐 새로고침 (대기현황 갱신) */}
+        <div className="flex justify-end">
+          <button onClick={onRefresh}
+            className="flex items-center gap-1 rounded-lg px-3 py-1.5 text-[14px] font-semibold text-muted active:scale-95">
+            <RefreshCw size={16} /> 새로고침
+          </button>
+        </div>
         <QueueBoard board={board} />
         <CTA onClick={onStart}>주문 시작하기</CTA>
       </div>
@@ -262,12 +281,22 @@ function SelectPage(props: {
   onSub: (c: string) => void
   onClear: () => void
   onNext: () => void
+  onBack: () => void
 }) {
-  const { catalog, cart, total, kinds, cartOpen, available } = props
+  const { cart, total, kinds, cartOpen, available } = props
+  // box(박스)는 판매/이동 대상 아님 — 선택 버튼에서 제외(검출은 백엔드서 계속).
+  const catalog = props.catalog.filter((c) => c.class_name !== 'box')
   return (
     <div className="page-fade flex h-full flex-col">
       <div className="flex-1 overflow-y-auto px-6 py-5">
-        <div className="mb-4 text-[22px] font-bold text-ink">상품을 골라주세요</div>
+        {/* 상단: 이전 / 제목 (이전 누르면 선택 초기화) */}
+        <div className="mb-4 flex items-center gap-3">
+          <button onClick={props.onBack}
+            className="flex items-center gap-1 rounded-lg px-2 py-1.5 text-[14px] font-semibold text-muted active:scale-95">
+            <ChevronLeft size={18} /> 이전
+          </button>
+          <div className="text-[22px] font-bold text-ink">상품을 골라주세요</div>
+        </div>
         <div className="grid grid-cols-3 gap-3">
           {catalog.map((c) => {
             const qty = cart[c.class_name] || 0
@@ -282,9 +311,18 @@ function SelectPage(props: {
                 } ${sold ? 'opacity-40' : ''}`}
               >
                 {qty > 0 && (
-                  <span className="pop absolute right-2 top-2 flex h-6 min-w-6 items-center justify-center rounded-full bg-brand px-1.5 text-[13px] font-bold text-white">
-                    {qty}
-                  </span>
+                  <>
+                    <span className="pop absolute right-2 top-2 flex h-6 min-w-6 items-center justify-center rounded-full bg-brand px-1.5 text-[13px] font-bold text-white">
+                      {qty}
+                    </span>
+                    {/* 카드에서 바로 감소 (장바구니 안 열어도). 카드 본체 탭은 +. */}
+                    <span
+                      role="button"
+                      onClick={(e) => { e.stopPropagation(); props.onSub(c.class_name) }}
+                      className="absolute left-2 top-2 flex h-6 w-6 items-center justify-center rounded-full bg-amber-400 text-white shadow active:scale-90">
+                      <Minus size={14} />
+                    </span>
+                  </>
                 )}
                 {sold && (
                   <span className="absolute left-2 top-2 rounded-full bg-muted px-1.5 text-[11px] font-bold text-white">
