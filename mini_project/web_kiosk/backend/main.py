@@ -23,7 +23,7 @@ from dsr_realsense_pick_place.task_repository import (
 # 상품 표시명 (class → 한글). 프론트도 자체 매핑 가능하지만 카탈로그 seed에 필요.
 PRODUCT_DISPLAY = {
     'ramen': '라면', 'pack': '팩음료', 'ssnack': '스낵', 'bsnack': '봉지과자',
-    'water': '생수', 'jelly': '젤리', 'box': '박스', 'can': '캔',
+    'water': '생수', 'jelly': '젤리', 'can': '캔',
     'boxsnack': '박스과자', 'wafers': '웨하스',
 }
 KNOWN_CLASSES = list(PRODUCT_DISPLAY.keys())

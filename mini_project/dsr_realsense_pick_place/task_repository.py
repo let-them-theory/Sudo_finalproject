@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import threading
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, fields as dc_fields
 from datetime import datetime
 from pathlib import Path
 
@@ -170,13 +170,16 @@ class JsonRepository(TaskRepository):
             self._save()
 
     def list_catalog(self) -> list[CatalogItem]:
+        _flds = {f.name for f in dc_fields(CatalogItem)}
         with self._lock:
-            return [CatalogItem(**d) for d in self._data['catalog'].values()]
+            return [CatalogItem(**{k: v for k, v in d.items() if k in _flds})
+                    for d in self._data['catalog'].values()]
 
     def get_catalog_item(self, class_name: str) -> CatalogItem | None:
+        _flds = {f.name for f in dc_fields(CatalogItem)}
         with self._lock:
             d = self._data['catalog'].get(class_name)
-            return CatalogItem(**d) if d else None
+            return CatalogItem(**{k: v for k, v in d.items() if k in _flds}) if d else None
 
     def adjust_stock(self, class_name: str, delta: int) -> None:
         with self._lock:

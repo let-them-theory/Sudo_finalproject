@@ -50,6 +50,7 @@ HTTP 엔드포인트
 import json
 import os
 import re
+import socket as _socket
 import sqlite3
 import subprocess
 import threading
@@ -123,8 +124,8 @@ DEFAULT_SETTINGS = {
     'min_safe_z': 0.0,
     'grip_current_default': 200,
     'grip_class_names': ["ramen", "pack", "ssnack", "bsnack", "water",
-                         "jelly", "box", "can", "boxsnack", "wafers"],
-    'grip_class_currents': [150, 150, 150, 120, 180, 140, 180, 200, 170, 150],
+                         "jelly", "can", "boxsnack", "wafers"],
+    'grip_class_currents': [150, 150, 150, 120, 180, 140, 200, 170, 150],
 }
 
 
@@ -658,6 +659,13 @@ class WebControlNode(Node):
         grip_state = (
             'ok' if self.gripper_hw_ready
             else ('warn' if fresh(self.gripper_init_progress_t, 30.0) else 'bad'))
+        try:
+            _s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+            _s.settimeout(0.1)
+            _kiosk_up = _s.connect_ex(('127.0.0.1', 8000)) == 0
+            _s.close()
+        except Exception:
+            _kiosk_up = False
         system_status = {
             'HW':   'ok' if fresh(self.last_hw_state_time) else 'warn',
             'GRIP': grip_state,
@@ -666,6 +674,7 @@ class WebControlNode(Node):
             'PICK': 'ok' if (self.cli_run_once.service_is_ready() and fresh(self.last_state_time)) else 'bad',
             'ARD':  'ok' if fresh(self.last_ultrasonic_time) else 'bad',
             'SPD':  'ok' if fresh(self.last_speed_mode_time) else 'warn',
+            'USER': 'ok' if _kiosk_up else 'bad',
         }
 
         self._put_state('pick_place_state', self.pick_place_state)
@@ -1140,7 +1149,9 @@ class WebControlNode(Node):
                     self._send_json(self._read_commands())
                     return
                 if path == '/api/orders':
-                    self._send_json(self._read_orders())
+                    qs = self.path.split('?', 1)[1] if '?' in self.path else ''
+                    show_all = 'all=1' in qs
+                    self._send_json(self._read_orders(show_all=show_all))
                     return
                 if path == '/api/log':
                     self._send_json(self._read_log())
@@ -1273,22 +1284,29 @@ class WebControlNode(Node):
                 conn.close()
                 return [dict(r) for r in rows]
 
-            def _read_orders(self):
-                # 같은 패키지의 task_repository(JsonRepository)에서 미완료 유저 주문 큐를 읽는다.
+            def _read_orders(self, show_all=False):
                 repo = node._order_repo
                 if repo is None:
                     return {'orders': [], 'paused': False, 'error': 'DB 없음'}
                 try:
                     repo.reload()
-                    active = {OrderStatus.QUEUED, OrderStatus.RUNNING, OrderStatus.PAUSED}
+                    if show_all:
+                        statuses = {OrderStatus.QUEUED, OrderStatus.RUNNING, OrderStatus.PAUSED,
+                                    OrderStatus.DONE, OrderStatus.FAILED, OrderStatus.CANCELED}
+                    else:
+                        statuses = {OrderStatus.QUEUED, OrderStatus.RUNNING, OrderStatus.PAUSED}
                     orders = []
-                    for o in repo.list_orders(active):
+                    for o in repo.list_orders(statuses):
                         items = []
                         for iid in o.item_ids:
                             it = repo.get_item(iid)
                             if it is None:
                                 continue
-                            items.append({'class_name': it.class_name, 'status': it.status})
+                            items.append({
+                                'class_name': it.class_name,
+                                'status': it.status,
+                                'item_id': iid,
+                            })
                         orders.append({
                             'order_id': o.order_id,
                             'ticket_no': o.ticket_no,
@@ -1406,6 +1424,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   header{background:#0d1520;padding:8px 14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;border-bottom:1px solid #2a3a50;}
   .dot{padding:2px 7px;border-radius:4px;font-size:11px;font-weight:bold;background:#555;}
   .ok{background:#1a7a1a;} .warn{background:#8a6000;} .bad{background:#a00000;}
+  .dot-sep{border-left:1px solid #444;margin:0 4px;height:16px;display:inline-block;vertical-align:middle;}
   nav{background:#111820;padding:0 14px;display:flex;gap:2px;border-bottom:1px solid #2a3a50;}
   .tab{background:none;border:none;color:#8ab;padding:10px 18px;cursor:pointer;font-size:13px;border-bottom:3px solid transparent;border-radius:0;margin:0;}
   .tab:hover{color:#def;}
@@ -1429,30 +1448,39 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .row{display:flex;gap:6px;align-items:center;margin:4px 0;flex-wrap:wrap;}
   label{font-size:12px;color:#bbb;}
   small{color:#888;font-size:11px;}
-  /* camera */
-  #cam-wrap{position:relative;background:#111;border-radius:8px;min-height:240px;overflow:hidden;}
-  #cam{width:100%;display:block;border-radius:8px;object-fit:contain;}
+  /* camera — D455 16:9 aspect ratio */
+  #cam-wrap{position:relative;background:#111;border-radius:8px;overflow:hidden;aspect-ratio:16/9;width:100%;}
+  #cam{position:absolute;inset:0;width:100%;height:100%;display:block;border-radius:8px;object-fit:contain;}
   #cam-no{position:absolute;inset:0;display:none;align-items:center;justify-content:center;color:#ff3333;font-size:22px;font-weight:bold;letter-spacing:3px;background:#0a0a0a;}
   /* detect objects */
   .obj-info{background:#2a2a2a;border-radius:5px;padding:5px 7px;margin:3px 0;font-size:12px;border-left:3px solid #555;}
   .obj-info.reach{border-left-color:#2a6a2a;}
   .obj-info.unreach{opacity:.5;}
-  /* object select buttons */
   #obj-sel-row{display:flex;flex-wrap:wrap;gap:4px;margin:6px 0 2px;}
-  /* queue */
+  /* orders */
   .order{border-radius:7px;padding:7px 9px;margin:5px 0;border-left:5px solid #555;background:#2a2a2a;}
-  .order.run{border-left-color:#1a8a1a;background:#1a2e1a;}
+  .order.running,.order.run{border-left-color:#1a8a1a;background:#1a2e1a;}
   .order.pause{border-left-color:#c89000;background:#2a2610;}
   .order.queued{border-left-color:#666;background:#2a2a2a;}
+  .order.done{border-left-color:#2255aa;background:#1a1e2a;opacity:.75;}
+  .order.failed{border-left-color:#993300;background:#2a1a10;opacity:.85;}
+  .order.canceled{border-left-color:#553300;opacity:.6;}
   .order .tk{font-weight:bold;font-size:13px;}
   .badge{font-size:10px;padding:1px 6px;border-radius:4px;background:#555;display:inline-block;margin:1px;}
-  .badge.run{background:#1a7a1a;} .badge.pause{background:#c89000;color:#111;} .badge.queued{background:#555;}
-  .badge.done{background:#2255aa;} .badge.failed{background:#993300;} .badge.canceled{background:#553300;}
-  .badge.running{background:#1a7a1a;}
+  .badge.run,.badge.running{background:#1a7a1a;}
+  .badge.pause{background:#c89000;color:#111;}
+  .badge.queued{background:#555;}
+  .badge.done{background:#2255aa;}
+  .badge.failed{background:#993300;}
+  .badge.canceled{background:#553300;}
   .item-row{display:flex;align-items:center;gap:5px;margin:2px 0;}
   .item-cancel{background:#6a2020;padding:1px 6px;font-size:11px;}
+  /* robot action grid */
+  .act-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;margin-bottom:4px;}
+  .act-grid button{margin:0;width:100%;}
+  .act-grid span{display:block;}
   /* gripper chart */
-  #gchart{width:100%;height:70px;border-radius:6px;background:#111;display:block;}
+  #gchart{width:100%;height:90px;border-radius:6px;background:#111;display:block;}
   /* ultrasonic bar */
   .us-wrap{background:#1a1a1a;border-radius:5px;height:24px;position:relative;overflow:hidden;border:1px solid #444;margin:6px 0;}
   .us-fill{height:100%;transition:width .3s,background .5s;border-radius:4px;}
@@ -1471,17 +1499,18 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .log-entry.cmd{border-left-color:#4466aa;}
   .log-entry.err{border-left-color:#cc2222;background:#280a0a;}
   .log-entry.war{border-left-color:#cc7700;background:#251800;}
+  .log-entry.user-src{background:#1c1c24!important;}
   .log-row1{display:flex;gap:10px;font-size:11px;color:#888;margin-bottom:2px;}
   .log-row2{font-size:12px;}
   .log-badge{padding:1px 6px;border-radius:3px;font-size:10px;font-weight:bold;}
   .log-badge.cmd{background:#1a3a6a;} .log-badge.err{background:#8a0000;} .log-badge.war{background:#7a4000;}
   .log-badge.done{background:#1a5a1a;} .log-badge.failed{background:#6a2200;} .log-badge.pending{background:#555;} .log-badge.running{background:#1a4a1a;}
   #loglist{max-height:calc(100vh - 160px);overflow-y:auto;}
-  /* command log */
-  #cmdlog{max-height:220px;overflow-y:scroll;overflow-x:hidden;}
-  table{width:100%;border-collapse:collapse;font-size:11px;table-layout:fixed;}
-  td,th{border-bottom:1px solid #333;padding:3px 5px;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-  #cmdtb td:last-child{color:#888;}
+  /* user tab */
+  #user-stats{display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap;}
+  .stat-box{background:#1e2a3a;border-radius:7px;padding:6px 14px;text-align:center;min-width:72px;}
+  .stat-box .sval{font-size:22px;font-weight:bold;color:#9fd0ff;}
+  .stat-box .slbl{font-size:10px;color:#888;}
 </style>
 </head>
 <body>
@@ -1493,6 +1522,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <div id="banner"></div>
 <nav>
   <button class="tab active" id="tab-main" onclick="showTab('main')">🤖 메인</button>
+  <button class="tab" id="tab-user" onclick="showTab('user')">👤 유저 큐</button>
   <button class="tab" id="tab-gripper" onclick="showTab('gripper')">🦾 그리퍼</button>
   <button class="tab" id="tab-log" onclick="showTab('log')">📋 로그</button>
 </nav>
@@ -1503,9 +1533,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <!-- Col 1: Queue + Camera -->
   <div class="col col-wide">
     <div class="card">
-      <h3>유저 주문 큐 <span id="queue-paused"></span></h3>
-      <button id="pauseBtn" onclick="toggleQueue()">⏸ 큐 보류/재개</button>
-      <div id="orders" style="margin-top:6px;"><small>불러오는 중...</small></div>
+      <h3>작업 중인 유저 주문</h3>
+      <div id="orders"><small>불러오는 중...</small></div>
     </div>
     <div class="card">
       <h3>카메라 / 검출 &nbsp;<small id="sel-label" style="color:#9fd0ff;">선택: 자동</small></h3>
@@ -1520,27 +1549,24 @@ INDEX_HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- Col 2: Robot controls -->
+  <!-- Col 2: Controls + Tuning -->
   <div class="col">
     <div class="card">
       <h3>긴급 제어</h3>
-      <button class="danger" onclick="cmd('e_stop')">⛔ 긴급정지</button>
+      <button id="estop-btn" class="danger" style="width:100%;padding:14px;font-size:15px;font-weight:bold;margin-bottom:6px;" onclick="toggleEStop()">⛔ 긴급정지</button>
       <button class="warn" onclick="cmd('cancel')">🚫 태스크 중단</button>
-      <button class="go" onclick="cmd('e_stop_reset')">✅ 긴급정지 해제</button>
       <button onclick="cmd('clear_error')">🔄 에러 해제</button>
     </div>
     <div class="card">
       <h3>로봇 동작</h3>
-      <button onclick="cmd('run_once')">▶ 한 번 실행</button>
-      <button class="go" onclick="cmd('sort_all')">🗂 자동 분류</button>
-      <button onclick="cmd('run_once_package')">📦 패키지 픽</button>
-      <button onclick="cmd('go_home')">🏠 HOME</button>
-      <button onclick="cmd('recover_to_home')">에러복구+HOME</button>
-      <div class="row" style="margin-top:4px;">
+      <div class="act-grid">
+        <button onclick="cmd('run_once')">▶ 한번실행</button>
+        <button class="go" onclick="cmd('sort_all')">🗂 자동 분류</button>
+        <button onclick="cmd('run_once_package')">📦 패키지 픽</button>
         <button onclick="cmd('speed_normal')">🟢 정상속도</button>
-        <button onclick="cmd('speed_reduced')">🟡 감속</button>
-        <button onclick="cmd('servo_on')">서보 ON</button>
-        <button class="warn" onclick="if(confirm('서보 OFF? 로봇 낙하 위험'))cmd('servo_off')">서보 OFF</button>
+        <button onclick="cmd('speed_reduced')">🟡 저속</button>
+        <span></span>
+        <button id="servo-btn" onclick="toggleServo()">서보 ON/OFF</button>
         <button onclick="cmd('safety_normal')">정상운전</button>
         <button onclick="cmd('safety_backdrive')">역구동</button>
       </div>
@@ -1568,7 +1594,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- Col 3: Model / system -->
+  <!-- Col 3: Model + 전류 그래프 + 초음파 -->
   <div class="col">
     <div class="card">
       <h3>모델 / 시스템</h3>
@@ -1589,16 +1615,38 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <button class="go" onclick="cmd('save_yaml')">💾 yaml 저장</button>
         <button class="warn" onclick="if(confirm('노드 재시작?'))cmd('system_reset')">🔄 시스템 리셋</button>
       </div>
-      <div style="margin-top:4px;"><small>변경 즉시 DB 저장 · yaml 저장 버튼으로 영구 반영</small></div>
     </div>
     <div class="card">
-      <h3>최근 명령 <small style="float:right;color:#666;">(최대 10행, 스크롤)</small></h3>
-      <div id="cmdlog">
-        <table><thead><tr><th>#</th><th>액션</th><th>상태</th><th>발행</th><th>완료</th><th>결과</th></tr></thead>
-        <tbody id="cmdtb"></tbody></table>
+      <h3>그리퍼 전류 &nbsp;<small><span id="g_curr2">-</span> mA &nbsp;위치: <span id="g_pos2">-</span></small></h3>
+      <canvas id="gchart"></canvas>
+    </div>
+    <div class="card">
+      <h3>초음파 거리 &nbsp;<small>grasp 기준: <span id="us-thresh">40</span> mm</small></h3>
+      <div class="us-wrap">
+        <div class="us-fill" id="us-fill" style="width:0%;background:#555;"></div>
+        <div class="us-mark" id="us-mark" style="left:20%;"></div>
+        <span class="us-lbl" id="us-lbl">- mm</span>
       </div>
+      <small>0mm ←──────────────────────── 400mm</small>
     </div>
   </div>
+</div>
+</div>
+
+<!-- ═══════════════ 유저 큐 탭 ═══════════════ -->
+<div class="page" id="page-user">
+<div style="padding:12px;">
+  <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap;">
+    <strong style="font-size:14px;">유저 주문 관리</strong>
+    <span id="user-q-badge"></span>
+    <button id="user-pause-btn" onclick="toggleQueue();setTimeout(pollUser,400)">⏸ 보류/재개</button>
+    <label style="margin-left:8px;display:flex;align-items:center;gap:4px;">
+      <input type="checkbox" id="show-history" onchange="pollUser()"> 완료/취소 이력 포함
+    </label>
+    <button onclick="pollUser()" style="margin-left:auto;">🔄 새로고침</button>
+  </div>
+  <div id="user-stats"></div>
+  <div id="user-orders"><small>로딩 중...</small></div>
 </div>
 </div>
 
@@ -1615,23 +1663,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <button onclick="cmd('gripper_reinit')">🔁 재초기화</button>
       <button class="warn" onclick="cmd('restart_gripper_bridge')">🔧 브릿지 재시작</button>
     </div>
-    <div class="card">
-      <h3>전류 그래프 &nbsp;<small><span id="g_curr2">-</span> mA &nbsp;위치: <span id="g_pos2">-</span></small></h3>
-      <canvas id="gchart"></canvas>
-    </div>
-    <div class="card">
-      <h3>초음파 거리 &nbsp;<small>grasp 기준: <span id="us-thresh">80</span> mm</small></h3>
-      <div class="us-wrap">
-        <div class="us-fill" id="us-fill" style="width:0%;background:#555;"></div>
-        <div class="us-mark" id="us-mark" style="left:20%;"></div>
-        <span class="us-lbl" id="us-lbl">- mm</span>
-      </div>
-      <small>0mm ←──────────────────────── 400mm</small>
-    </div>
   </div>
   <div class="col">
     <div class="card">
-      <h3>기본 파라미터 (mA / step)</h3>
+      <h3>기본 파라미터 (mA / step) <small style="float:right;color:#5a9;font-size:10px;">적용 시 yaml 자동 저장</small></h3>
       <div class="row">열기<input id="goc" type="number" style="width:65px">
         닫기<input id="gcc" type="number" style="width:65px">
         이송<input id="gtc" type="number" style="width:65px"></div>
@@ -1642,7 +1677,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <button onclick="cmd('set_min_safe_z',{value:+v('msz')})">적용</button></div>
     </div>
     <div class="card">
-      <h3>물체별 파지 강도 (mA)</h3>
+      <h3>물체별 파지 강도 (mA) <small style="float:right;color:#5a9;font-size:10px;">적용 시 yaml 자동 저장</small></h3>
       <div class="row">기본 전류<input id="gcd" type="number" style="width:65px">
         <button onclick="applyGripStrength()">전체 적용</button></div>
       <table class="grip-tbl">
@@ -1674,15 +1709,16 @@ const v = id => $(id) ? $(id).value : '';
 
 // ── 탭 전환 ─────────────────────────────────────────────────────────────────
 function showTab(t){
-  ['main','gripper','log'].forEach(n=>{
+  ['main','user','gripper','log'].forEach(n=>{
     const p=$('page-'+n), tb=$('tab-'+n);
     if(p) p.className='page'+(n===t?' active':'');
     if(tb) tb.className='tab'+(n===t?' active':'');
   });
   if(t==='log') pollLog();
+  if(t==='user') pollUser();
 }
 
-// ── cmd() with error handling ────────────────────────────────────────────────
+// ── cmd() ────────────────────────────────────────────────────────────────────
 async function cmd(action, payload={}){
   try{
     const r = await fetch('/api/command',{method:'POST',
@@ -1715,7 +1751,6 @@ async function loadSettings(){
     set('gtc','gripper_transport_current'); set('gpv','gripper_profile_velocity');
     set('gpa','gripper_profile_acceleration'); set('msz','min_safe_z');
     set('gcd','grip_current_default');
-    // 물체별 파지 테이블
     gripNames=s.grip_class_names||[]; gripCurrents=s.grip_class_currents||[];
     renderGripTable();
     settingsLoaded=true;
@@ -1754,38 +1789,87 @@ async function loadModels(){
 const HW={0:'INIT',1:'STANDBY',2:'MOVING',3:'SAFE_OFF',4:'TEACH',5:'SAFE_STOP',
   6:'E-STOP',7:'HOMING',8:'RECOVERY',15:'NOT_READY','-1':'?'};
 
-// ── 그리퍼 전류 sparkline ────────────────────────────────────────────────────
-const GC_LEN=60; // 60샘플 ≈ 30초(500ms poll)
+// ── 서보 토글 ─────────────────────────────────────────────────────────────────
+let lastHwState=-1;
+function updateServoBtn(hwState){
+  lastHwState=hwState;
+  const btn=$('servo-btn');
+  if(!btn)return;
+  if(hwState===3){
+    btn.textContent='⚡ 서보 ON';
+    btn.className='go';
+  }else{
+    btn.textContent='서보 OFF';
+    btn.className='warn';
+  }
+}
+function toggleServo(){
+  if(lastHwState===3){cmd('servo_on');}
+  else{if(confirm('서보 OFF? 로봇 낙하 위험'))cmd('servo_off');}
+}
+
+// ── 긴급정지 토글 ─────────────────────────────────────────────────────────────
+function updateEStopBtn(hwState){
+  const btn=$('estop-btn');
+  if(!btn)return;
+  if(hwState===6){ // E-STOP
+    btn.textContent='✅ 긴급정지 해제';
+    btn.className='go';
+    btn.style.cssText='width:100%;padding:14px;font-size:15px;font-weight:bold;margin-bottom:6px;';
+  }else{
+    btn.textContent='⛔ 긴급정지';
+    btn.className='danger';
+    btn.style.cssText='width:100%;padding:14px;font-size:15px;font-weight:bold;margin-bottom:6px;';
+  }
+}
+function toggleEStop(){
+  if(lastHwState===6){cmd('e_stop_reset');}
+  else{cmd('e_stop');}
+}
+
+// ── 그리퍼 전류 sparkline (0 중앙, ±300mA, close=빨강/open=파랑) ─────────────
+const GC_LEN=60;
 const gcBuf=new Array(GC_LEN).fill(0);
-const GC_MAX=500;
-function gcPush(val){gcBuf.shift();gcBuf.push(Math.max(0,+val||0));}
+const GC_RANGE=300; // ±300 mA
+function gcPush(val){gcBuf.shift();gcBuf.push(Math.max(-GC_RANGE,Math.min(GC_RANGE,+val||0)));}
 function gcDraw(){
   const c=$('gchart'); if(!c)return;
-  const W=c.offsetWidth||300, H=70;
+  const W=c.offsetWidth||300, H=90;
   c.width=W; c.height=H;
   const ctx=c.getContext('2d');
   ctx.clearRect(0,0,W,H);
   ctx.fillStyle='#111'; ctx.fillRect(0,0,W,H);
-  // grid lines
+  const mid=H/2;
+  const valToY=v=>mid-((v/GC_RANGE)*mid);
+  // grid
   ctx.strokeStyle='#2a2a2a'; ctx.lineWidth=1;
-  [0.25,0.5,0.75].forEach(f=>{
-    ctx.beginPath();ctx.moveTo(0,H*f);ctx.lineTo(W,H*f);ctx.stroke();
+  [-300,-150,0,150,300].forEach(v=>{
+    const y=valToY(v);
+    ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();
   });
+  // zero line (brighter)
+  ctx.strokeStyle='#444'; ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(0,mid);ctx.lineTo(W,mid);ctx.stroke();
   // labels
-  ctx.fillStyle='#555';ctx.font='9px monospace';
-  [0,250,500].forEach((v,i)=>{ctx.fillText(v+'mA',2,H-(H*v/GC_MAX)+9);});
-  // line
-  ctx.strokeStyle='#4fc3f7';ctx.lineWidth=2;ctx.beginPath();
-  gcBuf.forEach((v,i)=>{
-    const x=W*(i/(GC_LEN-1));
-    const y=H-H*(Math.min(v,GC_MAX)/GC_MAX);
-    i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
+  ctx.font='10px monospace';ctx.textAlign='left';
+  [[-300,'#5577ff'],[0,'#888'],[300,'#ff4444']].forEach(([v,col])=>{
+    const y=valToY(v);
+    ctx.fillStyle=col;
+    ctx.fillText((v>0?'+':'')+v,3,y<10?12:(y>H-10?H-2:y+10));
   });
-  ctx.stroke();
+  // draw line in colored segments
+  ctx.lineWidth=2;
+  gcBuf.forEach((val,i)=>{
+    if(i===0)return;
+    const x1=W*((i-1)/(GC_LEN-1)), y1=valToY(gcBuf[i-1]);
+    const x2=W*(i/(GC_LEN-1)),     y2=valToY(val);
+    ctx.strokeStyle=val>=0?'#ff4444':'#4488ff';
+    ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);ctx.stroke();
+  });
 }
 
 // ── 초음파 바 ────────────────────────────────────────────────────────────────
-let graspThresh=80;
+let graspThresh=40;
 function usColor(mm){
   if(mm>300)return'#555';
   if(mm>200)return'#888800';
@@ -1818,11 +1902,9 @@ function updateSelLabel(){
   if(el)el.textContent='선택: '+(selectedLabel||'자동');
 }
 function renderObjArea(objects){
-  // 선택 버튼 (box 제외)
   const row=$('obj-sel-row');
   if(row){
     const selBtns=objects.filter(o=>o.label!=='box'&&o.reachable);
-    // dedup by label
     const seen={},labels=[];
     selBtns.forEach(o=>{if(!seen[o.label]){seen[o.label]=1;labels.push(o.label);}});
     const auto=`<button id="sel-auto" class="${selectedLabel===''?'active-sel':''}" onclick="selectObject('')">🎯 자동</button>`;
@@ -1832,7 +1914,6 @@ function renderObjArea(objects){
     }).join('');
     row.innerHTML=auto+btns;
   }
-  // 검출 정보 (모든 물체, box 포함 표시만)
   const objDiv=$('objects');
   if(objDiv){
     objDiv.innerHTML=objects.map(o=>{
@@ -1852,54 +1933,39 @@ function renderObjArea(objects){
 async function poll(){
   try{
     const s=await(await fetch('/api/state')).json();
-    // 상태 헤더
     const ss=s.system_status||{};
-    $('status-dots').innerHTML=Object.entries(ss).map(([k,st])=>
-      `<span class="dot ${st}">${k}</span>`).join(' ');
+    $('status-dots').innerHTML=Object.entries(ss).map(([k,st])=>{
+      const sep=k==='USER'?'<span class="dot-sep"></span>':'';
+      return sep+`<span class="dot ${st}">${k}</span>`;
+    }).join(' ');
     const stt=s.pick_place_state||'?';
     $('activity').textContent=`상태: ${stt} · HW: ${HW[s.hw_state]||s.hw_state} · 속도: ${s.speed_mode===1?'감속':'정상'}`;
     const err=(stt==='ERROR')?(s.error_text||'ERROR'):'';
     $('banner').style.display=err?'block':'none';
     $('banner').textContent=err?('🔴 '+err):'';
-    // 카메라
+    updateServoBtn(s.hw_state);
+    updateEStopBtn(s.hw_state);
     if(s.has_image){
       $('cam').src='/api/image.jpg?t='+Date.now();
       $('cam').style.display='block'; $('cam-no').style.display='none';
     }else{
       $('cam').style.display='none'; $('cam-no').style.display='flex';
     }
-    // 검출
     renderObjArea(s.detected_objects||[]);
-    // 그리퍼 수치 (메인 + 그리퍼 탭)
     const gc=s.gripper_current_ma;
     const gp=s.gripper_position_raw;
     if($('g_curr2'))$('g_curr2').textContent=gc;
     if($('g_pos2'))$('g_pos2').textContent=gp;
     gcPush(gc); gcDraw();
-    // 초음파
-    const umm=s.ultrasonic_mm;
-    updateUs(umm);
-    if($('us-lbl'))$('us-lbl').textContent=(umm==null?'-':umm)+' mm';
-    // 모델 경로
+    updateUs(s.ultrasonic_mm);
     const mp=s.current_model_path||'';
     if(mp&&$('model-path'))$('model-path').textContent=mp;
-    // 최근 명령 (main 탭 col3)
-    const logs=await(await fetch('/api/commands')).json();
-    const tb=$('cmdtb');
-    if(tb){
-      const fmtT=ts=>{if(!ts)return'';const d=new Date(ts*1000);return d.toTimeString().slice(0,8);};
-      tb.innerHTML=logs.slice(0,10).map(l=>
-        `<tr><td>#${l.id}</td><td>${l.action}</td>`+
-        `<td><span class="log-badge ${l.status}">${l.status}</span></td>`+
-        `<td>${fmtT(l.ts)}</td><td>${fmtT(l.done_ts)}</td>`+
-        `<td><small>${(l.result||'').slice(0,40)}</small></td></tr>`).join('');
-    }
   }catch(e){$('activity').textContent='연결 끊김: '+e;}
   if(!settingsLoaded)loadSettings();
 }
-setInterval(poll,500); poll();
+setInterval(poll,200); poll();
 
-// ── 유저 주문 큐 ─────────────────────────────────────────────────────────────
+// ── 공통 주문 헬퍼 ───────────────────────────────────────────────────────────
 const ST_CLS={RUNNING:'running',PAUSED:'pause',QUEUED:'queued',DONE:'done',FAILED:'failed',CANCELED:'canceled'};
 function statusKo(s){return{RUNNING:'처리중',PAUSED:'보류',QUEUED:'대기',DONE:'완료',FAILED:'실패',CANCELED:'취소'}[s]||s;}
 async function cancelOrder(id){
@@ -1908,7 +1974,7 @@ async function cancelOrder(id){
     body:JSON.stringify({order_id:id})});
   const j=await r.json();
   if(!j.ok)alert('취소 실패: '+(j.error||'처리중 품목 보호'));
-  pollOrders();
+  pollOrders(); pollUser();
 }
 async function cancelItem(itemId){
   if(!confirm('이 품목을 취소?'))return;
@@ -1916,40 +1982,72 @@ async function cancelItem(itemId){
     body:JSON.stringify({item_id:itemId})});
   const j=await r.json();
   if(!j.ok)alert('취소 실패: '+(j.error||''));
-  pollOrders();
+  pollOrders(); pollUser();
 }
 async function toggleQueue(){
   await fetch('/api/orders/pause',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
   pollOrders();
 }
+function renderOrderCard(o){
+  const cls=ST_CLS[o.status]||'queued';
+  const items=(o.items||[]).map(it=>{
+    const ic=ST_CLS[it.status]||'queued';
+    const cb=it.status==='QUEUED'?`<button class="item-cancel" onclick="cancelItem('${it.item_id||''}')">✕</button>`:'';
+    return `<div class="item-row"><span class="badge ${ic}">${it.class_name}</span>`+
+           `<span class="badge ${ic}" style="font-size:9px;">${statusKo(it.status)}</span>${cb}</div>`;
+  }).join('');
+  const isDone=o.status==='DONE'||o.status==='CANCELED'||o.status==='FAILED';
+  const cancelBtn=isDone?'':
+    `<button class="item-cancel" style="margin-left:auto;" onclick="cancelOrder('${o.order_id}')">취소</button>`;
+  return `<div class="order ${cls}">`+
+    `<div style="display:flex;align-items:center;margin-bottom:4px;">`+
+    `<span class="tk">${o.ticket_no||o.order_id}</span>`+
+    `<span class="badge ${cls}" style="margin-left:6px;">${statusKo(o.status)}</span>`+
+    cancelBtn+`</div>`+
+    `${items||'<small>품목 없음</small>'}`+
+    `<div style="margin-top:3px;"><small>${o.created_at||''}</small></div></div>`;
+}
+
+// ── 메인 탭: RUNNING 주문 하나만 표시 ─────────────────────────────────────────
 async function pollOrders(){
   try{
     const d=await(await fetch('/api/orders')).json();
-    const pz=$('queue-paused');
-    if(d.error){pz.innerHTML=`<span class="badge failed">${d.error}</span>`;}
-    else if(d.paused){pz.innerHTML='<span class="badge pause">큐 보류중</span>';}
-    else{pz.innerHTML='<span class="badge run">동작중</span>';}
     const orders=d.orders||[];
-    $('orders').innerHTML=orders.length?orders.map(o=>{
-      const cls=ST_CLS[o.status]||'queued';
-      const items=(o.items||[]).map(it=>{
-        const ic=ST_CLS[it.status]||'queued';
-        const canCancel=it.status==='QUEUED';
-        const cancelBtn=canCancel?`<button class="item-cancel" onclick="cancelItem('${it.item_id}')">✕</button>`:'';
-        return `<div class="item-row"><span class="badge ${ic}">${it.class_name}</span>`+
-               `<span class="badge ${ic}" style="font-size:9px;">${statusKo(it.status)}</span>${cancelBtn}</div>`;
-      }).join('');
-      return `<div class="order ${cls}">`+
-        `<div style="display:flex;align-items:center;margin-bottom:4px;">`+
-        `<span class="tk">${o.ticket_no||o.order_id}</span>`+
-        `<span class="badge ${cls}" style="margin-left:6px;">${statusKo(o.status)}</span>`+
-        `<button class="item-cancel" style="margin-left:auto;" onclick="cancelOrder('${o.order_id}')">취소</button></div>`+
-        `${items||'<small>품목 없음</small>'}`+
-        `<div style="margin-top:3px;"><small>${o.created_at||''}</small></div></div>`;
-    }).join(''):'<small>대기 중인 주문 없음</small>';
-  }catch(e){$('orders').innerHTML='<small>큐 로드 실패: '+e+'</small>';}
+    const running=orders.filter(o=>o.status==='RUNNING');
+    const el=$('orders');
+    if(!el)return;
+    if(d.error){el.innerHTML=`<small>${d.error}</small>`;}
+    else if(running.length){el.innerHTML=running.map(o=>renderOrderCard(o)).join('');}
+    else{el.innerHTML='<small style="color:#666;">작업 중인 주문 없음</small>';}
+  }catch(e){const el=$('orders');if(el)el.innerHTML='<small>큐 로드 실패: '+e+'</small>';}
 }
-setInterval(pollOrders,1500);pollOrders();
+setInterval(pollOrders,1500); pollOrders();
+
+// ── 유저 큐 탭 전체 관리 ─────────────────────────────────────────────────────
+async function pollUser(){
+  const showAll=$('show-history')&&$('show-history').checked;
+  try{
+    const d=await(await fetch('/api/orders'+(showAll?'?all=1':''))).json();
+    const pb=$('user-q-badge');
+    if(pb){
+      if(d.error)pb.innerHTML=`<span class="badge failed">${d.error}</span>`;
+      else if(d.paused)pb.innerHTML='<span class="badge pause">⏸ 큐 보류중</span>';
+      else pb.innerHTML='<span class="badge run">▶ 동작중</span>';
+    }
+    const pBtn=$('user-pause-btn');
+    if(pBtn)pBtn.textContent=d.paused?'▶ 큐 재개':'⏸ 큐 보류';
+    const orders=d.orders||[];
+    const cnt={RUNNING:0,QUEUED:0,PAUSED:0,DONE:0,FAILED:0,CANCELED:0};
+    orders.forEach(o=>{if(cnt[o.status]!==undefined)cnt[o.status]++;});
+    const stats=$('user-stats');
+    if(stats)stats.innerHTML=['RUNNING','QUEUED','PAUSED','DONE','FAILED','CANCELED'].map(k=>{
+      const ko={RUNNING:'처리중',QUEUED:'대기',PAUSED:'보류',DONE:'완료',FAILED:'실패',CANCELED:'취소'}[k];
+      return `<div class="stat-box"><div class="sval">${cnt[k]}</div><div class="slbl">${ko}</div></div>`;
+    }).join('');
+    const uo=$('user-orders');
+    if(uo)uo.innerHTML=orders.length?orders.map(o=>renderOrderCard(o)).join(''):'<small>주문 없음</small>';
+  }catch(e){const uo=$('user-orders');if(uo)uo.innerHTML='<small>로드 실패: '+e+'</small>';}
+}
 
 // ── 로그 탭 ──────────────────────────────────────────────────────────────────
 let logFilter='all';
@@ -1961,6 +2059,8 @@ function setLogFilter(f){
   });
   pollLog();
 }
+(function(){const h=location.hash.replace('#','');if(h&&['main','user','gripper','log'].includes(h))showTab(h);})();
+
 async function pollLog(){
   try{
     const data=await(await fetch('/api/log')).json();
@@ -1969,11 +2069,14 @@ async function pollLog(){
     const filtered=logFilter==='all'?data:data.filter(e=>e.type===logFilter);
     if(!filtered.length){list.innerHTML='<small>로그 없음</small>';return;}
     list.innerHTML=filtered.map(e=>{
+      const isUser=e.source&&e.source.includes('유저');
+      const userCls=isUser?' user-src':'';
       const typeBadge=`<span class="log-badge ${e.type}">${e.type.toUpperCase()}</span>`;
       const stBadge=e.status?`<span class="log-badge ${e.status.toLowerCase()}">${e.status}</span>`:'';
       const done=e.done_ts_str?` → ${e.done_ts_str}`:'';
-      return `<div class="log-entry ${e.type}">`+
-        `<div class="log-row1"><span>${e.ts_str}${done}</span><span>${e.source}</span></div>`+
+      return `<div class="log-entry ${e.type}${userCls}">`+
+        `<div class="log-row1"><span>${e.ts_str}${done}</span>`+
+        `<span style="color:${isUser?'#999':'#ccc'}">${e.source}</span></div>`+
         `<div class="log-row2">${typeBadge} ${stBadge} ${e.text}${e.detail?` <small>· ${e.detail}</small>`:''}</div>`+
         `</div>`;
     }).join('');

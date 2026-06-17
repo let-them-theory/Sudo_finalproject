@@ -6,7 +6,6 @@ export const PRODUCTS: Record<string, { name: string; emoji: string }> = {
   bsnack: { name: '봉지과자', emoji: '🍿' },
   water: { name: '생수', emoji: '💧' },
   jelly: { name: '젤리', emoji: '🍮' },
-  box: { name: '박스', emoji: '📦' },
   can: { name: '캔', emoji: '🥫' },
   boxsnack: { name: '박스과자', emoji: '🍫' },
   wafers: { name: '웨하스', emoji: '🧇' },
