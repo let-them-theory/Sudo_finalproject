@@ -218,6 +218,7 @@ class WebControlNode(Node):
         self.last_hw_state_time = 0.0
         self.last_speed_mode_time = 0.0
         self.last_ultrasonic_time = 0.0
+        self.current_model_path = ''  # set_model 성공 시 갱신
 
         # HTTP 스레드가 읽는 최신 JPEG 프레임(불변 bytes, GIL 하에서 참조 교체는 원자적).
         self.latest_jpeg = None
@@ -350,6 +351,13 @@ class WebControlNode(Node):
                 pose_z     REAL,
                 reachable  INTEGER,
                 ts         REAL
+            );
+            CREATE TABLE IF NOT EXISTS error_log (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts        REAL NOT NULL,
+                level     TEXT NOT NULL DEFAULT 'WAR',
+                text      TEXT NOT NULL,
+                ticket_no TEXT NOT NULL DEFAULT ''
             );
             """
         )
@@ -562,6 +570,25 @@ class WebControlNode(Node):
 
     def _cb_error(self, msg: String):
         self.last_error_text = msg.data
+        text = msg.data
+        level = 'ERR' if text.startswith('[ERR]') else 'WAR'
+        ticket = ''
+        try:
+            repo = self._order_repo
+            if repo is not None:
+                repo.reload()
+                for o in repo.list_orders({OrderStatus.RUNNING}):
+                    ticket = o.ticket_no or ''
+                    break
+        except Exception:
+            pass
+        try:
+            self.db.execute(
+                'INSERT INTO error_log(ts, level, text, ticket_no) VALUES (?, ?, ?, ?)',
+                (time.time(), level, text, ticket))
+            self.db.commit()
+        except Exception:
+            pass
 
     def _cb_ultrasonic(self, msg: Range):
         if msg.range is not None and msg.range > 0.0:
@@ -653,6 +680,7 @@ class WebControlNode(Node):
                         None if self.ultrasonic_range_m is None else round(self.ultrasonic_range_m * 1000.0, 1))
         self._put_state('system_status', system_status)
         self._put_state('system_reset_phase', self._system_reset_phase)
+        self._put_state('current_model_path', self.current_model_path)
 
         # 검출 물체 테이블 교체(매 갱신마다 비우고 다시 채움).
         self.db.execute('DELETE FROM detected_objects')
@@ -809,6 +837,7 @@ class WebControlNode(Node):
             self._set_params(cmd_id, self.cli_object_set_parameters,
                              [('yolo_model', ParameterType.PARAMETER_STRING, path)])
             self._set_setting('yolo_model_path', path)
+            self.current_model_path = path
             return
 
         if action == 'set_camera_auto_exposure':
@@ -1113,6 +1142,12 @@ class WebControlNode(Node):
                 if path == '/api/orders':
                     self._send_json(self._read_orders())
                     return
+                if path == '/api/log':
+                    self._send_json(self._read_log())
+                    return
+                if path == '/api/models':
+                    self._send_json(self._scan_models())
+                    return
                 if path.startswith('/api/command/'):
                     try:
                         cid = int(path.rsplit('/', 1)[1])
@@ -1126,7 +1161,8 @@ class WebControlNode(Node):
             # ---- POST ----
             def do_POST(self):
                 path = self.path.split('?', 1)[0]
-                if path not in ('/api/command', '/api/orders/cancel', '/api/orders/pause'):
+                if path not in ('/api/command', '/api/orders/cancel', '/api/orders/pause',
+                                '/api/orders/cancel_item'):
                     self._send_json({'error': 'not found'}, 404)
                     return
                 length = int(self.headers.get('Content-Length', 0))
@@ -1164,6 +1200,21 @@ class WebControlNode(Node):
                             paused = not node._order_repo.is_queue_paused()
                         node._order_repo.set_queue_paused(paused)
                         self._send_json({'ok': True, 'paused': paused})
+                    except Exception as e:
+                        self._send_json({'ok': False, 'error': str(e)}, 500)
+                    return
+                if path == '/api/orders/cancel_item':
+                    if node._order_repo is None:
+                        self._send_json({'ok': False, 'error': 'DB 없음'}, 503)
+                        return
+                    item_id = str(body.get('item_id', '') or '')
+                    if not item_id:
+                        self._send_json({'ok': False, 'error': 'item_id 누락'}, 400)
+                        return
+                    try:
+                        node._order_repo.reload()
+                        node._order_repo.cancel_item(item_id)
+                        self._send_json({'ok': True})
                     except Exception as e:
                         self._send_json({'ok': False, 'error': str(e)}, 500)
                     return
@@ -1259,6 +1310,70 @@ class WebControlNode(Node):
                     return {'error': 'not found'}
                 return dict(row)
 
+            def _read_log(self):
+                conn = self._db()
+                try:
+                    cmd_rows = conn.execute(
+                        'SELECT ts, action as text, status, result, done_ts, id '
+                        'FROM command_queue ORDER BY ts DESC LIMIT 200').fetchall()
+                    err_rows = conn.execute(
+                        'SELECT ts, text, level, ticket_no, id '
+                        'FROM error_log ORDER BY ts DESC LIMIT 200').fetchall()
+                finally:
+                    conn.close()
+                import datetime
+                def fmt(ts):
+                    if ts is None: return ''
+                    try: return datetime.datetime.fromtimestamp(ts).strftime('%H:%M:%S')
+                    except: return str(ts)
+                entries = []
+                for r in cmd_rows:
+                    entries.append({
+                        'ts': r['ts'], 'ts_str': fmt(r['ts']),
+                        'type': 'cmd', 'source': '관리자',
+                        'text': r['text'], 'status': r['status'],
+                        'detail': r['result'] or '', 'done_ts_str': fmt(r['done_ts']),
+                    })
+                for r in err_rows:
+                    ticket = r['ticket_no'] or ''
+                    src = f'#{ticket} (유저 큐)' if ticket else '시스템'
+                    entries.append({
+                        'ts': r['ts'], 'ts_str': fmt(r['ts']),
+                        'type': r['level'].lower(),  # 'err' or 'war'
+                        'source': src,
+                        'text': r['text'], 'status': r['level'],
+                        'detail': '', 'done_ts_str': '',
+                    })
+                entries.sort(key=lambda x: x['ts'] or 0, reverse=True)
+                return entries[:300]
+
+            def _scan_models(self):
+                import glob, os
+                search_dirs = [
+                    os.path.expanduser('~/Downloads'),
+                    os.path.expanduser('~/'),
+                    os.path.expanduser('~/models'),
+                ]
+                try:
+                    from ament_index_python.packages import get_package_share_directory
+                    search_dirs.append(
+                        os.path.join(get_package_share_directory('dsr_realsense_pick_place'), 'models'))
+                except Exception:
+                    pass
+                found = []
+                seen = set()
+                for d in search_dirs:
+                    for p in glob.glob(os.path.join(d, '*.pt')):
+                        ap = os.path.abspath(p)
+                        if ap not in seen:
+                            seen.add(ap)
+                            found.append(ap)
+                found.sort()
+                current = node.current_model_path
+                if current and os.path.isfile(current) and current not in seen:
+                    found.insert(0, current)
+                return {'models': found, 'current': current}
+
         self._httpd = ThreadingHTTPServer((self.http_host, self.http_port), Handler)
         self._http_thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
         self._http_thread.start()
@@ -1285,299 +1400,585 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>DSR Pick &amp; Place 웹 제어</title>
 <style>
-  :root { color-scheme: dark; }
-  body { font-family: system-ui, sans-serif; margin: 0; background:#1e1e1e; color:#e0e0e0; }
-  header { background:#101820; padding:8px 14px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
-  .dot { padding:2px 8px; border-radius:4px; font-size:12px; font-weight:bold; background:#666; }
-  .ok{background:#1a7a1a;} .warn{background:#b38600;} .bad{background:#cc0000;}
-  main { display:flex; gap:14px; padding:14px; flex-wrap:wrap; align-items:flex-start; }
-  .col { flex:1; min-width:320px; }
-  .card { background:#2a2a2a; border-radius:10px; padding:12px; margin-bottom:12px; }
-  .card h3 { margin:0 0 8px; font-size:14px; color:#9fd0ff; }
-  button { background:#374151; color:#fff; border:none; border-radius:6px; padding:8px 10px;
-           font-size:13px; cursor:pointer; margin:3px; }
-  button:hover { background:#4b5563; }
-  button.danger { background:#cc0000; } button.danger:hover{background:#ff1a1a;}
-  button.warn   { background:#e65c00; } button.go{background:#1a7a1a;}
-  input, select { background:#1e1e1e; color:#fff; border:1px solid #555; border-radius:4px; padding:4px; }
-  #activity { font-weight:bold; color:#cfe8ff; }
-  #banner { color:#ff6666; font-weight:bold; padding:6px; display:none; }
-  table { width:100%; border-collapse:collapse; font-size:12px; }
-  td,th { border-bottom:1px solid #444; padding:3px 4px; text-align:left; }
-  .obj { background:#333; border-radius:6px; padding:6px; margin:4px 0; cursor:pointer; }
-  .obj:hover { background:#3d4f63; }
-  .obj.unreach { opacity:.4; cursor:not-allowed; }
-  img { max-width:100%; border-radius:8px; background:#111; }
-  .row { display:flex; gap:6px; align-items:center; margin:4px 0; flex-wrap:wrap; }
-  label { font-size:12px; }
-  small { color:#999; }
-  .order { border-radius:6px; padding:6px 8px; margin:5px 0; border-left:5px solid #666; background:#333; }
-  .order.run    { border-left-color:#1a7a1a; background:#1f3320; }
-  .order.pause  { border-left-color:#e6a700; background:#33301f; }
-  .order.queued { border-left-color:#888; background:#333; }
-  .order .tk { font-weight:bold; }
-  .order .badge { font-size:11px; padding:1px 6px; border-radius:4px; background:#666; margin-left:6px; }
-  .badge.run{background:#1a7a1a;} .badge.pause{background:#e6a700;color:#222;} .badge.queued{background:#666;}
-  .order .items { font-size:12px; color:#cfe8ff; margin-top:3px; }
-  .order .cancel { float:right; background:#a33; padding:2px 8px; }
-  #select-grid { display:flex; flex-wrap:wrap; gap:4px; margin-bottom:6px; }
-  .selbtn { background:#374151; }
-  .selbtn.active { background:#1a7a1a; outline:2px solid #9fffaf; outline-offset:1px; }
-  #sel-auto.active { background:#1a7a1a; outline:2px solid #9fffaf; outline-offset:1px; }
+  :root{color-scheme:dark;}
+  *{box-sizing:border-box;}
+  body{font-family:system-ui,sans-serif;margin:0;background:#1a1a1a;color:#e0e0e0;}
+  header{background:#0d1520;padding:8px 14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;border-bottom:1px solid #2a3a50;}
+  .dot{padding:2px 7px;border-radius:4px;font-size:11px;font-weight:bold;background:#555;}
+  .ok{background:#1a7a1a;} .warn{background:#8a6000;} .bad{background:#a00000;}
+  nav{background:#111820;padding:0 14px;display:flex;gap:2px;border-bottom:1px solid #2a3a50;}
+  .tab{background:none;border:none;color:#8ab;padding:10px 18px;cursor:pointer;font-size:13px;border-bottom:3px solid transparent;border-radius:0;margin:0;}
+  .tab:hover{color:#def;}
+  .tab.active{color:#9fd0ff;border-bottom-color:#9fd0ff;}
+  .page{display:none;}
+  .page.active{display:block;}
+  .cols{display:flex;gap:12px;padding:12px;flex-wrap:wrap;align-items:flex-start;}
+  .col{flex:1;min-width:300px;}
+  .col-wide{flex:1.6;min-width:360px;}
+  .card{background:#252525;border-radius:10px;padding:11px 13px;margin-bottom:11px;border:1px solid #333;}
+  .card h3{margin:0 0 8px;font-size:13px;color:#9fd0ff;font-weight:600;}
+  button{background:#374151;color:#fff;border:none;border-radius:6px;padding:7px 10px;font-size:12px;cursor:pointer;margin:2px;}
+  button:hover{background:#4b5a6e;}
+  button.danger{background:#8b0000;} button.danger:hover{background:#c00000;}
+  button.warn{background:#7a3200;} button.warn:hover{background:#b04800;}
+  button.go{background:#1a5e1a;} button.go:hover{background:#1e8a1e;}
+  button.active-sel{background:#1a7a1a;outline:2px solid #6fffaf;outline-offset:1px;}
+  input,select{background:#1a1a1a;color:#fff;border:1px solid #555;border-radius:4px;padding:4px 6px;font-size:12px;}
+  #activity{font-weight:bold;color:#cfe8ff;font-size:12px;}
+  #banner{color:#ff8888;font-weight:bold;padding:6px 14px;display:none;background:#2a0808;border-bottom:1px solid #a00;}
+  .row{display:flex;gap:6px;align-items:center;margin:4px 0;flex-wrap:wrap;}
+  label{font-size:12px;color:#bbb;}
+  small{color:#888;font-size:11px;}
+  /* camera */
+  #cam-wrap{position:relative;background:#111;border-radius:8px;min-height:240px;overflow:hidden;}
+  #cam{width:100%;display:block;border-radius:8px;object-fit:contain;}
+  #cam-no{position:absolute;inset:0;display:none;align-items:center;justify-content:center;color:#ff3333;font-size:22px;font-weight:bold;letter-spacing:3px;background:#0a0a0a;}
+  /* detect objects */
+  .obj-info{background:#2a2a2a;border-radius:5px;padding:5px 7px;margin:3px 0;font-size:12px;border-left:3px solid #555;}
+  .obj-info.reach{border-left-color:#2a6a2a;}
+  .obj-info.unreach{opacity:.5;}
+  /* object select buttons */
+  #obj-sel-row{display:flex;flex-wrap:wrap;gap:4px;margin:6px 0 2px;}
+  /* queue */
+  .order{border-radius:7px;padding:7px 9px;margin:5px 0;border-left:5px solid #555;background:#2a2a2a;}
+  .order.run{border-left-color:#1a8a1a;background:#1a2e1a;}
+  .order.pause{border-left-color:#c89000;background:#2a2610;}
+  .order.queued{border-left-color:#666;background:#2a2a2a;}
+  .order .tk{font-weight:bold;font-size:13px;}
+  .badge{font-size:10px;padding:1px 6px;border-radius:4px;background:#555;display:inline-block;margin:1px;}
+  .badge.run{background:#1a7a1a;} .badge.pause{background:#c89000;color:#111;} .badge.queued{background:#555;}
+  .badge.done{background:#2255aa;} .badge.failed{background:#993300;} .badge.canceled{background:#553300;}
+  .badge.running{background:#1a7a1a;}
+  .item-row{display:flex;align-items:center;gap:5px;margin:2px 0;}
+  .item-cancel{background:#6a2020;padding:1px 6px;font-size:11px;}
+  /* gripper chart */
+  #gchart{width:100%;height:70px;border-radius:6px;background:#111;display:block;}
+  /* ultrasonic bar */
+  .us-wrap{background:#1a1a1a;border-radius:5px;height:24px;position:relative;overflow:hidden;border:1px solid #444;margin:6px 0;}
+  .us-fill{height:100%;transition:width .3s,background .5s;border-radius:4px;}
+  .us-mark{position:absolute;top:0;bottom:0;width:2px;background:#fff8;pointer-events:none;}
+  .us-lbl{position:absolute;right:6px;top:50%;transform:translateY(-50%);font-size:11px;font-weight:bold;color:#fff;}
+  /* grip table */
+  .grip-tbl{width:100%;font-size:12px;border-collapse:collapse;margin-top:5px;}
+  .grip-tbl td,.grip-tbl th{padding:3px 5px;border-bottom:1px solid #333;text-align:left;}
+  .grip-tbl th{color:#9fd0ff;font-weight:600;}
+  .grip-tbl input{width:65px;}
+  /* log */
+  .log-filter{display:flex;gap:4px;margin-bottom:8px;}
+  .log-filter button{font-size:11px;padding:4px 10px;}
+  .log-filter button.active-sel{background:#1a5ea0;}
+  .log-entry{border-radius:6px;padding:6px 9px;margin:4px 0;border-left:4px solid #555;background:#252525;}
+  .log-entry.cmd{border-left-color:#4466aa;}
+  .log-entry.err{border-left-color:#cc2222;background:#280a0a;}
+  .log-entry.war{border-left-color:#cc7700;background:#251800;}
+  .log-row1{display:flex;gap:10px;font-size:11px;color:#888;margin-bottom:2px;}
+  .log-row2{font-size:12px;}
+  .log-badge{padding:1px 6px;border-radius:3px;font-size:10px;font-weight:bold;}
+  .log-badge.cmd{background:#1a3a6a;} .log-badge.err{background:#8a0000;} .log-badge.war{background:#7a4000;}
+  .log-badge.done{background:#1a5a1a;} .log-badge.failed{background:#6a2200;} .log-badge.pending{background:#555;} .log-badge.running{background:#1a4a1a;}
+  #loglist{max-height:calc(100vh - 160px);overflow-y:auto;}
+  /* command log */
+  #cmdlog{max-height:220px;overflow-y:scroll;overflow-x:hidden;}
+  table{width:100%;border-collapse:collapse;font-size:11px;table-layout:fixed;}
+  td,th{border-bottom:1px solid #333;padding:3px 5px;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  #cmdtb td:last-child{color:#888;}
 </style>
 </head>
 <body>
 <header>
-  <strong>DSR Pick &amp; Place</strong>
+  <strong style="font-size:14px;color:#9fd0ff;">DSR Pick &amp; Place</strong>
   <span id="status-dots"></span>
-  <span id="activity">연결 중...</span>
+  <span id="activity" style="margin-left:auto;">연결 중...</span>
 </header>
 <div id="banner"></div>
-<main>
-  <div class="col">
+<nav>
+  <button class="tab active" id="tab-main" onclick="showTab('main')">🤖 메인</button>
+  <button class="tab" id="tab-gripper" onclick="showTab('gripper')">🦾 그리퍼</button>
+  <button class="tab" id="tab-log" onclick="showTab('log')">📋 로그</button>
+</nav>
+
+<!-- ═══════════════ 메인 탭 ═══════════════ -->
+<div class="page active" id="page-main">
+<div class="cols">
+  <!-- Col 1: Queue + Camera -->
+  <div class="col col-wide">
     <div class="card">
       <h3>유저 주문 큐 <span id="queue-paused"></span></h3>
-      <div class="row">
-        <button id="pauseBtn" onclick="toggleQueue()">큐 보류/재개</button>
+      <button id="pauseBtn" onclick="toggleQueue()">⏸ 큐 보류/재개</button>
+      <div id="orders" style="margin-top:6px;"><small>불러오는 중...</small></div>
+    </div>
+    <div class="card">
+      <h3>카메라 / 검출 &nbsp;<small id="sel-label" style="color:#9fd0ff;">선택: 자동</small></h3>
+      <div id="cam-wrap">
+        <img id="cam" alt="카메라 영상" src="">
+        <div id="cam-no">NO CAMERA</div>
       </div>
-      <div id="orders"><small>불러오는 중...</small></div>
-    </div>
-    <div class="card">
-      <h3>카메라 / 검출</h3>
-      <img id="cam" alt="카메라 영상" src="">
-      <div id="objects"></div>
-      <button onclick="cmd('select_object',{label:''})">자동 선택</button>
-    </div>
-    <div class="card">
-      <h3>검출 물체 선택 <span id="sel-cur"><small>선택: 자동</small></span></h3>
-      <div id="select-grid"></div>
-      <button id="sel-auto" onclick="selectObject('')">🎯 자동 선택</button>
-      <div><small>box(상자)는 이동 대상이 아니므로 선택할 수 없습니다.</small></div>
+      <div id="obj-sel-row">
+        <button id="sel-auto" class="active-sel" onclick="selectObject('')">🎯 자동</button>
+      </div>
+      <div id="objects" style="margin-top:4px;"></div>
     </div>
   </div>
 
+  <!-- Col 2: Robot controls -->
   <div class="col">
     <div class="card">
       <h3>긴급 제어</h3>
       <button class="danger" onclick="cmd('e_stop')">⛔ 긴급정지</button>
       <button class="warn" onclick="cmd('cancel')">🚫 태스크 중단</button>
       <button class="go" onclick="cmd('e_stop_reset')">✅ 긴급정지 해제</button>
-      <button onclick="cmd('clear_error')">에러 해제</button>
+      <button onclick="cmd('clear_error')">🔄 에러 해제</button>
     </div>
     <div class="card">
       <h3>로봇 동작</h3>
       <button onclick="cmd('run_once')">▶ 한 번 실행</button>
-      <button class="go" onclick="cmd('sort_all')">🗂 자동 분류(Sort All)</button>
-      <button onclick="cmd('run_once_package')">📦 패키지 픽(테스트)</button>
-      <button onclick="cmd('go_home')">🏠 HOME 이동</button>
-      <button onclick="cmd('recover_to_home')">에러복구 &amp; HOME</button>
-      <div class="row">
+      <button class="go" onclick="cmd('sort_all')">🗂 자동 분류</button>
+      <button onclick="cmd('run_once_package')">📦 패키지 픽</button>
+      <button onclick="cmd('go_home')">🏠 HOME</button>
+      <button onclick="cmd('recover_to_home')">에러복구+HOME</button>
+      <div class="row" style="margin-top:4px;">
         <button onclick="cmd('speed_normal')">🟢 정상속도</button>
         <button onclick="cmd('speed_reduced')">🟡 감속</button>
         <button onclick="cmd('servo_on')">서보 ON</button>
-        <button class="warn" onclick="if(confirm('서보 OFF? 중력으로 로봇이 떨어질 수 있습니다'))cmd('servo_off')">서보 OFF</button>
+        <button class="warn" onclick="if(confirm('서보 OFF? 로봇 낙하 위험'))cmd('servo_off')">서보 OFF</button>
         <button onclick="cmd('safety_normal')">정상운전</button>
         <button onclick="cmd('safety_backdrive')">역구동</button>
       </div>
     </div>
     <div class="card">
-      <h3>그리퍼</h3>
-      <button onclick="cmd('gripper_open')">OPEN</button>
-      <button onclick="cmd('gripper_close')">CLOSE</button>
-      <button onclick="cmd('gripper_enable',{enable:true})">토크 ON</button>
-      <button onclick="cmd('gripper_enable',{enable:false})">토크 OFF</button>
-      <button onclick="cmd('restart_gripper_bridge')">🔧 브릿지 재시작</button>
-      <div><small>전류: <span id="g_curr">-</span> mA · 위치: <span id="g_pos">-</span> · 초음파: <span id="us">-</span> mm</small></div>
-    </div>
-  </div>
-
-  <div class="col">
-    <div class="card">
       <h3>검출 / 카메라 튜닝</h3>
       <div class="row"><label>신뢰도</label>
-        <input id="conf" type="number" step="0.01" min="0.05" max="0.95" style="width:70px">
+        <input id="conf" type="number" step="0.01" min="0.05" max="0.95" style="width:65px">
         <button onclick="cmd('set_confidence',{value:+v('conf')})">적용</button></div>
       <div class="row"><label>자동노출</label>
         <button onclick="cmd('set_camera_auto_exposure',{enable:true})">ON</button>
         <button onclick="cmd('set_camera_auto_exposure',{enable:false})">OFF</button>
-        <input id="exp" type="number" min="20" max="5000" style="width:80px">
-        <button onclick="cmd('set_camera_exposure',{value:+v('exp')})">노출적용</button></div>
+        <input id="exp" type="number" min="20" max="5000" style="width:70px">
+        <button onclick="cmd('set_camera_exposure',{value:+v('exp')})">적용</button></div>
     </div>
     <div class="card">
       <h3>캘리브레이션 (mm, IDLE 전용)</h3>
       <div class="row">
-        X<input id="cx" type="number" step="1" style="width:70px">
-        Y<input id="cy" type="number" step="1" style="width:70px">
-        Z<input id="cz" type="number" step="1" style="width:70px">
+        X<input id="cx" type="number" step="1" style="width:65px">
+        Y<input id="cy" type="number" step="1" style="width:65px">
+        Z<input id="cz" type="number" step="1" style="width:65px">
       </div>
       <button onclick="cmd('load_calibration')">불러오기</button>
       <button onclick="cmd('set_calibration',{x:+v('cx'),y:+v('cy'),z:+v('cz')})">적용</button>
     </div>
+  </div>
+
+  <!-- Col 3: Model / system -->
+  <div class="col">
     <div class="card">
-      <h3>그리퍼 정밀 / 안전</h3>
-      <div class="row">열기<input id="goc" type="number" style="width:70px">
-        닫기<input id="gcc" type="number" style="width:70px">
-        이송<input id="gtc" type="number" style="width:70px"></div>
-      <div class="row">속도<input id="gpv" type="number" style="width:70px">
-        가속<input id="gpa" type="number" style="width:70px">
+      <h3>모델 / 시스템</h3>
+      <div style="margin-bottom:6px;"><small>현재 모델:</small><br>
+        <code id="model-path" style="font-size:11px;color:#adf;word-break:break-all;">-</code>
+      </div>
+      <div class="row">
+        <select id="model-sel" style="flex:1;min-width:0;" onchange="if(this.value)$('model').value=this.value">
+          <option value="">-- 스캔된 파일 --</option>
+        </select>
+        <button onclick="loadModels()">🔍</button>
+      </div>
+      <div class="row">
+        <input id="model" type="text" placeholder=".pt 경로 직접 입력" style="flex:1;min-width:0;">
+        <button onclick="cmd('set_model',{path:v('model')})">적용</button>
+      </div>
+      <div style="margin-top:6px;">
+        <button class="go" onclick="cmd('save_yaml')">💾 yaml 저장</button>
+        <button class="warn" onclick="if(confirm('노드 재시작?'))cmd('system_reset')">🔄 시스템 리셋</button>
+      </div>
+      <div style="margin-top:4px;"><small>변경 즉시 DB 저장 · yaml 저장 버튼으로 영구 반영</small></div>
+    </div>
+    <div class="card">
+      <h3>최근 명령 <small style="float:right;color:#666;">(최대 10행, 스크롤)</small></h3>
+      <div id="cmdlog">
+        <table><thead><tr><th>#</th><th>액션</th><th>상태</th><th>발행</th><th>완료</th><th>결과</th></tr></thead>
+        <tbody id="cmdtb"></tbody></table>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- ═══════════════ 그리퍼 탭 ═══════════════ -->
+<div class="page" id="page-gripper">
+<div class="cols">
+  <div class="col">
+    <div class="card">
+      <h3>그리퍼 제어</h3>
+      <button onclick="cmd('gripper_open')">OPEN</button>
+      <button onclick="cmd('gripper_close')">CLOSE</button>
+      <button onclick="cmd('gripper_enable',{enable:true})">토크 ON</button>
+      <button class="warn" onclick="cmd('gripper_enable',{enable:false})">토크 OFF</button>
+      <button onclick="cmd('gripper_reinit')">🔁 재초기화</button>
+      <button class="warn" onclick="cmd('restart_gripper_bridge')">🔧 브릿지 재시작</button>
+    </div>
+    <div class="card">
+      <h3>전류 그래프 &nbsp;<small><span id="g_curr2">-</span> mA &nbsp;위치: <span id="g_pos2">-</span></small></h3>
+      <canvas id="gchart"></canvas>
+    </div>
+    <div class="card">
+      <h3>초음파 거리 &nbsp;<small>grasp 기준: <span id="us-thresh">80</span> mm</small></h3>
+      <div class="us-wrap">
+        <div class="us-fill" id="us-fill" style="width:0%;background:#555;"></div>
+        <div class="us-mark" id="us-mark" style="left:20%;"></div>
+        <span class="us-lbl" id="us-lbl">- mm</span>
+      </div>
+      <small>0mm ←──────────────────────── 400mm</small>
+    </div>
+  </div>
+  <div class="col">
+    <div class="card">
+      <h3>기본 파라미터 (mA / step)</h3>
+      <div class="row">열기<input id="goc" type="number" style="width:65px">
+        닫기<input id="gcc" type="number" style="width:65px">
+        이송<input id="gtc" type="number" style="width:65px"></div>
+      <div class="row">속도<input id="gpv" type="number" style="width:65px">
+        가속<input id="gpa" type="number" style="width:65px">
         <button onclick="applyGripper()">적용</button></div>
-      <div class="row">Min Safe Z(m)<input id="msz" type="number" step="0.005" style="width:80px">
+      <div class="row">Min Safe Z(m)<input id="msz" type="number" step="0.005" style="width:75px">
         <button onclick="cmd('set_min_safe_z',{value:+v('msz')})">적용</button></div>
     </div>
     <div class="card">
-      <h3>모델 / 시스템</h3>
-      <div class="row"><input id="model" type="text" placeholder="YOLO .pt 경로" style="flex:1">
-        <button onclick="cmd('set_model',{path:v('model')})">적용</button></div>
-      <button class="go" onclick="cmd('save_yaml')">💾 전체 yaml 저장</button>
-      <button class="warn" onclick="if(confirm('GUI 제외 전 노드 재시작?'))cmd('system_reset')">🔄 시스템 리셋</button>
-      <div><small>설정 변경은 DB에 즉시 저장되고, 위 튜닝값은 yaml에도 자동 기록됩니다.</small></div>
-    </div>
-    <div class="card">
-      <h3>최근 명령</h3>
-      <table id="log"><tbody></tbody></table>
+      <h3>물체별 파지 강도 (mA)</h3>
+      <div class="row">기본 전류<input id="gcd" type="number" style="width:65px">
+        <button onclick="applyGripStrength()">전체 적용</button></div>
+      <table class="grip-tbl">
+        <thead><tr><th>물체</th><th>파지 전류(mA)</th></tr></thead>
+        <tbody id="grip-tbl-body"></tbody>
+      </table>
     </div>
   </div>
-</main>
+</div>
+</div>
+
+<!-- ═══════════════ 로그 탭 ═══════════════ -->
+<div class="page" id="page-log">
+<div style="padding:12px;">
+  <div class="log-filter">
+    <button class="active-sel" id="lf-all" onclick="setLogFilter('all')">전체</button>
+    <button id="lf-cmd" onclick="setLogFilter('cmd')">CMD</button>
+    <button id="lf-err" onclick="setLogFilter('err')">🔴 ERR</button>
+    <button id="lf-war" onclick="setLogFilter('war')">🟠 WAR</button>
+    <button onclick="pollLog()" style="margin-left:auto;">🔄 새로고침</button>
+  </div>
+  <div id="loglist"><small>로그 탭 클릭 시 로드됩니다.</small></div>
+</div>
+</div>
+
 <script>
 const $ = id => document.getElementById(id);
-const v = id => $(id).value;
-async function cmd(action, payload={}) {
-  const r = await fetch('/api/command', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({action, payload})});
-  const j = await r.json();
-  $('activity').textContent = '명령 #' + (j.id||'?') + ' ' + action + ' 전송';
-  return j;
-}
-function applyGripper(){ cmd('set_gripper_params', {
-  open_current:+v('goc'), close_current:+v('gcc'), transport_current:+v('gtc'),
-  profile_velocity:+v('gpv'), profile_acceleration:+v('gpa')}); }
+const v = id => $(id) ? $(id).value : '';
 
-let settingsLoaded = false;
-async function loadSettings(){
-  const s = await (await fetch('/api/settings')).json();
-  const set=(id,k)=>{ if($(id) && s[k]!=null && $(id).value==='') $(id).value=s[k]; };
-  set('conf','confidence_threshold'); set('exp','camera_exposure');
-  set('cx','calib_x_mm'); set('cy','calib_y_mm'); set('cz','calib_z_mm');
-  set('goc','gripper_open_current'); set('gcc','gripper_close_current');
-  set('gtc','gripper_transport_current'); set('gpv','gripper_profile_velocity');
-  set('gpa','gripper_profile_acceleration'); set('msz','min_safe_z'); set('model','yolo_model_path');
-  settingsLoaded = true;
+// ── 탭 전환 ─────────────────────────────────────────────────────────────────
+function showTab(t){
+  ['main','gripper','log'].forEach(n=>{
+    const p=$('page-'+n), tb=$('tab-'+n);
+    if(p) p.className='page'+(n===t?' active':'');
+    if(tb) tb.className='tab'+(n===t?' active':'');
+  });
+  if(t==='log') pollLog();
 }
+
+// ── cmd() with error handling ────────────────────────────────────────────────
+async function cmd(action, payload={}){
+  try{
+    const r = await fetch('/api/command',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action,payload})});
+    const j = await r.json();
+    $('activity').textContent='명령 #'+(j.id||'?')+' '+action+' 전송';
+    return j;
+  }catch(e){
+    $('activity').textContent='오류: '+e;
+    return {};
+  }
+}
+
+function applyGripper(){
+  cmd('set_gripper_params',{
+    open_current:+v('goc'),close_current:+v('gcc'),transport_current:+v('gtc'),
+    profile_velocity:+v('gpv'),profile_acceleration:+v('gpa')});
+}
+
+// ── 설정 로드 ────────────────────────────────────────────────────────────────
+let settingsLoaded=false, gripNames=[], gripCurrents=[];
+async function loadSettings(){
+  try{
+    const s=await(await fetch('/api/settings')).json();
+    const set=(id,k)=>{if($(id)&&s[k]!=null&&$(id).value==='')$(id).value=s[k];};
+    set('conf','confidence_threshold'); set('exp','camera_exposure');
+    set('cx','calib_x_mm'); set('cy','calib_y_mm'); set('cz','calib_z_mm');
+    set('goc','gripper_open_current'); set('gcc','gripper_close_current');
+    set('gtc','gripper_transport_current'); set('gpv','gripper_profile_velocity');
+    set('gpa','gripper_profile_acceleration'); set('msz','min_safe_z');
+    set('gcd','grip_current_default');
+    // 물체별 파지 테이블
+    gripNames=s.grip_class_names||[]; gripCurrents=s.grip_class_currents||[];
+    renderGripTable();
+    settingsLoaded=true;
+  }catch(e){}
+}
+
+function renderGripTable(){
+  const tb=$('grip-tbl-body'); if(!tb)return;
+  tb.innerHTML=gripNames.map((n,i)=>
+    `<tr><td>${n}</td><td><input type="number" id="gc_${i}" value="${gripCurrents[i]||200}" style="width:65px"></td></tr>`
+  ).join('');
+}
+
+function applyGripStrength(){
+  const names=[...gripNames];
+  const currents=gripNames.map((_,i)=>+v('gc_'+i)||200);
+  const def=+v('gcd')||200;
+  cmd('set_grip_strength',{names,currents,default:def});
+}
+
+// ── 모델 스캔 ────────────────────────────────────────────────────────────────
+async function loadModels(){
+  try{
+    const d=await(await fetch('/api/models')).json();
+    const sel=$('model-sel');
+    sel.innerHTML='<option value="">-- 스캔된 파일 선택 --</option>'+
+      (d.models||[]).map(p=>{
+        const name=p.split('/').pop();
+        const cur=p===(d.current||'');
+        return `<option value="${p}"${cur?' selected':''}>${name}</option>`;
+      }).join('');
+  }catch(e){}
+}
+
+// ── 상태 코드 매핑 ────────────────────────────────────────────────────────────
 const HW={0:'INIT',1:'STANDBY',2:'MOVING',3:'SAFE_OFF',4:'TEACH',5:'SAFE_STOP',
   6:'E-STOP',7:'HOMING',8:'RECOVERY',15:'NOT_READY','-1':'?'};
+
+// ── 그리퍼 전류 sparkline ────────────────────────────────────────────────────
+const GC_LEN=60; // 60샘플 ≈ 30초(500ms poll)
+const gcBuf=new Array(GC_LEN).fill(0);
+const GC_MAX=500;
+function gcPush(val){gcBuf.shift();gcBuf.push(Math.max(0,+val||0));}
+function gcDraw(){
+  const c=$('gchart'); if(!c)return;
+  const W=c.offsetWidth||300, H=70;
+  c.width=W; c.height=H;
+  const ctx=c.getContext('2d');
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle='#111'; ctx.fillRect(0,0,W,H);
+  // grid lines
+  ctx.strokeStyle='#2a2a2a'; ctx.lineWidth=1;
+  [0.25,0.5,0.75].forEach(f=>{
+    ctx.beginPath();ctx.moveTo(0,H*f);ctx.lineTo(W,H*f);ctx.stroke();
+  });
+  // labels
+  ctx.fillStyle='#555';ctx.font='9px monospace';
+  [0,250,500].forEach((v,i)=>{ctx.fillText(v+'mA',2,H-(H*v/GC_MAX)+9);});
+  // line
+  ctx.strokeStyle='#4fc3f7';ctx.lineWidth=2;ctx.beginPath();
+  gcBuf.forEach((v,i)=>{
+    const x=W*(i/(GC_LEN-1));
+    const y=H-H*(Math.min(v,GC_MAX)/GC_MAX);
+    i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
+  });
+  ctx.stroke();
+}
+
+// ── 초음파 바 ────────────────────────────────────────────────────────────────
+let graspThresh=80;
+function usColor(mm){
+  if(mm>300)return'#555';
+  if(mm>200)return'#888800';
+  if(mm>100)return'#cc7700';
+  if(mm>graspThresh)return'#ee4400';
+  return'#ff1111';
+}
+function updateUs(mm){
+  const fill=$('us-fill'),lbl=$('us-lbl'),mark=$('us-mark');
+  if(mm==null||mm<0){
+    if(fill)fill.style.width='0%';
+    if(lbl)lbl.textContent='- mm';
+    return;
+  }
+  const MAX=400, pct=Math.min(100,mm/MAX*100);
+  if(fill){fill.style.width=pct+'%';fill.style.background=usColor(mm);}
+  if(lbl)lbl.textContent=mm+' mm';
+  if(mark)mark.style.left=(graspThresh/MAX*100)+'%';
+}
+
+// ── 검출 물체 + 선택 ─────────────────────────────────────────────────────────
+let selectedLabel='';
+function selectObject(label){
+  selectedLabel=label||'';
+  cmd('select_object',{label:selectedLabel});
+  updateSelLabel();
+}
+function updateSelLabel(){
+  const el=$('sel-label');
+  if(el)el.textContent='선택: '+(selectedLabel||'자동');
+}
+function renderObjArea(objects){
+  // 선택 버튼 (box 제외)
+  const row=$('obj-sel-row');
+  if(row){
+    const selBtns=objects.filter(o=>o.label!=='box'&&o.reachable);
+    // dedup by label
+    const seen={},labels=[];
+    selBtns.forEach(o=>{if(!seen[o.label]){seen[o.label]=1;labels.push(o.label);}});
+    const auto=`<button id="sel-auto" class="${selectedLabel===''?'active-sel':''}" onclick="selectObject('')">🎯 자동</button>`;
+    const btns=labels.map(lb=>{
+      const act=lb===selectedLabel?'active-sel':'';
+      return `<button class="${act}" onclick="selectObject('${lb}')">${lb}</button>`;
+    }).join('');
+    row.innerHTML=auto+btns;
+  }
+  // 검출 정보 (모든 물체, box 포함 표시만)
+  const objDiv=$('objects');
+  if(objDiv){
+    objDiv.innerHTML=objects.map(o=>{
+      const isBox=o.label==='box';
+      const p=o.pose||{};
+      const cls='obj-info'+(o.reachable&&!isBox?' reach':' unreach');
+      return `<div class="${cls}">${o.label}`+
+        `<small style="margin-left:8px;">conf ${(o.confidence||0).toFixed(2)}`+
+        ` · [${(p.x||0).toFixed(2)},${(p.y||0).toFixed(2)},${(p.z||0).toFixed(2)}]m`+
+        `${isBox?' · 이동불가(box)':(o.reachable?'':' · 도달불가')}</small></div>`;
+    }).join('')||'<small>검출된 물체 없음</small>';
+  }
+  updateSelLabel();
+}
+
+// ── 메인 poll ────────────────────────────────────────────────────────────────
 async function poll(){
   try{
-    const s = await (await fetch('/api/state')).json();
-    // 상태점
-    const ss = s.system_status||{};
-    $('status-dots').innerHTML = Object.entries(ss).map(([k,st])=>
+    const s=await(await fetch('/api/state')).json();
+    // 상태 헤더
+    const ss=s.system_status||{};
+    $('status-dots').innerHTML=Object.entries(ss).map(([k,st])=>
       `<span class="dot ${st}">${k}</span>`).join(' ');
-    const stt = s.pick_place_state||'?';
-    $('activity').textContent = `상태: ${stt} · HW: ${HW[s.hw_state]||s.hw_state} · 속도: ${s.speed_mode===1?'감속':'정상'}`;
-    const err = (stt==='ERROR') ? (s.error_text||'ERROR') : '';
-    $('banner').style.display = err?'block':'none'; $('banner').textContent = err?('🔴 '+err):'';
-    $('g_curr').textContent = s.gripper_current_ma; $('g_pos').textContent = s.gripper_position_raw;
-    $('us').textContent = s.ultrasonic_mm==null?'-':s.ultrasonic_mm;
-    // 검출 물체
-    $('objects').innerHTML = (s.detected_objects||[]).map(o=>{
-      const isBox = (o.label==='box');           // box 는 이동 금지 → 선택 불가
-      const selectable = o.reachable && !isBox;
-      const cls = selectable?'obj':'obj unreach';
-      const onclick = selectable?`onclick="cmd('select_object',{label:'${o.label}'}).then(()=>cmd('run_once'))"`:'';
-      const p=o.pose||{};
-      return `<div class="${cls}" ${onclick}>${o.label} `+
-             `<small>conf ${(o.confidence||0).toFixed(2)} · [${(p.x||0).toFixed(2)},${(p.y||0).toFixed(2)},${(p.z||0).toFixed(2)}]m`+
-             `${isBox?' · 이동불가(box)':(o.reachable?'':' · 도달불가')}</small></div>`;
-    }).join('') || '<small>검출된 물체 없음</small>';
-    if(s.has_image) $('cam').src = '/api/image.jpg?t=' + Date.now();
-    // 명령 로그
-    const logs = await (await fetch('/api/commands')).json();
-    $('log').querySelector('tbody').innerHTML = logs.map(l=>
-      `<tr><td>#${l.id}</td><td>${l.action}</td><td>${l.status}</td><td><small>${l.result||''}</small></td></tr>`).join('');
-  }catch(e){ $('activity').textContent='연결 끊김: '+e; }
-  if(!settingsLoaded) loadSettings();
-}
-setInterval(poll, 500); poll();
-
-// ── 검출 물체 선택 (gui_node 패리티) ─────────────────────────────────────────
-// box 는 이동 금지 → 선택 버튼에서 제외. 선택된 라벨은 색 강조 + 현재 라벨 표시.
-let selectedLabel = '';  // '' = 자동 선택
-function selectObject(label){
-  selectedLabel = label || '';
-  cmd('select_object', {label: selectedLabel});
-  $('sel-cur').innerHTML = '<small>선택: ' + (selectedLabel || '자동') + '</small>';
-  renderSelectGrid(lastSelectLabels);
-}
-let lastSelectLabels = [];
-function renderSelectGrid(labels){
-  lastSelectLabels = labels;
-  const grid = $('select-grid');
-  if(!grid) return;
-  if(!labels.length){ grid.innerHTML = '<small>검출된 물체 없음</small>'; }
-  else {
-    grid.innerHTML = labels.map(lb=>{
-      const act = (lb===selectedLabel && selectedLabel!=='') ? ' active' : '';
-      return `<button class="selbtn${act}" onclick="selectObject('${lb}')">${lb}</button>`;
-    }).join('');
-  }
-  $('sel-auto').className = (selectedLabel==='') ? 'active' : '';
-}
-async function pollSelect(){
-  try{
-    const s = await (await fetch('/api/state')).json();
-    // box 제외 + 중복 제거(여러 개 검출 시 라벨 1개만). 검출 자체는 백엔드 유지.
-    const seen = {};
-    const labels = [];
-    for(const o of (s.detected_objects||[])){
-      const lb = o.label||'';
-      if(!lb || lb==='box') continue;
-      if(seen[lb]) continue;
-      seen[lb] = 1; labels.push(lb);
+    const stt=s.pick_place_state||'?';
+    $('activity').textContent=`상태: ${stt} · HW: ${HW[s.hw_state]||s.hw_state} · 속도: ${s.speed_mode===1?'감속':'정상'}`;
+    const err=(stt==='ERROR')?(s.error_text||'ERROR'):'';
+    $('banner').style.display=err?'block':'none';
+    $('banner').textContent=err?('🔴 '+err):'';
+    // 카메라
+    if(s.has_image){
+      $('cam').src='/api/image.jpg?t='+Date.now();
+      $('cam').style.display='block'; $('cam-no').style.display='none';
+    }else{
+      $('cam').style.display='none'; $('cam-no').style.display='flex';
     }
-    renderSelectGrid(labels);
-  }catch(e){ /* poll() 가 연결 끊김 표시 처리 */ }
+    // 검출
+    renderObjArea(s.detected_objects||[]);
+    // 그리퍼 수치 (메인 + 그리퍼 탭)
+    const gc=s.gripper_current_ma;
+    const gp=s.gripper_position_raw;
+    if($('g_curr2'))$('g_curr2').textContent=gc;
+    if($('g_pos2'))$('g_pos2').textContent=gp;
+    gcPush(gc); gcDraw();
+    // 초음파
+    const umm=s.ultrasonic_mm;
+    updateUs(umm);
+    if($('us-lbl'))$('us-lbl').textContent=(umm==null?'-':umm)+' mm';
+    // 모델 경로
+    const mp=s.current_model_path||'';
+    if(mp&&$('model-path'))$('model-path').textContent=mp;
+    // 최근 명령 (main 탭 col3)
+    const logs=await(await fetch('/api/commands')).json();
+    const tb=$('cmdtb');
+    if(tb){
+      const fmtT=ts=>{if(!ts)return'';const d=new Date(ts*1000);return d.toTimeString().slice(0,8);};
+      tb.innerHTML=logs.slice(0,10).map(l=>
+        `<tr><td>#${l.id}</td><td>${l.action}</td>`+
+        `<td><span class="log-badge ${l.status}">${l.status}</span></td>`+
+        `<td>${fmtT(l.ts)}</td><td>${fmtT(l.done_ts)}</td>`+
+        `<td><small>${(l.result||'').slice(0,40)}</small></td></tr>`).join('');
+    }
+  }catch(e){$('activity').textContent='연결 끊김: '+e;}
+  if(!settingsLoaded)loadSettings();
 }
-setInterval(pollSelect, 1200); pollSelect();
+setInterval(poll,500); poll();
 
-// ── 유저 주문 큐 ────────────────────────────────────────────────────────────
-const ST_CLS = {RUNNING:'run', PAUSED:'pause', QUEUED:'queued'};
-function statusKo(s){ return s==='RUNNING'?'처리중':(s==='PAUSED'?'보류':(s==='QUEUED'?'대기':s)); }
+// ── 유저 주문 큐 ─────────────────────────────────────────────────────────────
+const ST_CLS={RUNNING:'running',PAUSED:'pause',QUEUED:'queued',DONE:'done',FAILED:'failed',CANCELED:'canceled'};
+function statusKo(s){return{RUNNING:'처리중',PAUSED:'보류',QUEUED:'대기',DONE:'완료',FAILED:'실패',CANCELED:'취소'}[s]||s;}
 async function cancelOrder(id){
-  if(!confirm('이 주문을 취소할까요? (처리중 품목은 보호됩니다)')) return;
-  const r = await fetch('/api/orders/cancel', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({order_id:id})});
-  const j = await r.json();
-  if(!j.ok) alert('취소 실패: ' + (j.error||'처리중 품목 보호'));
+  if(!confirm('주문 취소? (처리중 품목 보호)'))return;
+  const r=await fetch('/api/orders/cancel',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({order_id:id})});
+  const j=await r.json();
+  if(!j.ok)alert('취소 실패: '+(j.error||'처리중 품목 보호'));
+  pollOrders();
+}
+async function cancelItem(itemId){
+  if(!confirm('이 품목을 취소?'))return;
+  const r=await fetch('/api/orders/cancel_item',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({item_id:itemId})});
+  const j=await r.json();
+  if(!j.ok)alert('취소 실패: '+(j.error||''));
   pollOrders();
 }
 async function toggleQueue(){
-  const r = await fetch('/api/orders/pause', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({})});
-  await r.json();
+  await fetch('/api/orders/pause',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
   pollOrders();
 }
 async function pollOrders(){
   try{
-    const d = await (await fetch('/api/orders')).json();
-    const pz = $('queue-paused');
-    if(d.error){ pz.innerHTML = '<span class="badge pause">'+d.error+'</span>'; }
-    else if(d.paused){ pz.innerHTML = '<span class="badge pause">큐 보류중</span>'; }
-    else { pz.innerHTML = '<span class="badge run">큐 동작중</span>'; }
-    const orders = d.orders||[];
-    $('orders').innerHTML = orders.map(o=>{
-      const cls = ST_CLS[o.status] || 'queued';
-      const items = (o.items||[]).map(it=>
-        `<span class="badge ${ST_CLS[it.status]||'queued'}">${it.class_name}</span>`).join(' ');
+    const d=await(await fetch('/api/orders')).json();
+    const pz=$('queue-paused');
+    if(d.error){pz.innerHTML=`<span class="badge failed">${d.error}</span>`;}
+    else if(d.paused){pz.innerHTML='<span class="badge pause">큐 보류중</span>';}
+    else{pz.innerHTML='<span class="badge run">동작중</span>';}
+    const orders=d.orders||[];
+    $('orders').innerHTML=orders.length?orders.map(o=>{
+      const cls=ST_CLS[o.status]||'queued';
+      const items=(o.items||[]).map(it=>{
+        const ic=ST_CLS[it.status]||'queued';
+        const canCancel=it.status==='QUEUED';
+        const cancelBtn=canCancel?`<button class="item-cancel" onclick="cancelItem('${it.item_id}')">✕</button>`:'';
+        return `<div class="item-row"><span class="badge ${ic}">${it.class_name}</span>`+
+               `<span class="badge ${ic}" style="font-size:9px;">${statusKo(it.status)}</span>${cancelBtn}</div>`;
+      }).join('');
       return `<div class="order ${cls}">`+
-             `<button class="cancel" onclick="cancelOrder('${o.order_id}')">취소</button>`+
-             `<span class="tk">${o.ticket_no||o.order_id}</span>`+
-             `<span class="badge ${cls}">${statusKo(o.status)}</span>`+
-             `<div class="items">${items||'<small>품목 없음</small>'}</div>`+
-             `<div><small>${o.created_at||''}</small></div></div>`;
-    }).join('') || '<small>대기 중인 주문 없음</small>';
-  }catch(e){ $('orders').innerHTML = '<small>주문 큐 로드 실패: '+e+'</small>'; }
+        `<div style="display:flex;align-items:center;margin-bottom:4px;">`+
+        `<span class="tk">${o.ticket_no||o.order_id}</span>`+
+        `<span class="badge ${cls}" style="margin-left:6px;">${statusKo(o.status)}</span>`+
+        `<button class="item-cancel" style="margin-left:auto;" onclick="cancelOrder('${o.order_id}')">취소</button></div>`+
+        `${items||'<small>품목 없음</small>'}`+
+        `<div style="margin-top:3px;"><small>${o.created_at||''}</small></div></div>`;
+    }).join(''):'<small>대기 중인 주문 없음</small>';
+  }catch(e){$('orders').innerHTML='<small>큐 로드 실패: '+e+'</small>';}
 }
-setInterval(pollOrders, 1500); pollOrders();
+setInterval(pollOrders,1500);pollOrders();
+
+// ── 로그 탭 ──────────────────────────────────────────────────────────────────
+let logFilter='all';
+function setLogFilter(f){
+  logFilter=f;
+  ['all','cmd','err','war'].forEach(k=>{
+    const b=$('lf-'+k);
+    if(b)b.className=k===f?'active-sel':'';
+  });
+  pollLog();
+}
+async function pollLog(){
+  try{
+    const data=await(await fetch('/api/log')).json();
+    const list=$('loglist');
+    if(!list)return;
+    const filtered=logFilter==='all'?data:data.filter(e=>e.type===logFilter);
+    if(!filtered.length){list.innerHTML='<small>로그 없음</small>';return;}
+    list.innerHTML=filtered.map(e=>{
+      const typeBadge=`<span class="log-badge ${e.type}">${e.type.toUpperCase()}</span>`;
+      const stBadge=e.status?`<span class="log-badge ${e.status.toLowerCase()}">${e.status}</span>`:'';
+      const done=e.done_ts_str?` → ${e.done_ts_str}`:'';
+      return `<div class="log-entry ${e.type}">`+
+        `<div class="log-row1"><span>${e.ts_str}${done}</span><span>${e.source}</span></div>`+
+        `<div class="log-row2">${typeBadge} ${stBadge} ${e.text}${e.detail?` <small>· ${e.detail}</small>`:''}</div>`+
+        `</div>`;
+    }).join('');
+  }catch(e){const l=$('loglist');if(l)l.innerHTML='<small>로그 로드 실패: '+e+'</small>';}
+}
 </script>
 </body>
 </html>
