@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+models/*.pt
+*.egg-info/
+build/
+dist/
+install/
+log/
+web_kiosk/frontend/node_modules/
+web_kiosk/frontend/dist/

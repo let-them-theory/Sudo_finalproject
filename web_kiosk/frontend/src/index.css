@@ -1,0 +1,44 @@
+@import "tailwindcss";
+@import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css');
+
+/* 디자인 토큰 — 토스풍. 단색 파랑 악센트 + 무채색 베이스 + 절제된 그림자. */
+@theme {
+  --color-brand: #3182f6;
+  --color-brand-dark: #1b64da;
+  --color-brand-light: #eef4ff;
+  --color-ink: #191f28;
+  --color-sub: #4e5968;
+  --color-muted: #8b95a1;
+  --color-line: #e5e8eb;
+  --color-surface: #f9fafb;
+  --shadow-card: 0 1px 3px rgba(25, 31, 40, 0.06), 0 8px 24px rgba(25, 31, 40, 0.05);
+  --shadow-lift: 0 8px 28px rgba(49, 130, 246, 0.22);
+}
+
+html, body, #root { height: 100%; margin: 0; }
+body {
+  background: white;
+  color: var(--color-ink);
+  font-family: 'Pretendard', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  letter-spacing: -0.01em;
+}
+
+button { transition: all 0.18s cubic-bezier(0.2, 0.8, 0.2, 1); cursor: pointer; }
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.page-fade { animation: fadeIn 0.28s cubic-bezier(0.2, 0.8, 0.2, 1) both; }
+
+@keyframes pop {
+  0% { transform: scale(0.5); opacity: 0; }
+  60% { transform: scale(1.12); }
+  100% { transform: scale(1); opacity: 1; }
+}
+.pop { animation: pop 0.22s cubic-bezier(0.2, 0.8, 0.2, 1) both; }
+
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-thumb { background: var(--color-line); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--color-muted); }
