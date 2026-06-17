@@ -37,8 +37,8 @@ object_detector:
     # --- 동적 place (box_roi 그리드 빈 칸 탐색) ---
     # true: 카메라 depth+검출로 빈 칸 → /zone_dynamic_place_targets 발행. pick_place가 우선 사용.
     use_dynamic_place_pose: true
-    place_slot_grid_cols: 2          # box_roi 가로 2칸
-    place_slot_grid_rows: 2          # 세로 2칸 → 2x2=4칸
+    place_slot_grid_cols: 3          # 가로 3칸
+    place_slot_grid_rows: 1          # 세로 1칸 → 1x3=3칸 (한 줄)
     place_slot_occupy_depth_margin_m: 0.025  # depth 점유 켤 때만: 바닥보다 이만큼 가까우면 점유
     place_slot_floor_percentile: 70.0        # depth 점유 바닥 기준 백분위
     place_slot_min_valid_pixels: 40
@@ -47,6 +47,12 @@ object_detector:
     place_slot_occupy_classes: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "can", "boxsnack"]
     place_slot_use_depth_occupancy: false    # 크레이트 벽·격자 무늬 depth 오판 방지
     place_slot_z_offset_m: 0.03              # (카메라 xyz 모드용) pick_place 앵커 모드에서는 pick_place_node 값 사용
+    # 비전 박스 모드: zone ROI 안 검출된 'box' bbox를 격자 영역으로 사용(박스 옮겨도 따라감).
+    place_slot_use_detected_box: true
+    # 빈 칸 3D는 망사 depth 대신 zone별 고정 박스높이로 역투영. [zone1..5] 낮은박스/높은박스
+    place_slot_zone_heights: [0.24, 0.24, 0.31, 0.31, 0.24]
+    # 박스 bbox는 처음 N프레임만 per-ROI로 찾아 캐시 → 이후 full-frame(빠름). 박스 고정 가정, 옮기면 재시작.
+    box_cache_max_frames: 8
 
     # --- FastSAM unknown 검출 ---
     # proto.pt(YOLO)가 못 잡는(학습 안 된) 물체를 FastSAM 세그멘테이션으로 잡아
@@ -227,10 +233,10 @@ pick_place_node:
     # object_detector 동적 place(/zone_dynamic_place_targets) 우선. 없으면 sort_roi_zone_positions 폴백.
     use_dynamic_place_pose: true
     # round_robin=순환 / camera=카메라 빈칸 우선+place한 칸 로컬 기억(카메라 미인식 대비)
-    place_slot_use_yaml_anchor: true
+    place_slot_use_yaml_anchor: false   # 비전 모드: 카메라 계산 xyz 사용
     place_slot_mode: camera
-    place_slot_grid_cols: 2
-    place_slot_grid_rows: 2             # 2x2=4칸
+    place_slot_grid_cols: 3
+    place_slot_grid_rows: 1             # 1x3=3칸 (한 줄)
     place_slot_cell_spacing_x_m: 0.09   # 칸 간격(m). zone 중심 기준 좌우
     place_slot_cell_spacing_y_m: 0.08   # zone 중심 기준 앞뒤
     place_slot_z_offset_m: 0.04       # zone yaml z + this. 깊으면 ↑ (0.05~0.06)

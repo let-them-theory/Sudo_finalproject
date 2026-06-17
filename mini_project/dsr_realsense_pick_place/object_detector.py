@@ -534,6 +534,12 @@ class ObjectDetectorNode(Node):
         # false: depth 점유 끔(크레이트 벽·격자 무늬 오판 방지). YOLO만으로 점유 판정.
         self.declare_parameter('place_slot_use_depth_occupancy', False)
         self.declare_parameter('place_slot_z_offset_m', 0.0)
+        # 비전 박스: zone ROI 안에서 검출된 'box' bbox를 격자 영역으로 사용(박스 옮겨도 따라감).
+        self.declare_parameter('place_slot_use_detected_box', True)
+        # 빈 칸 3D는 망사 depth 대신 zone별 고정 박스높이로 역투영. 낮은박스 0.18, 높은박스 0.24.
+        self.declare_parameter('place_slot_zone_heights', [0.18, 0.18, 0.24, 0.24, 0.18])
+        # 박스 bbox는 처음 N프레임만 per-ROI로 찾아 캐시 → 이후 full-frame(빠름). 박스 고정 가정, 옮기면 재시작.
+        self.declare_parameter('box_cache_max_frames', 8)
 
         p = self.get_parameter
         # 자주 쓰는 파라미터는 멤버 변수로 꺼내 두고 이후 계산에 재사용한다.
@@ -619,6 +625,12 @@ class ObjectDetectorNode(Node):
         self.place_slot_use_depth_occupancy = bool(
             p('place_slot_use_depth_occupancy').value)
         self.place_slot_z_offset_m = float(p('place_slot_z_offset_m').value)
+        self.place_slot_use_detected_box = bool(p('place_slot_use_detected_box').value)
+        self.place_slot_zone_heights = [
+            float(x) for x in p('place_slot_zone_heights').value]
+        self.box_cache_max_frames = int(p('box_cache_max_frames').value)
+        self._zone_box_rect_cache = {}   # zone_id -> 캐시된 박스 bbox (한 번만 검출)
+        self._box_cache_frames = 0
         self._zone_dynamic_targets: dict = {}
         self._zone_slot_debug: dict = {}
 
@@ -1055,6 +1067,59 @@ class ObjectDetectorNode(Node):
             return None
         return float(p.x), float(p.y), z
 
+    def _pixel_at_height(self, u: int, v: int, base_z: float):
+        """픽셀(u,v) 광선을 base 프레임 z=base_z 평면과 교차 → (x, y, base_z).
+        망사 박스의 부정확한 depth 대신 '고정 박스높이'로 역투영하므로 정확하다."""
+        pa = self._to_absolute_pose(self._pixel_to_optical_pose(int(u), int(v), 0.5))
+        pb = self._to_absolute_pose(self._pixel_to_optical_pose(int(u), int(v), 1.0))
+        if pa is None or pb is None:
+            return None
+        ax, ay, az = pa.pose.position.x, pa.pose.position.y, pa.pose.position.z
+        bx, by, bz = pb.pose.position.x, pb.pose.position.y, pb.pose.position.z
+        if abs(bz - az) < 1e-9:
+            return None
+        t = (base_z - az) / (bz - az)
+        x = ax + t * (bx - ax)
+        y = ay + t * (by - ay)
+        if not (self.workspace_x_min <= x <= self.workspace_x_max
+                and self.workspace_y_min <= y <= self.workspace_y_max):
+            return None
+        return float(x), float(y), float(base_z)
+
+    def _zone_height(self, zone_id: int) -> float:
+        """zone(1~5)의 고정 박스높이(m). 범위 밖이면 0.18."""
+        i = zone_id - 1
+        if 0 <= i < len(self.place_slot_zone_heights):
+            return self.place_slot_zone_heights[i]
+        return 0.18
+
+    def _zone_grid_rect(self, zone_id: int, detections: list,
+                        frame_w: int, frame_h: int):
+        """zone의 격자 영역(픽셀). 검출된 'box' bbox를 사용(박스 따라감). 미검출/끔이면 고정 ROI.
+        한 번 검출된 bbox는 캐시 재사용(매 프레임 재검출 안 함 → FPS↑)."""
+        if zone_id in self._zone_box_rect_cache:
+            return self._zone_box_rect_cache[zone_id]
+        roi = self._zone_rect_by_id(zone_id, frame_w, frame_h)
+        if roi is None or not self.place_slot_use_detected_box:
+            return roi
+        rx1, ry1, rx2, ry2 = roi
+        best, best_area = None, 0
+        for det in detections:
+            if (det[4] if len(det) > 4 else '') != 'box':
+                continue
+            u, v, w, h = int(det[0]), int(det[1]), int(det[2]), int(det[3])
+            if not (rx1 <= u < rx2 and ry1 <= v < ry2):
+                continue
+            if w * h > best_area:
+                best_area, best = w * h, (u, v, w, h)
+        if best is None:
+            return roi
+        u, v, w, h = best
+        bbox = (max(0, u - w // 2), max(0, v - h // 2),
+                min(frame_w, u + w // 2), min(frame_h, v + h // 2))
+        self._zone_box_rect_cache[zone_id] = bbox
+        return bbox
+
     def _class_counts_for_slot_occupancy(self, label: str) -> bool:
         cls = (label or '').strip()
         if not cls:
@@ -1066,7 +1131,7 @@ class ObjectDetectorNode(Node):
     def _occupied_slot_cells_for_zone(
             self, zone_id: int, frame_w: int, frame_h: int,
             detections: list, candidates: list) -> set:
-        rect = self._zone_rect_by_id(zone_id, frame_w, frame_h)
+        rect = self._zone_grid_rect(zone_id, detections, frame_w, frame_h)
         if rect is None:
             return set()
         x1, y1, x2, y2 = rect
@@ -1099,7 +1164,7 @@ class ObjectDetectorNode(Node):
             self, zone_id: int, depth_img: np.ndarray,
             frame_w: int, frame_h: int,
             detections: list, candidates: list) -> dict | None:
-        rect = self._zone_rect_by_id(zone_id, frame_w, frame_h)
+        rect = self._zone_grid_rect(zone_id, detections, frame_w, frame_h)
         if rect is None:
             return None
         x1, y1, x2, y2 = rect
@@ -1150,10 +1215,12 @@ class ObjectDetectorNode(Node):
                 'row': c['row'], 'col': c['col'],
                 'all_full': False,
             }
-            if c['depth'] is not None:
+            zh = self._zone_height(zone_id)
+            xyz = self._pixel_at_height(u, v, zh)
+            if xyz is None and c['depth'] is not None:
                 xyz = self._base_xyz_from_pixel(u, v, c['depth'])
-                if xyz is not None:
-                    slot['x'], slot['y'], slot['z'] = xyz
+            if xyz is not None:
+                slot['x'], slot['y'], slot['z'] = xyz
             return slot
 
         # 빈 칸 없음 — 중앙 칸 폴백 (pick_place yaml 앵커가 최종 좌표 산출)
@@ -1168,10 +1235,12 @@ class ObjectDetectorNode(Node):
             'row': fallback['row'], 'col': fallback['col'],
             'all_full': True,
         }
-        if fallback['depth'] is not None:
+        zh = self._zone_height(zone_id)
+        xyz = self._pixel_at_height(u, v, zh)
+        if xyz is None and fallback['depth'] is not None:
             xyz = self._base_xyz_from_pixel(u, v, fallback['depth'])
-            if xyz is not None:
-                slot['x'], slot['y'], slot['z'] = xyz
+        if xyz is not None:
+            slot['x'], slot['y'], slot['z'] = xyz
         return slot
 
     def _update_dynamic_zone_place_targets(
@@ -1793,8 +1862,18 @@ class ObjectDetectorNode(Node):
         Hh, Ww = color_img.shape[:2]
         _active = self._active_roi_rects(Ww, Hh)
 
-        if self.roi_detect_per_roi and _active and self.use_yolo and self.model:
-            # 각 ROI를 따로 잘라(crop) 개별 YOLO predict → 뭉친 박스도 ROI별로 단독 검출.
+        # 박스 bbox 캐시 단계: 처음 몇 프레임만 per-ROI로 박스 검출(캐시) → 이후 full-frame(빠름).
+        _enabled_zones = [z for z, _ in self._box_roi_zone_rects(Ww, Hh)]
+        _all_boxes_cached = bool(_enabled_zones) and all(
+            z in self._zone_box_rect_cache for z in _enabled_zones)
+        _caching_boxes = (self.place_slot_use_detected_box and not _all_boxes_cached
+                          and self._box_cache_frames < self.box_cache_max_frames)
+        if _caching_boxes:
+            self._box_cache_frames += 1
+
+        if (self.roi_detect_per_roi and _caching_boxes
+                and _active and self.use_yolo and self.model):
+            # 초기 캐시 단계만: per-ROI로 박스 검출 → _zone_grid_rect가 bbox를 캐시한다.
             detections = self._detect_yolo_per_roi(color_img, _active)
         else:
             detections = (self._detect_yolo(color_img) if self.use_yolo and self.model
