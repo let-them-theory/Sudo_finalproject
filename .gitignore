@@ -12,3 +12,4 @@ log/
 # dist/ 패턴 제거 — web_kiosk/frontend/dist 추적 위해. colcon은 build/·install/만 생성.
 web_kiosk/frontend/node_modules/
 # web_kiosk/frontend/dist 는 키오스크 빌드물 — 재현성 위해 추적(clone 시 바로 뜸)
+.vscode/

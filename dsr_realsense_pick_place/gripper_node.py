@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
-# Doosan-E0509-ROBOTIS-RH-P12-RN-TCP-Bridge 패키지의 서비스를 래핑하는 ROS 2 그리퍼 제어 래퍼 노드.
+# ─────────────────────────────────────────────────────────────────────────────
+# 그리퍼 클라이언트 어댑터 노드 (pick_place_node 호환용 얇은 래퍼)
+#
+# 역할: dsr_gripper_tcp/gripper_service_node 가 노출하는 저수준 서비스
+#       (/gripper_service/* : SetPosition/SetTorque/SetMotionProfile 등)를
+#       pick_place_node 가 기대하는 고수준 인터페이스(open/close/grasp, transport
+#       전류 전환, idle 위치락, JointState 발행)로 변환·중계한다.
+#
+# 계층 구조:
+#   pick_place_node  →  gripper_node(이 파일, 어댑터)  →  dsr_gripper_tcp/gripper_service_node  →  gripper_tcp_bridge(TCP/Modbus)
+#
+# 통합 메모: 단순 중계라 pick_place_node 로 인라인할 수도 있으나, pick_place_node 가
+#   이미 대형 FSM(2.6k LOC)이라 가독성·테스트 용이성을 위해 별도 어댑터로 유지한다.
+# ─────────────────────────────────────────────────────────────────────────────
 
 import threading
 import time
