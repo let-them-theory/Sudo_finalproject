@@ -42,32 +42,13 @@ import cv2
 import pyrealsense2 as rs
 
 from sensor_msgs.msg import Image, CameraInfo
-from geometry_msgs.msg import PoseStamped
-from std_msgs.msg import Bool, Int32, String
+from geometry_msgs.msg import PoseStamped, Vector3Stamped
+from std_msgs.msg import Bool, Float32, Int32, String
 from cv_bridge import CvBridge, CvBridgeError
 import message_filters
 import tf2_ros
 import tf2_geometry_msgs  # noqa: F401  (transform 메서드 등록용)
 from rcl_interfaces.msg import SetParametersResult
-
-
-def _resolve_inference_device() -> str:
-    """CUDA sm_120(Blackwell RTX 5080 등) 미지원 GPU 환경에서 CPU로 자동 fallback.
-    torch.cuda.is_available()은 True여도 실제 커널 실행이 불가할 수 있으므로
-    더미 텐서 연산으로 직접 확인한다."""
-    try:
-        import torch
-        if not torch.cuda.is_available():
-            return 'cpu'
-        t = torch.zeros(1, device='cuda')
-        _ = t + t
-        torch.cuda.synchronize()
-        return '0'
-    except Exception:
-        return 'cpu'
-
-
-_INFER_DEVICE = _resolve_inference_device()
 
 
 class TrackedDetectionManager:
@@ -801,6 +782,8 @@ class ObjectDetectorNode(Node):
         # 선택된 물체의 클래스명 — pick_place가 물체별 그리퍼 강도를 정할 때 사용한다.
         # 좌표(pub_selected_pose)와 함께 발행해 자동/수동 선택 모두에서 라벨을 알 수 있게 한다.
         self.pub_selected_class = self.create_publisher(String, '/selected_object_class', 10)
+        # 선택 물체의 PCA 단축 폭(mm) — pick_place가 동적 초음파 파지거리 계산에 사용. <=0이면 미상.
+        self.pub_grasp_width = self.create_publisher(Float32, '/selected_object_grasp_width', 10)
         # 배치 대상 box_roi 구역(1~5). 0=미지정(기본 place_position 폴백).
         self.pub_selected_place_zone = self.create_publisher(
             Int32, '/selected_object_place_zone', 10)
@@ -840,12 +823,10 @@ class ObjectDetectorNode(Node):
 
         _add(self._repo_root())
         _add(Path.cwd())
-        _add(Path.cwd() / 'mini_project')
 
         for parent in Path(__file__).resolve().parents:
             _add(parent)
             _add(parent / 'src')
-            _add(parent / 'src' / 'mini_project')
 
         return roots
 
@@ -926,7 +907,11 @@ class ObjectDetectorNode(Node):
         try:
             from ultralytics import FastSAM
             self.fastsam = FastSAM(weights)
-            self.fastsam_device = _INFER_DEVICE
+            try:
+                import torch
+                self.fastsam_device = 0 if torch.cuda.is_available() else 'cpu'
+            except Exception:
+                self.fastsam_device = 'cpu'
             self.get_logger().info(
                 f'FastSAM 로드 완료: {weights} (device={self.fastsam_device}) — unknown 검출 ON')
             return True
@@ -936,65 +921,42 @@ class ObjectDetectorNode(Node):
             self.get_logger().warn(f'FastSAM 로드 실패 — unknown 검출 비활성화: {e}')
             return False
 
-    def _roi_rect(self, frame_w: int, frame_h: int) -> tuple:
-        """unknown 검출 ROI 사각형 (x1,y1,x2,y2). realsense_fastsam_segment.py와 동일 로직."""
-        cx = frame_w // 2 + self.unknown_roi_shift_x
-        cy = frame_h // 2 + self.unknown_roi_shift_y
-        x1 = max(0, cx - self.unknown_roi_w // 2)
-        y1 = max(0, cy - self.unknown_roi_h // 2)
-        x2 = min(frame_w, x1 + self.unknown_roi_w)
-        y2 = min(frame_h, y1 + self.unknown_roi_h)
+    def _roi_rect_for(self, prefix: str, frame_w: int, frame_h: int) -> tuple:
+        """{prefix}_shift_x/y, {prefix}_w/h 파라미터로 ROI 사각형 (x1,y1,x2,y2) 계산.
+
+        중심 = 프레임 중앙 + shift, 크기 = (w,h), 프레임 경계로 clamp.
+        unknown_roi / box_roi / box_roi2~5 가 모두 동일 로직이라 prefix로 통합.
+        """
+        shift_x = getattr(self, f'{prefix}_shift_x')
+        shift_y = getattr(self, f'{prefix}_shift_y')
+        w = getattr(self, f'{prefix}_w')
+        h = getattr(self, f'{prefix}_h')
+        cx = frame_w // 2 + shift_x
+        cy = frame_h // 2 + shift_y
+        x1 = max(0, cx - w // 2)
+        y1 = max(0, cy - h // 2)
+        x2 = min(frame_w, x1 + w)
+        y2 = min(frame_h, y1 + h)
         return x1, y1, x2, y2
+
+    def _roi_rect(self, frame_w: int, frame_h: int) -> tuple:
+        """unknown 검출 ROI 사각형 (x1,y1,x2,y2)."""
+        return self._roi_rect_for('unknown_roi', frame_w, frame_h)
 
     def _box_roi_rect(self, frame_w: int, frame_h: int) -> tuple:
-        """박스 위치 ROI 사각형 (x1,y1,x2,y2). unknown_roi와 동일 로직, 박스용 파라미터 사용."""
-        cx = frame_w // 2 + self.box_roi_shift_x
-        cy = frame_h // 2 + self.box_roi_shift_y
-        x1 = max(0, cx - self.box_roi_w // 2)
-        y1 = max(0, cy - self.box_roi_h // 2)
-        x2 = min(frame_w, x1 + self.box_roi_w)
-        y2 = min(frame_h, y1 + self.box_roi_h)
-        return x1, y1, x2, y2
+        return self._roi_rect_for('box_roi', frame_w, frame_h)
 
     def _box_roi2_rect(self, frame_w: int, frame_h: int) -> tuple:
-        """박스 위치 ROI 2 사각형 (x1,y1,x2,y2). 동일 로직, box_roi2 파라미터 사용."""
-        cx = frame_w // 2 + self.box_roi2_shift_x
-        cy = frame_h // 2 + self.box_roi2_shift_y
-        x1 = max(0, cx - self.box_roi2_w // 2)
-        y1 = max(0, cy - self.box_roi2_h // 2)
-        x2 = min(frame_w, x1 + self.box_roi2_w)
-        y2 = min(frame_h, y1 + self.box_roi2_h)
-        return x1, y1, x2, y2
+        return self._roi_rect_for('box_roi2', frame_w, frame_h)
 
     def _box_roi3_rect(self, frame_w: int, frame_h: int) -> tuple:
-        """박스 위치 ROI 3 사각형 (x1,y1,x2,y2). 동일 로직, box_roi3 파라미터 사용."""
-        cx = frame_w // 2 + self.box_roi3_shift_x
-        cy = frame_h // 2 + self.box_roi3_shift_y
-        x1 = max(0, cx - self.box_roi3_w // 2)
-        y1 = max(0, cy - self.box_roi3_h // 2)
-        x2 = min(frame_w, x1 + self.box_roi3_w)
-        y2 = min(frame_h, y1 + self.box_roi3_h)
-        return x1, y1, x2, y2
+        return self._roi_rect_for('box_roi3', frame_w, frame_h)
 
     def _box_roi4_rect(self, frame_w: int, frame_h: int) -> tuple:
-        """박스 위치 ROI 4 사각형 (x1,y1,x2,y2). 동일 로직, box_roi4 파라미터 사용."""
-        cx = frame_w // 2 + self.box_roi4_shift_x
-        cy = frame_h // 2 + self.box_roi4_shift_y
-        x1 = max(0, cx - self.box_roi4_w // 2)
-        y1 = max(0, cy - self.box_roi4_h // 2)
-        x2 = min(frame_w, x1 + self.box_roi4_w)
-        y2 = min(frame_h, y1 + self.box_roi4_h)
-        return x1, y1, x2, y2
+        return self._roi_rect_for('box_roi4', frame_w, frame_h)
 
     def _box_roi5_rect(self, frame_w: int, frame_h: int) -> tuple:
-        """박스 위치 ROI 5 사각형 (x1,y1,x2,y2). 동일 로직, box_roi5 파라미터 사용."""
-        cx = frame_w // 2 + self.box_roi5_shift_x
-        cy = frame_h // 2 + self.box_roi5_shift_y
-        x1 = max(0, cx - self.box_roi5_w // 2)
-        y1 = max(0, cy - self.box_roi5_h // 2)
-        x2 = min(frame_w, x1 + self.box_roi5_w)
-        y2 = min(frame_h, y1 + self.box_roi5_h)
-        return x1, y1, x2, y2
+        return self._roi_rect_for('box_roi5', frame_w, frame_h)
 
     def _rebuild_sort_class_zone_map(self, names: list, zones: list):
         """클래스명 → box_roi 구역 번호(1~5) 맵 재구성."""
@@ -1522,11 +1484,10 @@ class ObjectDetectorNode(Node):
             if pose_abs is None:
                 continue
             pose_abs = self._finalize_pick_pose_z(pose_abs, u, v, W, H)
-            yaw_deg = None
-            if self.use_object_yaw_for_grasp:
-                yaw_deg = self._estimate_object_yaw_deg(depth_img, u, v, w, h, depth_m)
-                if yaw_deg is not None and self.use_manual_absolute_origin:
-                    self._set_pose_yaw_deg(pose_abs, yaw_deg)
+            yaw_deg, grasp_w_mm = self._estimate_grasp_geometry(
+                depth_img, u, v, w, h, depth_m)
+            if self.use_object_yaw_for_grasp and yaw_deg is not None:
+                self._apply_object_yaw_to_pose(pose_abs, yaw_deg)
             pos = pose_abs.pose.position
 
             candidates.append({
@@ -1541,12 +1502,15 @@ class ObjectDetectorNode(Node):
                 'place_zone': self._resolve_place_zone('object', u, v, W, H),
                 # 소스 위치: 픽셀이 든 box_roi(1~5), 0=ws(박스밖). sort_ws_only 필터용.
                 'source_zone': self._resolve_box_roi_zone_from_pixel(u, v, W, H),
+                'grasp_width_mm': grasp_w_mm,   # PCA 단축 폭(mm) — 동적 초음파 거리 산출용
                 'pose': pose_abs,
                 'pose_dict': {'x': pos.x, 'y': pos.y, 'z': pos.z, 'yaw_deg': yaw_deg},
             })
             unknown_draw.append((seg, uid, cidx))
 
         # ── 시각화 합성 (realsense_fastsam_segment.py 스타일) ──
+        # 마스크 색칠 오버레이·윤곽선·객체 라벨은 그대로 표시한다. 객체별 장축선(yaw axis,
+        # _draw_yaw_axis_roi)만 프레임 드랍 완화를 위해 그리지 않는다.
         vis = (color_img.astype(np.float32) * 0.35).astype(np.uint8)
         roi_base = color_img[ry1:ry2, rx1:rx2].copy()
         roi_overlay = roi_base.copy()
@@ -1915,11 +1879,10 @@ class ObjectDetectorNode(Node):
                 continue
             pose_abs = self._finalize_pick_pose_z(pose_abs, u, v, Ww, Hh)
 
-            yaw_deg = None
-            if self.use_object_yaw_for_grasp:
-                yaw_deg = self._estimate_object_yaw_deg(depth_img, u, v, w, h, depth_m)
-                if yaw_deg is not None and self.use_manual_absolute_origin:
-                    self._set_pose_yaw_deg(pose_abs, yaw_deg)
+            yaw_deg, grasp_w_mm = self._estimate_grasp_geometry(
+                depth_img, u, v, w, h, depth_m)
+            if self.use_object_yaw_for_grasp and yaw_deg is not None:
+                self._apply_object_yaw_to_pose(pose_abs, yaw_deg)
 
             pos = pose_abs.pose.position
 
@@ -1952,6 +1915,7 @@ class ObjectDetectorNode(Node):
                 'place_zone': place_zone,    # 배치 대상 box_roi 구역(1~5), 0=미지정
                 # 소스 위치: 픽셀이 든 box_roi(1~5), 0=ws(박스밖). sort_ws_only 필터용.
                 'source_zone': self._resolve_box_roi_zone_from_pixel(u, v, Ww, Hh),
+                'grasp_width_mm': grasp_w_mm,   # PCA 단축 폭(mm) — 동적 초음파 거리 산출용
                 'pose': pose_abs,
                 'pose_dict': {
                     'x': pos.x,
@@ -2044,6 +2008,9 @@ class ObjectDetectorNode(Node):
         self.pub_selected_pose.publish(pose_base)
         # 그리퍼 강도 룩업용 — 표시 라벨([1]) 아닌 원본 클래스 이름을 발행
         self.pub_selected_class.publish(String(data=selected.get('class_name', selected['label'])))
+        # 단축 폭(mm) 발행 — pick_place가 동적 초음파 파지거리 산출. 미상이면 0.0(폴백 신호).
+        _gw = selected.get('grasp_width_mm')
+        self.pub_grasp_width.publish(Float32(data=float(_gw) if _gw and _gw > 0 else 0.0))
         place_zone = int(selected.get('place_zone', 0))
         self.pub_selected_place_zone.publish(Int32(data=place_zone))
         self.get_logger().info(
@@ -2116,7 +2083,7 @@ class ObjectDetectorNode(Node):
         # 평균 대신 중앙값을 사용해 남은 이상치의 영향도 최소화한다.
         return float(np.median(samples))
 
-    def _estimate_object_yaw_deg(
+    def _estimate_grasp_geometry(
         self,
         depth_img: np.ndarray,
         u: int,
@@ -2124,15 +2091,16 @@ class ObjectDetectorNode(Node):
         box_w: int,
         box_h: int,
         depth_m: float,
-    ) -> float | None:
-        """깊이 밴드 마스크의 2D PCA로 물체의 평면 yaw를 추정한다.
+    ) -> tuple:
+        """깊이 밴드 마스크의 2D PCA로 (yaw_deg, 단축 물리길이 mm)를 함께 추정한다.
 
-        yaw_axis_reference:
-          - long  -> PCA 긴축(major axis) 기준
-          - short -> PCA 단축(minor axis) 기준
+        - yaw_deg: yaw_axis_reference(long=긴축/short=단축) 기준 평면 yaw. 실패 시 None.
+        - short_mm: PCA 단축(minor axis) 방향 마스크 실제 폭(mm) — 그리퍼가 가로질러 닫는 폭.
+                    px extent × depth / fx 로 환산. 실패 시 None.
+        PCA를 한 번만 돌려 둘 다 계산(프레임 비용 추가 없음).
         """
         if not math.isfinite(depth_m):
-            return None
+            return None, None
 
         h_img, w_img = depth_img.shape[:2]
         x0 = max(0, u - box_w // 2)
@@ -2140,13 +2108,13 @@ class ObjectDetectorNode(Node):
         y0 = max(0, v - box_h // 2)
         y1 = min(h_img, v + box_h // 2 + 1)
         if x1 - x0 < 6 or y1 - y0 < 6:
-            return None
+            return None, None
 
         roi = depth_img[y0:y1, x0:x1].astype(np.float32) * self.depth_scale
         valid = roi > 0.0
         valid &= np.abs(roi - float(depth_m)) <= self.yaw_depth_band_m
         if int(np.count_nonzero(valid)) < self.yaw_min_mask_pixels:
-            return None
+            return None, None
 
         small_mask = valid.astype(np.uint8) * 255
         kernel = np.ones((5, 5), np.uint8)
@@ -2157,22 +2125,73 @@ class ObjectDetectorNode(Node):
         ys = ys_roi + y0
         xs = xs_roi + x0
         if ys.size < self.yaw_min_mask_pixels:
-            return None
+            return None, None
 
         pts = np.column_stack((xs.astype(np.float32), ys.astype(np.float32)))
         mean, eigvecs = cv2.PCACompute(pts, mean=None, maxComponents=2)
         if eigvecs is None or eigvecs.shape[0] == 0:
-            return None
+            return None, None
 
+        # ── yaw (장축/단축 기준 선택) ──
         axis_index = 1 if self.yaw_axis_reference == 'short' and eigvecs.shape[0] > 1 else 0
         axis_u = float(eigvecs[axis_index][0])
         axis_v = float(eigvecs[axis_index][1])
-
         # 이미지 축(u right, v down) -> project camera XY(x left, y down)
         proj_x = axis_v
         proj_y = -axis_u
-        yaw_deg = math.degrees(math.atan2(proj_y, proj_x))
-        return self._normalize_grasp_yaw_deg(yaw_deg)
+        yaw_deg = self._normalize_grasp_yaw_deg(math.degrees(math.atan2(proj_y, proj_x)))
+
+        # ── 단축 물리 길이(mm): 단축(minor=eigvecs[1]) 방향 투영 extent ──
+        short_mm = None
+        if eigvecs.shape[0] > 1 and self.intrinsics is not None:
+            minor = np.asarray(eigvecs[1], dtype=np.float32)
+            proj = (pts - mean) @ minor                # (N,) 단축 방향 좌표
+            extent_px = float(proj.max() - proj.min())  # 단축 폭(픽셀)
+            fx = float(self.intrinsics.fx)
+            if fx > 1e-6:
+                short_mm = extent_px * float(depth_m) / fx * 1000.0
+        return yaw_deg, short_mm
+
+    def _apply_object_yaw_to_pose(self, pose_abs: PoseStamped, yaw_cam_deg: float) -> bool:
+        """PCA yaw(카메라 이미지 평면) → base_link Z 회전으로 변환해 pose에 기록."""
+        yaw_rad = math.radians(float(yaw_cam_deg))
+        # project camera XY → optical XY (x_opt=-x_proj, y_opt=y_proj)
+        ox = -math.cos(yaw_rad)
+        oy = math.sin(yaw_rad)
+
+        vs = Vector3Stamped()
+        vs.header.frame_id = self.camera_frame
+        vs.header.stamp = pose_abs.header.stamp
+        vs.vector.x = ox
+        vs.vector.y = oy
+        vs.vector.z = 0.0
+
+        try:
+            vs_base = self.tf_buffer.transform(
+                vs,
+                self.robot_base_frame,
+                timeout=rclpy.duration.Duration(seconds=0.1),
+            )
+        except Exception as e:
+            self.get_logger().warn(
+                f'물체 yaw TF 변환 실패 — 카메라 yaw 그대로 적용: {e}',
+                throttle_duration_sec=5.0,
+            )
+            self._set_pose_yaw_deg(pose_abs, yaw_cam_deg)
+            return False
+
+        bx = float(vs_base.vector.x)
+        by = float(vs_base.vector.y)
+        if math.hypot(bx, by) < 1e-6:
+            return False
+
+        yaw_base = self._normalize_grasp_yaw_deg(math.degrees(math.atan2(by, bx)))
+        self._set_pose_yaw_deg(pose_abs, yaw_base)
+        self.get_logger().info(
+            f'[yaw] cam={yaw_cam_deg:+.1f}° → base={yaw_base:+.1f}° ({self.yaw_axis_reference})',
+            throttle_duration_sec=2.0,
+        )
+        return True
 
     def _normalize_grasp_yaw_deg(self, yaw_deg: float) -> float:
         """그리퍼 180도 대칭을 고려해 yaw를 [-90, 90) 범위로 접는다."""
@@ -2403,8 +2422,7 @@ class ObjectDetectorNode(Node):
             masked[y1:y2, x1:x2] = img[y1:y2, x1:x2]   # ROI만 남기고 검정 (전체 크기 유지)
             try:
                 results = self.model.predict(
-                    masked, conf=self.conf_thresh, verbose=False,
-                    device=_INFER_DEVICE)
+                    masked, conf=self.conf_thresh, verbose=False)
             except Exception as e:
                 self.get_logger().warn(f'per-ROI predict 실패: {e}',
                                        throttle_duration_sec=5.0)
@@ -2449,8 +2467,7 @@ class ObjectDetectorNode(Node):
           - tracker_id는 ultralytics BoT-SORT/ByteTrack이 부여하는 고유 ID(int).
           - tracker가 ID 미부여 상태(첫 프레임 일부)면 그 검출은 skip.
         """
-        track_kwargs = dict(conf=self.conf_thresh, persist=True, verbose=False,
-                            device=_INFER_DEVICE)
+        track_kwargs = dict(conf=self.conf_thresh, persist=True, verbose=False)
         if self._tracker_yaml_path:
             track_kwargs['tracker'] = self._tracker_yaml_path
         results = self.model.track(img, **track_kwargs)

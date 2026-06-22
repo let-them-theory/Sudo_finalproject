@@ -10,14 +10,14 @@ User GUI를 **PyQt → 웹**으로 전환. 관리자는 PyQt 유지 + USER 탭 �
 ## 생성/수정 파일
 
 ### 1. 웹 백엔드 (신규)
-`mini_project/web_kiosk/backend/main.py`
+`web_kiosk/backend/main.py`
 - FastAPI + rclpy. `UserGuiNode`의 큐 로직(`tick_queue`/`submit_order`/`cancel_order`) 그대로 이전 — **기능 동일**
 - REST: `GET /api/catalog`, `POST /api/orders`, `GET /api/orders/{id}`, `POST /api/orders/{id}/cancel`, `GET /api/queue`, `GET /api/state`
 - WebSocket `/ws`: state/queue/detected/error 푸시
 - 프론트 `dist` 정적 서빙, `0.0.0.0:8000`
 
 ### 2. 웹 프론트 (신규)
-`mini_project/web_kiosk/frontend/` (Vite + React + TS + Tailwind v4 + lucide-react)
+`web_kiosk/frontend/` (Vite + React + TS + Tailwind v4 + lucide-react)
 - `src/App.tsx` — 4페이지(환영→선택→확인→대기), 토스풍, 카트 collapsible, 대기 진행률/품목상태/큐위치
 - `src/api.ts` — REST/WS 클라이언트
 - `src/products.ts` — 상품 class→한글/이모지
@@ -25,7 +25,7 @@ User GUI를 **PyQt → 웹**으로 전환. 관리자는 PyQt 유지 + USER 탭 �
 - 빌드 완료 (`dist/`)
 
 ### 3. 관리자 PyQt (수정)
-`mini_project/dsr_realsense_pick_place/gui_node.py`
+`dsr_realsense_pick_place/gui_node.py`
 - **USER 탭** 추가 (4번째 탭): 주문 큐 **트리**(주문 단위 펼치기/접기 + 번호표·수량·시간·상태) + 새로고침 + 🗑 큐 비우기
 - import 추가: `QTreeWidget`/`QTreeWidgetItem`/`QTableWidget`/`QHeaderView`/`QMessageBox`, `task_repository`(`JsonRepository`/`OrderStatus`/`ItemStatus`)
 - 상수 추가: `PRODUCT_KR`, `_KR_STATUS`
@@ -66,7 +66,7 @@ User GUI를 **PyQt → 웹**으로 전환. 관리자는 PyQt 유지 + USER 탭 �
 ## 실행
 ```bash
 # 웹 백엔드 (메인 PC)
-cd mini_project/web_kiosk/backend && python3 main.py    # 0.0.0.0:8000
+cd web_kiosk/backend && python3 main.py    # 0.0.0.0:8000
 # 폰/태블릿 → http://<메인PC_IP>:8000  (현재 172.30.1.59, DHCP라 변동)
 
 # 관리자 GUI

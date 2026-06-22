@@ -339,7 +339,7 @@ pgrep -af 'gripper_service|gripper_node'   # 출력 없으면 정상
 
 ### 10.2 변경 이력 (날짜순)
 
-> 문제 → 원인 → 조치 형식으로 정리. Pick & Place는 `mini_project/` 기준, 학습 데이터 수집은 `~/ultralytics/collect_data.py` 기준.
+> 문제 → 원인 → 조치 형식으로 정리. Pick & Place는 `src/` 루트 패키지 기준, 학습 데이터 수집은 `~/ultralytics/collect_data.py` 기준.
 
 | 날짜 | 주요 영역 |
 |------|-----------|
@@ -459,18 +459,18 @@ use_ultrasonic_grasp: true
 
 | 문제 | 조치 |
 |------|------|
-| 스크립트가 `Sudo_finalproject-main`, `doosan_ws` install을 순회 | `mini_project/_source_workspace.sh` 추가 — 상위 디렉터리에서 `install/local_setup.bash` 자동 탐색, **`sudo_ws` 우선** |
+| 스크립트가 `Sudo_finalproject-main`, `doosan_ws` install을 순회 | `_source_workspace.sh` 추가 — 상위 디렉터리에서 `install/local_setup.bash` 자동 탐색, **`sudo_ws` 우선** |
 | `source_ws.bash`, `run_pick_place_real.sh`, `shutdown_nodes.sh` 등 경로 불일치 | 공통 헬퍼 `source` 로 통일 |
 | `.bashrc`가 `doosan_ws` + `sudo_ws` 동시 source → 패키지 경로 충돌 | `~/sudo_ws/install/local_setup.bash` 단일 source, Gazebo 리소스 경로도 `sudo_ws` 기준 |
-| `realsense_fastsam_segment.py` 모델 경로 고정 | `mini_project/models/proto.pt` 등 후보 경로 자동 탐색 |
+| `realsense_fastsam_segment.py` 모델 경로 고정 | `models/proto.pt` 등 후보 경로 자동 탐색 |
 
-관련 파일: `mini_project/_source_workspace.sh`, `source_ws.bash`, `mini_project/setup.py`(install에 헬퍼 포함), `realsense_fastsam_segment.py`
+관련 파일: `_source_workspace.sh`, `source_ws.bash`, `setup.py`, `realsense_fastsam_segment.py`
 
 ##### C. 경로 수정 후 launch 연결 실패 (1차)
 
 | 문제 | 원인 | 조치 |
 |------|------|------|
-| `run_pick_place_real.sh` 실행 시 ROS 패키지 못 찾음 | install된 스크립트가 존재하지 않는 `../../_source_workspace.sh` 참조 | `_source_workspace.sh`를 `mini_project/`에 두고 `setup.py`로 install share에 복사, 스크립트 경로 `../_source_workspace.sh`로 수정 |
+| `run_pick_place_real.sh` 실행 시 ROS 패키지 못 찾음 | install된 스크립트가 존재하지 않는 `../../_source_workspace.sh` 참조 | `_source_workspace.sh`를 `src/`에 두고 `setup.py`로 install share에 복사, 스크립트 경로 `../_source_workspace.sh`로 수정 |
 
 ##### D. 그리퍼 연결·초기화 안정화 (1차)
 
@@ -676,7 +676,7 @@ use_ultrasonic_grasp: true
 ```bash
 cd ~/sudo_ws && source install/local_setup.bash && op
 # 30초 대기 후 다른 터미널:
-bash ~/sudo_ws/src/mini_project/scripts/verify_pick_place_graph.sh
+bash ~/sudo_ws/src/scripts/verify_pick_place_graph.sh
 ros2 topic echo /detected_objects --once
 ```
 
@@ -691,12 +691,12 @@ ros2 topic echo /detected_objects --once
 
 | 경로 | 역할 |
 |------|------|
-| `mini_project/launch/pick_place.launch.py` | 전체 노드 런치 (`gui:=false`/`web:=true` 기본) |
-| `mini_project/dsr_realsense_pick_place/web_control_node.py` | **관리자 웹 제어 (SQLite+HTTP, 포트 8080) — PyQt GUI 대체** |
-| `mini_project/web_kiosk/` | **유저 주문 키오스크 (React + FastAPI, 포트 8000)** |
-| `mini_project/dsr_realsense_pick_place/gui_node.py` | PyQt GUI (web_control로 대체, `gui:=true`로 사용 가능) |
-| `mini_project/dsr_realsense_pick_place/object_detector.py` | YOLO + FastSAM 검출 (클래스 다수결 안정화) |
-| `mini_project/dsr_realsense_pick_place/pick_place_node.py` | 픽 FSM (package/비동기 하강/status3 방어) |
+| `launch/pick_place.launch.py` | 전체 노드 런치 (`gui:=false`/`web:=true` 기본) |
+| `dsr_realsense_pick_place/web_control_node.py` | **관리자 웹 제어 (SQLite+HTTP, 포트 8080) — PyQt GUI 대체** |
+| `web_kiosk/` | **유저 주문 키오스크 (React + FastAPI, 포트 8000)** |
+| `dsr_realsense_pick_place/gui_node.py` | PyQt GUI (web_control로 대체, `gui:=true`로 사용 가능) |
+| `dsr_realsense_pick_place/object_detector.py` | YOLO + FastSAM 검출 (클래스 다수결 안정화) |
+| `dsr_realsense_pick_place/pick_place_node.py` | 픽 FSM (package/비동기 하강/status3 방어) |
 | `dsr_gripper_tcp/` | 그리퍼 TCP 브릿지 |
 | `scripts/shutdown_nodes.sh` | 정상 종료 (DRCF/DRL 순서 해제) |
 | `scripts/run_pick_place_real.sh` | 권장 기동 래퍼 (종료 시 shutdown 자동) |
@@ -706,8 +706,8 @@ ros2 topic echo /detected_objects --once
 | `scripts/restart_gripper_bridge.sh` | 그리퍼만 복구 |
 | `scripts/verify_pick_place_graph.sh` | Pick & Place 토픽·서비스·검출 연결 점검 |
 | `scripts/diagnose_drcf.py` | DRCF 연결 진단 |
-| `mini_project/config/pick_place_params.yaml` | 초음파·place·슬롯·zone 파라미터 |
-| `mini_project/_source_workspace.sh` | ROS 워크스페이스 자동 source (`sudo_ws` 우선) |
+| `config/pick_place_params.yaml` | 초음파·place·슬롯·zone 파라미터 |
+| `_source_workspace.sh` | ROS 워크스페이스 자동 source (`sudo_ws` 우선) |
 | `source_ws.bash` | 터미널용 환경 설정 |
 | `~/ultralytics/collect_data.py` | RealSense 학습 데이터 수집 GUI |
 

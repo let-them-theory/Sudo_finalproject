@@ -58,10 +58,10 @@ ARGUMENTS = [
                           description='Fallback: launch에서 set_robot_mode service call 실행 여부'),
     DeclareLaunchArgument('gripper_tcp_port', default_value='20002',
                           description='그리퍼 TCP 서버 포트'),
-    DeclareLaunchArgument('use_ultrasonic', default_value='false',
+    DeclareLaunchArgument('use_ultrasonic', default_value='true',
                           description='아두이노 HC-SR04 초음파 거리 노드 실행 여부'),
-    DeclareLaunchArgument('ultrasonic_port', default_value='/dev/ttyACM0',
-                          description='아두이노 시리얼 포트'),
+    DeclareLaunchArgument('ultrasonic_port', default_value='auto',
+                          description='아두이노 시리얼 포트 (auto=by-id 자동탐색)'),
     DeclareLaunchArgument('ultrasonic_baudrate', default_value='9600',
                           description='아두이노 시리얼 baudrate'),
 ]
@@ -112,7 +112,7 @@ def generate_launch_description():
         ]),
         launch_arguments={
             'align_depth.enable': 'true',
-            'pointcloud.enable':  'true',
+            'pointcloud.enable':  'false',
             'serial_no':          LaunchConfiguration('camera_serial'),
         }.items(),
         condition=IfCondition(LaunchConfiguration('use_realsense')),
@@ -174,6 +174,7 @@ def generate_launch_description():
                 parameters=[params_file, {
                     'http_host': LaunchConfiguration('web_host'),
                     'http_port': ParameterValue(LaunchConfiguration('web_port'), value_type=int),
+                    'params_file': params_file,
                 }],
                 condition=IfCondition(LaunchConfiguration('web')),
             )

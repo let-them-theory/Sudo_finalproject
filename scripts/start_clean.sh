@@ -53,4 +53,5 @@ export DISPLAY="${DISPLAY:-:0}"
 exec ros2 launch dsr_realsense_pick_place pick_place.launch.py \
   mode:=real \
   host:="$HOST" \
-  use_launch_set_robot_mode:=true
+  use_launch_set_robot_mode:=true \
+  use_ultrasonic:=true
