@@ -337,6 +337,36 @@ pgrep -af 'gripper_service|gripper_node'   # 출력 없으면 정상
 
 `pkill -9`로 `ros2_control_node` / 그리퍼를 직접 죽이지 마세요. DRCF authority가 컨트롤러에 남아 **재연결 시 로봇 전원 사이클**이 필요해질 수 있습니다.
 
+### 10.1.1 웹 인터페이스
+
+| 페이지 | 주소 | 내용 |
+|--------|------|------|
+| 유저 키오스크 | `http://localhost:8000` | 주문 · QR/코드 수령 |
+| 관리자 패널 | `http://localhost:8000/admin` | 재고(box 제외 9종) · 락커 · 주문/큐 · 픽 통계 · 처리 이력 |
+| 로봇 제어 | `http://localhost:8080` | 그리퍼 전류/초음파 · 락커 · 로그 (web_control) |
+
+전체 한 번에 시작(빌드 + 정리 + 로봇 + 키오스크 + 관리자 창):
+
+```bash
+bash mini_project/scripts/start_all.sh
+```
+
+데이터 계층은 **하이브리드** — 영속(재고/통계/이력)은 SQLite(`~/.config/dsr_realsense_pick_place/store.db`), 휘발(주문/큐/락커)은 JSON. UI·Robot은 DB 직접 접근 안 함(Main 경유).
+
+### 10.1.2 재현성 (clone 후 바로 실행)
+
+모델(`models/*.pt`)과 키오스크 빌드물(`web_kiosk/frontend/dist`)을 git에 포함 → clone 후 `npm run build` 없이 동작. 단 **빌드는 두산 underlay(ros2_ws) 먼저 source + `--paths` 지정**(루트 `package.xml` 때문에 colcon이 하위 패키지를 자동 탐색 못 함):
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/ros2_ws/install/setup.bash          # 두산 underlay 먼저 (필수)
+cd ~/kairos_ws
+colcon build --paths \
+  src/Sudo_finalproject/dsr_gripper_tcp_interfaces \
+  src/Sudo_finalproject/dsr_gripper_tcp \
+  src/Sudo_finalproject
+```
+
 ### 10.2 변경 이력 (날짜순)
 
 > 문제 → 원인 → 조치 형식으로 정리. Pick & Place는 `mini_project/` 기준, 학습 데이터 수집은 `~/ultralytics/collect_data.py` 기준.
@@ -349,6 +379,7 @@ pgrep -af 'gripper_service|gripper_node'   # 출력 없으면 정상
 | [2026-06-11](#2026-06-11--그리퍼-초기화-속도--place-구역) | status3 초기화 단축, box_roi ↔ place zone 매핑 |
 | [2026-06-12 ~ 14](#2026-06-12--14--gui--place-시퀀스--빈칸-배치) | GUI 분리/스크롤, zone4 시퀀스, 동적 place 슬롯 |
 | [2026-06-15](#2026-06-15--학습-데이터-수집-gui) | `collect_data.py` 화살표 선택, 클래스 추가 |
+| 2026-06-22 | 관리자 패널(`/admin`) 통합 · 하이브리드 SQLite(재고/통계/이력 영속) · 락커/QR 수령 · 키오스크 UX(결제/키패드/고정캔버스) · 모델·dist git 추적(재현성) |
 | [2026-06-15](#2026-06-15--proto_v3-모델-교체) | YOLO `proto_v2.pt` → `proto_v3.pt` |
 | [2026-06-15](#2026-06-15--proto_v2-전환-후-gui-검출-불가) | `proto_v2.pt` 런치 교체, GUI 물체 버튼·응답 없음 수정 |
 

@@ -145,7 +145,7 @@ object_detector:
     depth_outlier_mad_scale: 2.5    # MAD 이상치 제거 스케일 팩터
     selected_object_topic: "/selected_object_label"
     # 마스크 기반 축(yaw) 추정 비활성화 — GUI 장축/단축 오버레이 미사용.
-    use_object_yaw_for_grasp: false
+    use_object_yaw_for_grasp: true
     yaw_axis_reference: "long"
     yaw_depth_band_m: 0.03
     yaw_min_mask_pixels: 40
@@ -204,7 +204,7 @@ rh_p12_rna_gripper:
     stroke_close: 1000
     # --- 파지 감지 위치 범위 ---
     min_grip_pos: 500           # 이 위치부터 파지 전류 감지 시작
-    max_grip_pos: 700           # 이 이상 = 물체 없음(완전 닫힘)
+    max_grip_pos: 730           # 이 이상 = 물체 없음(완전 닫힘)
     # --- 파지 감지 임계 전류 (mA) — close_current(전류 한계)와 분리 ---
     # present_current가 이 값 이상이면 접촉(파지)으로 판단. close_current보다 낮게 둬
     # 포화 전에 접촉 감지 → 빨리 위치 락. free-run/노이즈(~68mA)보단 충분히 높게.
@@ -272,7 +272,7 @@ pick_place_node:
     # --- 그리퍼 설정 ---
     # gripper_node의 motion_wait(1.5s)보다 길게 설정해야
     # 그리퍼 동작 완료 후 다음 로봇 모션이 시작됩니다.
-    gripper_wait_sec: 1.7           # 그리퍼 동작 대기 시간 (s)
+    gripper_wait_sec: 0.5           # 그리퍼 동작 대기 시간 (s)
 
     # --- 물체별 파지 전류(강도) (mA) ---
     # 파지 직전, 선택된 물체 클래스(/selected_object_class)에 따라

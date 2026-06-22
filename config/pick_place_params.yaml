@@ -309,7 +309,7 @@ pick_place_node:
     place_position: [0.4, -0.3, 0.2]
     # user 주문 전용 place(=package 영역). run_once_package 호출 시 zone 무시하고 여기로.
     # box zone(-Y)의 반대 +Y쪽. z는 package 표면 실측 후 조정.
-    package_position: [0.40, 0.40, 0.25]
+    package_position: [0.40, 0.30, 0.25]   # Y 줄여 아래쪽(unknown zone5와 위아래 분리)
     # zone4 transit 티치: approach_z = sort_roi_zone_positions_z[3] + place_approach_z_offset
     # scripts/teach_zone4_transit.py info → goto → (티치 미세조정) → capture --apply
     place_approach_z_offset: 0.09   # 미지정 구역 폴백. 구역별은 sort_roi_zone_approach_z_offset 사용
@@ -333,7 +333,7 @@ pick_place_node:
     # ★ 실제 테이블 좌표로 캘리브레이션 후 채워넣으세요 ★
     #         zone1(roi1)  zone2(roi2)  zone3(roi3)  zone4(roi4)  zone5(roi5)
     sort_roi_zone_positions_x: [0.51,        0.20,        0.20,        0.145,       0.60]
-    sort_roi_zone_positions_y: [-0.29,       -0.29,       -0.45,       -0.543,       0.0]
+    sort_roi_zone_positions_y: [-0.29,       -0.29,       -0.45,       -0.543,       0.50]  # zone5(unknown) Y↑ — package(0.30)보다 위쪽
     sort_roi_zone_positions_z: [0.25,        0.25,        0.45,        0.341,       0.25]
     #                            zone1/2/5 바닥 높이(티치). 동적 place z = 이 값 + place_slot_z_offset_m
     # 구역별 MOVE_TO_PLACE 접근 상승(place_z+). 0= LIFT 높이에서 수평이동 / zone4만 높게

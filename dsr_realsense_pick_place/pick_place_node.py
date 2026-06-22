@@ -1313,7 +1313,13 @@ class PickPlaceNode(Node):
 
                 elif current == State.PLACE:
                     px, py, pz = self._active_place_pos
-                    self.get_logger().info('물체 내려놓기')
+                    _cls = self._target_object_class or 'unknown'
+                    _zi = self._active_place_zone_idx
+                    _roi = f'box_roi{_zi + 1}' if _zi is not None else 'package'
+                    _unk = (not self._target_object_class) or ('unknown' in _cls.lower())
+                    self.get_logger().info(
+                        f'📦 내려놓기: [{_cls}]{" [UNKNOWN]" if _unk else ""} → {_roi} '
+                        f'(x={px:.3f} y={py:.3f} z={pz:.3f})')
                     self._move_to_cart(
                         px, py, pz, self._active_place_rpy, vel=50.0, acc=100.0)
                     self._gripper_open()
@@ -1324,7 +1330,12 @@ class PickPlaceNode(Node):
                     px, py, pz = self._active_place_pos
                     self._move_to_cart(
                         px, py, pz + self.pre_place_dz, self._active_place_rpy)
-                    self.get_logger().info('Pick & Place 완료!')
+                    _cls = self._target_object_class or 'unknown'
+                    _zi = self._active_place_zone_idx
+                    _roi = f'box_roi{_zi + 1}' if _zi is not None else 'package'
+                    _unk = (not self._target_object_class) or ('unknown' in _cls.lower())
+                    self.get_logger().info(
+                        f'✅ 소팅 완료: [{_cls}]{" [UNKNOWN]" if _unk else ""} → {_roi}')
                     self._set_state(State.HOME)
 
                 elif current == State.HOME:

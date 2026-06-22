@@ -1,15 +1,15 @@
 // 원격 주문 키오스크 — 환영(대기현황) → 상품선택 → 주문확인 → 주문완료(영수증). 토스풍.
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
-  getCatalog, createOrder, connectWs,
-  type Catalog, type OrderResp, type QueueItem,
+  getCatalog, createOrder, connectWs, scanPickup, confirmPickup, pickupQrUrl, getLockers,
+  type Catalog, type OrderResp, type QueueItem, type LockerInfo, type LockerSlot,
 } from './api'
 import { nameOf, emojiOf } from './products'
 import {
-  ChevronUp, ChevronDown, ChevronLeft, RefreshCw, Plus, Minus, Check, AlertTriangle, Clock,
+  ChevronUp, ChevronDown, ChevronLeft, RefreshCw, Plus, Minus, Check, AlertTriangle, Clock, Package,
 } from 'lucide-react'
 
-type Page = 'welcome' | 'select' | 'confirm' | 'done'
+type Page = 'welcome' | 'select' | 'confirm' | 'pay' | 'setcode' | 'done' | 'pickup'
 type ReceiptItem = { class_name: string; qty: number }
 
 // 품절/미검출 표시 — 로직만 배선, 지금은 끔(큐→픽플레이스 검증 우선). 나중에 true.
@@ -18,8 +18,9 @@ const IDLE_MS = 60000               // 무동작 시 처음 화면 복귀
 const ORDER_KEY = 'kiosk_receipt'   // 새로고침 후 영수증 복원
 
 const STEPS: { key: Page; label: string }[] = [
-  { key: 'select', label: '선택' },
-  { key: 'confirm', label: '확인' },
+  { key: 'select', label: '주문' },
+  { key: 'pay', label: '결제' },
+  { key: 'setcode', label: '코드' },
   { key: 'done', label: '완료' },
 ]
 
@@ -53,8 +54,13 @@ export default function App() {
   const [available, setAvailable] = useState<string[]>([])
   const [paused, setPaused] = useState(false)
   const [queue, setQueue] = useState<QueueItem[]>([])
+  const [lockers, setLockers] = useState<LockerSlot[]>([])
   const [cartOpen, setCartOpen] = useState(false)
   const [err, setErr] = useState('')
+  // 주문 완료(배달끝) 알림 — order_done WS 이벤트.
+  const [doneNotice, setDoneNotice] = useState<
+    { order_id: string; status: string; locker_id: number; failed: string[]; all_ok: boolean } | null
+  >(null)
 
   useEffect(() => {
     getCatalog().then(setCatalog).catch(() => {})
@@ -76,13 +82,26 @@ export default function App() {
       else if (e.type === 'detected') setAvailable(e.classes)
       else if (e.type === 'queue') setQueue(e.items)
       else if (e.type === 'paused') setPaused(e.paused)
+      else if (e.type === 'order_done')
+        setDoneNotice({ order_id: e.order_id, status: e.status, locker_id: e.locker_id,
+          failed: e.failed, all_ok: e.all_ok })
     })
     return () => ws.close()
   }, [])
 
+  // HOME 락커(보관함) 현황 폴링 — 어느 주문이 어느 칸에 있는지 표시.
+  useEffect(() => {
+    if (page !== 'welcome') return
+    let alive = true
+    const tick = () => getLockers().then((l) => { if (alive) setLockers(l) }).catch(() => {})
+    tick()
+    const id = window.setInterval(tick, 1500)
+    return () => { alive = false; clearInterval(id) }
+  }, [page])
+
   // 유휴 자동 리셋 (홈 제외).
   useEffect(() => {
-    if (page === 'welcome') return
+    if (page === 'welcome' || page === 'done') return   // done은 자체 15초 타이머 사용
     let t = window.setTimeout(toWelcome, IDLE_MS)
     const bump = () => { clearTimeout(t); t = window.setTimeout(toWelcome, IDLE_MS) }
     window.addEventListener('pointerdown', bump)
@@ -105,20 +124,21 @@ export default function App() {
   const total = Object.values(cart).reduce((a, b) => a + b, 0)
   const kinds = Object.keys(cart).length
 
-  const submit = async () => {
+  const submit = async (code: string) => {
     try {
       const lines = Object.entries(cart) as [string, number][]
-      const o = await createOrder(lines)
+      const o = await createOrder(lines, code)
       const items: ReceiptItem[] = lines.map(([c, q]) => ({ class_name: c, qty: q }))
       localStorage.setItem(ORDER_KEY, JSON.stringify({ order: o, items }))
       setOrder(o); setReceipt(items); setErr(''); setCart({}); setPage('done')
-    } catch {
-      setErr('주문 접수에 실패했어요. 다시 시도해주세요.')
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : '주문 접수에 실패했어요. 다시 시도해주세요.')
     }
   }
   function toWelcome() {
     localStorage.removeItem(ORDER_KEY)
-    setCart({}); setOrder(null); setReceipt([]); setCartOpen(false); setErr(''); setPage('welcome')
+    setCart({}); setOrder(null); setReceipt([]); setCartOpen(false); setErr('')
+    setDoneNotice(null); setPage('welcome')
   }
 
   const hardError = state === 'ERROR' || state === 'EMERGENCY_STOP'
@@ -126,9 +146,10 @@ export default function App() {
   const board = buildBoard(queue)
 
   return (
-    <div className={`mx-auto flex h-full w-full max-w-2xl flex-col transition-colors ${
-      alertLevel === 'error' ? 'bg-red-50' : alertLevel === 'warn' ? 'bg-amber-50' : 'bg-white'
-    }`}>
+    <div className="flex h-screen w-screen items-center justify-center overflow-hidden bg-neutral-200">
+      <div className={`relative flex flex-col overflow-hidden rounded-[20px] shadow-2xl transition-colors ${
+        alertLevel === 'error' ? 'bg-red-50' : alertLevel === 'warn' ? 'bg-amber-50' : 'bg-white'
+      }`} style={{ width: 'var(--kiosk-w)', height: 'var(--kiosk-h)' }}>
       <Header page={page} />
       {alertLevel && (
         <div className={`flex items-center justify-center gap-2 px-4 py-2.5 text-[15px] font-bold text-white ${
@@ -140,8 +161,12 @@ export default function App() {
       )}
       <main className="flex-1 overflow-hidden">
         {page === 'welcome' && (
-          <Welcome board={board} onStart={() => setPage('select')}
+          <Welcome board={board} lockers={lockers} onStart={() => setPage('select')}
+            onPickup={() => setPage('pickup')}
             onRefresh={() => getCatalog().then(setCatalog).catch(() => {})} />
+        )}
+        {page === 'pickup' && (
+          <PickupPage onBack={() => setPage('welcome')} />
         )}
         {page === 'select' && (
           <SelectPage
@@ -154,19 +179,32 @@ export default function App() {
           />
         )}
         {page === 'confirm' && (
-          <ConfirmPage cart={cart} total={total} err={err}
-            onBack={() => setPage('select')} onPlace={submit} />
+          <ConfirmPage cart={cart} total={total} err=""
+            onBack={() => setPage('select')}
+            onPlace={() => { setErr(''); setPage('pay') }} />
+        )}
+        {page === 'pay' && (
+          <PayPage total={total} onBack={() => setPage('confirm')}
+            onPaid={() => setPage('setcode')} />
+        )}
+        {page === 'setcode' && (
+          <SetCodePage err={err} onBack={() => setPage('pay')} onSubmit={submit} />
         )}
         {page === 'done' && (
-          <DonePage order={order} receipt={receipt} board={board} onHome={toWelcome} />
+          <DonePage order={order} receipt={receipt} board={board}
+            notice={doneNotice && order && doneNotice.order_id === order.order_id ? doneNotice : null}
+            onHome={toWelcome} />
         )}
       </main>
+      </div>
     </div>
   )
 }
 
 function Header({ page }: { page: Page }) {
-  const activeIdx = STEPS.findIndex((s) => s.key === page)
+  // confirm은 주문(select) 단계로 묶어 표시.
+  const stepKey = page === 'confirm' ? 'select' : page
+  const activeIdx = STEPS.findIndex((s) => s.key === stepKey)
   return (
     <header className="flex items-center justify-between border-b border-line px-6 py-4">
       <div className="text-xl font-bold text-ink">무인 스토어</div>
@@ -207,6 +245,47 @@ function CTA(props: { onClick: () => void; disabled?: boolean; children: React.R
   )
 }
 
+// HOME 보관함 현황 — 8칸 전부 표시. 완료=초록/진행중=노랑/대기(빈칸)=흰색. 번호+주문번호+상태.
+function LockerBoard({ lockers }: { lockers: LockerSlot[] }) {
+  // 항상 8칸 그리드. lockers 비었으면 id만 채운 빈칸으로.
+  const slots: LockerSlot[] = Array.from({ length: 8 }, (_, i) => {
+    const id = i + 1
+    return lockers.find((l) => l.id === id) ?? { id, status: 'free', order_id: '', ticket_no: '' }
+  })
+  return (
+    <div className="rounded-xl border border-line bg-white/70 p-3">
+      <div className="mb-2 flex items-center gap-1.5 text-[14px] font-bold text-ink">
+        <Package size={15} /> 보관함 현황
+        <span className="ml-auto flex items-center gap-2 text-[11px] font-semibold text-muted">
+          <span className="inline-flex items-center gap-1"><i className="inline-block h-2.5 w-2.5 rounded-sm bg-amber-300" />진행중</span>
+          <span className="inline-flex items-center gap-1"><i className="inline-block h-2.5 w-2.5 rounded-sm bg-green-400" />수령가능</span>
+        </span>
+      </div>
+      <div className="grid grid-cols-4 gap-2">
+        {slots.map((l) => {
+          const ready = l.status === 'ready'
+          const busy = l.status === 'occupied'
+          const cls = ready
+            ? 'bg-green-100 border-green-300 text-green-800'
+            : busy
+            ? 'bg-amber-100 border-amber-300 text-amber-900'
+            : 'bg-white border-line text-muted'
+          return (
+            <div key={l.id}
+              className={`flex flex-col items-center justify-center rounded-lg border py-2 ${cls}`}>
+              <span className="text-[15px] font-bold">{l.id}</span>
+              <span className="font-mono text-[12px] leading-tight">{l.ticket_no || '—'}</span>
+              <span className="text-[11px] font-semibold leading-tight">
+                {ready ? '수령가능' : busy ? '배달중' : '대기'}
+              </span>
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
 function QueueBoard({ board, myId }: { board: BoardRow[]; myId?: string }) {
   if (board.length === 0) {
     return (
@@ -240,8 +319,9 @@ function QueueBoard({ board, myId }: { board: BoardRow[]; myId?: string }) {
   )
 }
 
-function Welcome({ board, onStart, onRefresh }: {
-  board: BoardRow[]; onStart: () => void; onRefresh: () => void
+function Welcome({ board, lockers, onStart, onPickup, onRefresh }: {
+  board: BoardRow[]; lockers: LockerSlot[]
+  onStart: () => void; onPickup: () => void; onRefresh: () => void
 }) {
   return (
     <div className="page-fade flex h-full flex-col px-6">
@@ -262,8 +342,13 @@ function Welcome({ board, onStart, onRefresh }: {
             <RefreshCw size={16} /> 새로고침
           </button>
         </div>
+        <LockerBoard lockers={lockers} />
         <QueueBoard board={board} />
         <CTA onClick={onStart}>주문 시작하기</CTA>
+        <button onClick={onPickup}
+          className="flex w-full items-center justify-center gap-2 rounded-xl border-2 border-brand py-3 text-[16px] font-bold text-brand active:scale-95">
+          📦 QR로 수령하기
+        </button>
       </div>
     </div>
   )
@@ -431,20 +516,168 @@ function ConfirmPage(props: {
 }
 
 // 원격 주문 — 주문 완료 영수증. 실시간 로봇 추적 없음(주문은 큐에 올라가 처리됨).
+function PayPage({ total, onBack, onPaid }: {
+  total: number; onBack: () => void; onPaid: () => void
+}) {
+  const [paid, setPaid] = useState(false)
+  const [method, setMethod] = useState('')
+  useEffect(() => {
+    if (!paid) return
+    const t = window.setTimeout(onPaid, 1500)   // 결제완료 보여주고 자동으로 다음
+    return () => clearTimeout(t)
+  }, [paid])
+
+  const PAY_METHODS = [
+    { key: 'card', label: '카드', emoji: '💳' },
+    { key: 'kakao', label: '카카오페이', emoji: '🟡' },
+    { key: 'naver', label: '네이버페이', emoji: '🟢' },
+  ]
+
+  if (paid) return (
+    <div className="page-fade flex h-full flex-col items-center justify-center px-6">
+      <span className="pop flex h-20 w-20 items-center justify-center rounded-full bg-brand text-white">
+        <Check size={44} />
+      </span>
+      <div className="mt-5 text-[26px] font-bold text-ink">결제 완료!</div>
+      <div className="mt-1 text-[16px] text-muted">잠시만 기다려주세요...</div>
+    </div>
+  )
+  return (
+    <div className="page-fade flex h-full flex-col">
+      <div className="flex-1 overflow-y-auto px-6 py-5">
+        <div className="mb-1 text-[22px] font-bold text-ink">결제 수단 선택</div>
+        <div className="text-[15px] text-muted">총 {total}개 상품</div>
+        <div className="mt-5 space-y-3">
+          {PAY_METHODS.map((m) => {
+            const on = method === m.key
+            return (
+              <button key={m.key} onClick={() => setMethod(m.key)}
+                className={`flex w-full items-center gap-3 rounded-2xl border-2 px-5 py-4 text-[17px] font-bold transition-all active:scale-95 ${
+                  on ? 'border-brand bg-brand-light text-brand' : 'border-line bg-white text-ink'
+                }`}>
+                <span className="text-2xl">{m.emoji}</span>
+                <span className="flex-1 text-left">{m.label}</span>
+                {on && <Check size={20} />}
+              </button>
+            )
+          })}
+        </div>
+      </div>
+      <div className="flex gap-2 border-t border-line px-6 pb-6 pt-4">
+        <button onClick={onBack}
+          className="rounded-2xl border border-line px-6 py-4 text-[16px] font-bold text-sub active:scale-95">뒤로</button>
+        <div className="flex-1">
+          <CTA onClick={() => method && setPaid(true)}>
+            {method ? '결제하기' : '결제 수단을 선택하세요'}
+          </CTA>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// 코드 표시 — _ _ _ _ 칸이 한 글자씩 채워짐. 현재 입력 위치 강조.
+function CodeDisplay({ code, len = 4 }: { code: string; len?: number }) {
+  return (
+    <div className="flex justify-center gap-3">
+      {Array.from({ length: len }).map((_, i) => {
+        const filled = i < code.length
+        const current = i === code.length
+        return (
+          <div key={i}
+            className={`flex h-16 w-14 items-center justify-center rounded-2xl border-2 font-mono text-[34px] font-bold ${
+              filled ? 'border-brand bg-brand-light text-ink'
+                : current ? 'border-brand' : 'border-line'
+            }`}>
+            {filled ? <span className="code-pop">{code[i]}</span> : <span className="text-line">_</span>}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+// 터치 숫자 키패드 — 키오스크용. 1~9, 0, 삭제(⌫).
+function Keypad({ onDigit, onDelete }: { onDigit: (d: string) => void; onDelete: () => void }) {
+  const KEY = 'rounded-xl border border-line bg-white py-3 text-[24px] font-bold active:scale-95 active:bg-gray-100'
+  return (
+    <div className="mt-3 grid grid-cols-3 gap-2">
+      {['1', '2', '3', '4', '5', '6', '7', '8', '9'].map((k) => (
+        <button key={k} onClick={() => onDigit(k)} className={`${KEY} text-ink`}>{k}</button>
+      ))}
+      <div />
+      <button onClick={() => onDigit('0')} className={`${KEY} text-ink`}>0</button>
+      <button onClick={onDelete} className={`${KEY} text-red-500`}>⌫</button>
+    </div>
+  )
+}
+
+function SetCodePage({ err, onBack, onSubmit }: {
+  err: string; onBack: () => void; onSubmit: (code: string) => void
+}) {
+  const [code, setCode] = useState('')
+  const ok = code.length === 4
+  return (
+    <div className="page-fade flex h-full flex-col">
+      <div className="flex-1 overflow-y-auto px-6 py-5">
+        <div className="mb-2 text-[22px] font-bold text-ink">수령 코드 설정</div>
+        <div className="text-[15px] text-muted">수령할 때 입력할 4자리 숫자를 정해주세요</div>
+        <div className="mt-7"><CodeDisplay code={code} /></div>
+        <Keypad onDigit={(d) => setCode((c) => (c + d).slice(0, 4))}
+          onDelete={() => setCode((c) => c.slice(0, -1))} />
+        {err && (
+          <div className="mt-3 rounded-xl bg-red-50 px-4 py-2.5 text-[14px] font-semibold text-red-600">{err}</div>
+        )}
+      </div>
+      <div className="flex gap-2 border-t border-line px-6 pb-6 pt-4">
+        <button onClick={onBack}
+          className="rounded-2xl border border-line px-6 py-4 text-[16px] font-bold text-sub active:scale-95">뒤로</button>
+        <div className="flex-1"><CTA onClick={() => ok && onSubmit(code)}>{ok ? '주문 완료' : '4자리를 입력하세요'}</CTA></div>
+      </div>
+    </div>
+  )
+}
+
 function DonePage(props: {
   order: OrderResp | null
   receipt: ReceiptItem[]
   board: BoardRow[]
+  notice: { order_id: string; status: string; locker_id: number; failed: string[]; all_ok: boolean } | null
   onHome: () => void
 }) {
-  const { order, receipt, board } = props
+  const { order, receipt, board, notice } = props
   const ahead = order
     ? board.findIndex((b) => b.order_id === order.order_id)
     : -1
   const total = receipt.reduce((a, b) => a + b.qty, 0)
 
+  // 15초 미동작 시 홈 복귀. 마지막 5초(10초 경과)부터 우측 상단 카운트다운 표시.
+  const [left, setLeft] = useState(15)
+  useEffect(() => {
+    let n = 15
+    setLeft(n)
+    const reset = () => { n = 15; setLeft(n) }
+    const iv = window.setInterval(() => {
+      n -= 1
+      setLeft(n)
+      if (n <= 0) { clearInterval(iv); props.onHome() }
+    }, 1000)
+    window.addEventListener('pointerdown', reset)
+    window.addEventListener('keydown', reset)
+    return () => {
+      clearInterval(iv)
+      window.removeEventListener('pointerdown', reset)
+      window.removeEventListener('keydown', reset)
+    }
+  }, [])
+
   return (
-    <div className="page-fade flex h-full flex-col px-6">
+    <div className="page-fade relative flex h-full flex-col px-6">
+      {left <= 5 && (
+        <div className="absolute right-4 top-4 flex h-9 w-9 items-center justify-center rounded-full bg-red-500 text-[15px] font-bold text-white">
+          {left}
+        </div>
+      )}
       <div className="flex flex-1 flex-col items-center overflow-y-auto pt-8">
         <span className="pop flex h-16 w-16 items-center justify-center rounded-full bg-brand text-white">
           <Check size={36} />
@@ -473,6 +706,39 @@ function DonePage(props: {
           </div>
         </div>
 
+        {/* 수령 락커 + QR */}
+        {order?.locker_id ? (
+          <div className="mt-6 w-full rounded-2xl border-2 border-brand bg-brand-light p-5 text-center">
+            <div className="text-[15px] font-semibold text-muted">수령 락커</div>
+            <div className="text-[40px] font-bold leading-tight text-brand">{order.locker_id}번</div>
+            {order.qr_token && (
+              <>
+                <img src={pickupQrUrl(order.qr_token)} alt="수령 QR" width={160} height={160}
+                  className="mx-auto mt-3 rounded-lg bg-white p-1"
+                  onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none' }} />
+                <div className="mt-2 text-[13px] text-muted">수령 코드</div>
+                <div className="font-mono text-[18px] font-bold tracking-widest text-ink">{order.qr_token}</div>
+              </>
+            )}
+            <div className="mt-2 text-[14px] text-sub">상품 준비가 끝나면 이 QR로 수령하세요</div>
+          </div>
+        ) : null}
+
+        {/* 배달 완료 알림 (order_done) — 준비완료 / 일부 실패 / 전체 실패 피드백 */}
+        {notice && (
+          <div className={`mt-4 w-full rounded-2xl p-4 text-center font-bold ${
+            notice.all_ok ? 'bg-green-100 text-green-800'
+              : notice.status === 'CANCELED' ? 'bg-red-100 text-red-800'
+              : 'bg-amber-100 text-amber-900'
+          }`}>
+            {notice.all_ok
+              ? `✅ 준비 완료! ${notice.locker_id}번 락커에서 수령하세요`
+              : notice.status === 'CANCELED'
+                ? '😢 주문을 처리하지 못했어요 (전 품목 실패) — 다시 주문해 주세요'
+                : `⚠️ 일부 품목 실패: ${notice.failed.map(nameOf).join(', ')} — 나머지는 ${notice.locker_id}번 락커에서 수령하세요`}
+          </div>
+        )}
+
         {ahead > 0 && (
           <div className="mt-4 flex items-center gap-1.5 rounded-full bg-brand-light px-4 py-1.5 text-[14px] font-bold text-brand">
             <Clock size={14} /> 앞에 {ahead}건 대기 중
@@ -482,6 +748,182 @@ function DonePage(props: {
 
       <div className="pb-6 pt-4">
         <CTA onClick={props.onHome}>홈으로</CTA>
+      </div>
+    </div>
+  )
+}
+
+function PickupPage({ onBack }: { onBack: () => void }) {
+  const videoRef = useRef<HTMLVideoElement | null>(null)
+  const [info, setInfo] = useState<LockerInfo | null>(null)
+  const [token, setToken] = useState('')   // 스캔/입력에 쓴 토큰 — 수령확인에 사용
+  const [code, setCode] = useState('')
+  const [msg, setMsg] = useState('')
+  const [busy, setBusy] = useState(false)
+  const handledRef = useRef(false)   // 중복 스캔 방지
+
+  const lookup = async (raw: string) => {
+    const t = raw.trim()
+    if (!t || busy) return
+    setBusy(true); setMsg('')
+    try {
+      const i = await scanPickup(t)
+      setToken(t); setInfo(i)
+    } catch (e) {
+      setMsg(e instanceof Error ? e.message : '조회 실패')
+      handledRef.current = false   // 실패 시 재스캔 허용
+    } finally { setBusy(false) }
+  }
+
+  // 카메라 + 네이티브 BarcodeDetector(있으면). 없으면 코드 입력만.
+  useEffect(() => {
+    if (info) return   // 결과 화면에선 스캔 중지
+    const BD = (window as unknown as { BarcodeDetector?: new (o: object) => {
+      detect: (s: CanvasImageSource) => Promise<{ rawValue: string }[]> } }).BarcodeDetector
+    // getUserMedia 자체가 없으면(=http로 IP 원격 접속 등 non-secure context) 카메라 불가.
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setMsg('이 접속에선 카메라를 쓸 수 없어요 (http 원격 접속은 보안상 차단) — 코드를 직접 입력하세요')
+      return
+    }
+    let stream: MediaStream | null = null
+    let raf = 0
+    // BarcodeDetector 없는 브라우저(Firefox/Safari)에서도 카메라는 띄운다(스캔만 비활성, 코드 입력 보조).
+    const det = BD ? new BD({ formats: ['qr_code'] }) : null
+    const run = async () => {
+      try {
+        // 권한 확보 후 디바이스 열거 → 원하는 카메라(deviceId)로 연결.
+        // RealSense(depth) 카메라는 QR 인식에 부적합 → 제외하고 노트북 내장/일반 웹캠 우선.
+        let constraint: MediaStreamConstraints = { video: { facingMode: 'environment' } }
+        try {
+          const probe = await navigator.mediaDevices.getUserMedia({ video: true })
+          probe.getTracks().forEach((t) => t.stop())
+          const cams = (await navigator.mediaDevices.enumerateDevices())
+            .filter((d) => d.kind === 'videoinput')
+          const isDepth = (c: MediaDeviceInfo) => /realsense|depth|intel|stereo|infrared/i.test(c.label)
+          const webcams = cams.filter((c) => !isDepth(c))   // realsense 등 제외
+          const pick = webcams[0] || cams[0]
+          if (pick?.deviceId) constraint = { video: { deviceId: { exact: pick.deviceId } } }
+        } catch { /* 열거 실패 시 기본 video */ }
+        stream = await navigator.mediaDevices.getUserMedia(constraint)
+        const v = videoRef.current
+        if (!v) return
+        v.srcObject = stream; await v.play()
+        if (!det) {
+          // 스캔 API 없음 — 카메라 미리보기만, QR은 코드 직접 입력.
+          setMsg('이 브라우저는 QR 자동인식 미지원 — 카메라 아래 코드를 직접 입력하세요')
+        } else {
+          const tick = async () => {
+            if (handledRef.current || !videoRef.current) return
+            try {
+              const codes = await det.detect(videoRef.current)
+              if (codes[0]?.rawValue && !handledRef.current) {
+                handledRef.current = true
+                lookup(codes[0].rawValue)
+                return
+              }
+            } catch { /* 프레임 스킵 */ }
+            raf = requestAnimationFrame(tick)
+          }
+          raf = requestAnimationFrame(tick)
+        }
+      } catch { setMsg('카메라를 열 수 없어요 — 코드를 직접 입력하세요') }
+    }
+    run()
+    return () => {
+      cancelAnimationFrame(raf)
+      stream?.getTracks().forEach((t) => t.stop())
+    }
+  }, [info])
+
+  return (
+    <div className="page-fade flex h-full flex-col">
+      <div className="flex-1 overflow-y-auto px-6 py-5">
+        {/* 상단: 이전 / 제목 (주문 페이지와 동일) */}
+        <div className="mb-4 flex items-center gap-3">
+          <button onClick={onBack}
+            className="flex items-center gap-1 rounded-lg px-2 py-1.5 text-[14px] font-semibold text-muted active:scale-95">
+            <ChevronLeft size={18} /> 이전
+          </button>
+          <div className="text-[22px] font-bold text-ink">QR 수령</div>
+        </div>
+        <div className="flex flex-col items-center">
+          {!info ? (
+            <>
+              <div className="text-[15px] text-muted">QR을 카메라에 비추거나 코드를 입력하세요</div>
+              <div className="relative mt-3 aspect-[4/3] w-full max-w-[220px] overflow-hidden rounded-2xl border-2 border-line bg-black">
+                <video ref={videoRef} className="h-full w-full object-cover" muted playsInline />
+                <div className="pointer-events-none absolute inset-6 rounded-xl border-2 border-white/70" />
+                <div className="absolute left-1/2 top-2 -translate-x-1/2 text-[13px] text-white/60">📷 QR 스캔</div>
+              </div>
+              <div className="mt-3 w-full max-w-xs">
+                <div className="mb-2 text-center text-[13px] font-semibold text-muted">수령 코드 4자리 입력</div>
+                <CodeDisplay code={code} />
+                <Keypad onDigit={(d) => setCode((c) => (c + d).slice(0, 4))}
+                  onDelete={() => setCode((c) => c.slice(0, -1))} />
+                <button onClick={() => lookup(code)} disabled={busy || code.length !== 4}
+                  className="mt-2 w-full rounded-xl bg-brand py-3 font-bold text-white active:scale-95 disabled:opacity-50">조회</button>
+              </div>
+              {msg && <div className="mt-3 text-[14px] font-semibold text-red-500">{msg}</div>}
+            </>
+          ) : (
+            <PickupResult info={info} token={token} onDone={onBack}
+              onRescan={() => { handledRef.current = false; setInfo(null); setToken(''); setCode(''); setMsg('') }} />
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function PickupResult({ info, token, onDone, onRescan }: {
+  info: LockerInfo; token: string; onDone: () => void; onRescan: () => void
+}) {
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState('')
+  const [done, setDone] = useState(false)
+
+  const confirm = async () => {
+    setBusy(true); setErr('')
+    try {
+      await confirmPickup(token)   // 스캔/입력에 쓴 토큰으로 수령 확정
+      setDone(true)
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : '수령 처리 실패')
+    } finally { setBusy(false) }
+  }
+
+  if (done) return (
+    <div className="flex flex-col items-center pt-10">
+      <span className="pop flex h-16 w-16 items-center justify-center rounded-full bg-brand text-white"><Check size={36} /></span>
+      <div className="mt-4 text-[24px] font-bold text-ink">수령 완료!</div>
+      <div className="mt-1 text-[15px] text-muted">이용해 주셔서 감사합니다</div>
+      <button onClick={onDone} className="mt-8 rounded-xl bg-brand px-8 py-3 font-bold text-white">홈으로</button>
+    </div>
+  )
+
+  return (
+    <div className="flex w-full flex-col items-center pt-4">
+      <div className={`flex h-16 w-16 items-center justify-center rounded-full text-[30px] ${info.ready ? 'bg-brand' : 'bg-amber-400'}`}>
+        📦
+      </div>
+      <div className="mt-4 text-[15px] font-semibold text-muted">수령 락커</div>
+      <div className="text-[48px] font-bold leading-none text-brand">{info.locker_id}번</div>
+      <div className={`mt-3 rounded-full px-4 py-1.5 text-[14px] font-bold ${
+        info.ready ? 'bg-green-100 text-green-800' : 'bg-amber-100 text-amber-900'
+      }`}>
+        {info.ready ? '수령 가능 — 락커에서 꺼내세요' : '아직 준비 중이에요'}
+      </div>
+      {err && <div className="mt-3 text-[14px] font-semibold text-red-500">{err}</div>}
+      <div className="mt-8 w-full max-w-xs space-y-2">
+        {info.ready && (
+          <button onClick={confirm} disabled={busy}
+            className="w-full rounded-xl bg-brand py-3.5 text-[17px] font-bold text-white active:scale-95 disabled:opacity-50">
+            수령 완료
+          </button>
+        )}
+        <button onClick={onRescan} className="w-full rounded-xl border-2 border-line py-3 text-[15px] font-semibold text-muted">
+          다시 스캔
+        </button>
       </div>
     </div>
   )

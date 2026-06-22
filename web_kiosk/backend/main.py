@@ -14,10 +14,11 @@ from std_srvs.srv import Trigger
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response, HTMLResponse
 from pydantic import BaseModel
 
 from dsr_realsense_pick_place.task_repository import (
-    JsonRepository, CatalogItem, ItemStatus, OrderStatus,
+    HybridRepository, CatalogItem, ItemStatus, OrderStatus,
 )
 
 # 상품 표시명 (class → 한글). 프론트도 자체 매핑 가능하지만 카탈로그 seed에 필요.
@@ -41,7 +42,7 @@ class KioskBackend(Node):
     def __init__(self, on_event=None):
         super().__init__('kiosk_backend')
         self._on_event = on_event   # 상태 변화 → WebSocket 브로드캐스트 콜백
-        self.repo = JsonRepository()
+        self.repo = HybridRepository()   # 영속(재고/통계/이력)=SQLite, 휘발(주문/큐/락커)=JSON
         self.repo.seed_catalog([
             CatalogItem(c, PRODUCT_DISPLAY.get(c, c)) for c in KNOWN_CLASSES
         ])
@@ -59,6 +60,8 @@ class KioskBackend(Node):
         self.create_subscription(String, '/detected_objects', self._cb_objects, 10)
         self.create_subscription(String, '/pick_place_state', self._cb_state, 10)
         self.create_subscription(String, '/pick_place_error', self._cb_error, 10)
+        # 사이클 결과(success/dropped/failed) — 상태추론 대신 이걸로 DONE/FAILED 판정.
+        self.create_subscription(String, '/pick_place/cycle_result', self._cb_cycle_result, 10)
 
         self.pick_place_state = ''
         self.detected_classes: set[str] = set()
@@ -66,6 +69,7 @@ class KioskBackend(Node):
         self.paused = False
         self._injected_item_id = None
         self._item_grasped = False
+        self._last_cycle_result = None   # pick_place가 발행한 마지막 사이클 결과
         self._inject_inflight = False
         self._inject_cooldown_until = 0.0
         self._inflight_item_id = None      # 응답 대기 중 item (워치독 복구용)
@@ -94,6 +98,29 @@ class KioskBackend(Node):
     def _cb_error(self, msg: String):
         self.last_error_text = msg.data
         self._emit('error', {'msg': msg.data})
+
+    def _cb_cycle_result(self, msg: String):
+        # pick_place가 사이클 끝에 발행. 'success'만 배달완료, 'dropped'/'failed'는 실패.
+        self._last_cycle_result = msg.data
+
+    def _maybe_emit_order_done(self, iid):
+        # 이 item으로 주문이 종료(DONE/CANCELED)됐으면 ready/실패 알림 발행(QR 락커 + #3 실패피드백).
+        it = self.repo.get_item(iid)
+        if it is None:
+            return
+        order = self.repo.get_order(it.order_id)
+        if order is None or order.status not in (OrderStatus.DONE, OrderStatus.CANCELED):
+            return
+        items = [self.repo.get_item(i) for i in order.item_ids]
+        failed = [x.class_name for x in items if x and x.status == ItemStatus.FAILED]
+        self._emit('order_done', {
+            'order_id': order.order_id,
+            'ticket_no': order.ticket_no,
+            'status': order.status,
+            'locker_id': order.locker_id,
+            'failed': failed,
+            'all_ok': (not failed and order.status == OrderStatus.DONE),
+        })
 
     def _emit(self, kind: str, data: dict):
         if self._on_event:
@@ -127,19 +154,31 @@ class KioskBackend(Node):
             if state in GRASPED_STATES:
                 self._item_grasped = True
             elif state == 'IDLE':
-                done = self._item_grasped
+                # 완료 판정: pick_place 사이클 결과가 우선('success'만 배달완료).
+                # 결과 토픽 유실 시에만 기존 grasp-도달 추론으로 폴백(무회귀).
+                res = self._last_cycle_result
+                done = (res == 'success') if res is not None else self._item_grasped
                 iid = self._injected_item_id
                 self._injected_item_id = None
                 self._item_grasped = False
+                self._last_cycle_result = None
                 self.repo.set_item_status(
                     iid, ItemStatus.DONE if done else ItemStatus.FAILED)
+                # 픽 통계 기록(admin 품목별 성공/실패).
+                _it = self.repo.get_item(iid)
+                if _it is not None:
+                    self.repo.record_pick_result(
+                        _it.class_name, done,
+                        '' if done else (self.last_error_text or '미상'))
                 if done:
                     self.get_logger().info(f'item {iid} 완료(DONE)')
                 else:
-                    # DONE으로 두지 않고 실패 사유를 남긴다(어느 작업/시퀀스/이유).
+                    # DONE으로 두지 않고 실패 사유를 남긴다(결과/에러 텍스트).
                     self.get_logger().error(
-                        f'item {iid} FAILED — 사유: {self.last_error_text or "미상(파지/이송 미완)"}')
+                        f'item {iid} FAILED (result={res!r}) — '
+                        f'사유: {self.last_error_text or "미상(파지/이송 미완)"}')
                 self._emit_queue_if_changed()
+                self._maybe_emit_order_done(iid)   # 주문 종료 시 ready/실패 알림(QR 락커)
             return
         if state != 'IDLE':
             return
@@ -170,6 +209,7 @@ class KioskBackend(Node):
         self._inject_inflight = True
         self._inflight_item_id = item.item_id
         self._inject_sent_t = time.monotonic()
+        self._last_cycle_result = None   # 직전 사이클 결과 잔존 방지(이번 item 결과만 본다)
         self.repo.set_item_status(item.item_id, ItemStatus.RUNNING)
         label = String(); label.data = item.class_name
         self.pub_selected.publish(label)
@@ -204,11 +244,22 @@ class KioskBackend(Node):
             self.cli_cancel.call_async(Trigger.Request())
 
     # ── 주문 명령 (REST에서 호출) ──
-    def submit_order(self, lines):
+    def submit_order(self, lines, code=None):
         self.repo.reload()
         order = self.repo.create_order(lines)
+        # 빈 락커 배정 + 수령 코드(유저 지정 또는 자동). 실패 시 주문 롤백 후 거절.
+        try:
+            assigned = self.repo.assign_locker(order.order_id, code)
+        except ValueError as e:           # 코드 형식 오류/중복
+            self.repo.cancel_order(order.order_id)
+            self._emit_queue_if_changed()
+            raise RuntimeError(str(e))
+        if assigned is None:              # 만석
+            self.repo.cancel_order(order.order_id)
+            self._emit_queue_if_changed()
+            raise RuntimeError('모든 락커가 사용 중입니다. 잠시 후 다시 시도하세요.')
         self._emit_queue_if_changed()
-        return order
+        return self.repo.get_order(order.order_id)   # 락커 배정 반영본
 
     def cancel_order(self, order_id):
         self.repo.reload()
@@ -275,8 +326,109 @@ app.add_middleware(CORSMiddleware, allow_origins=['*'],
                    allow_methods=['*'], allow_headers=['*'])
 
 
+# 관리자 패널 HTML — 백엔드 직접 서빙(SPA 아님). 재고/큐/주문/락커/픽통계/이력.
+_PANEL_CSS = """<style>
+  *{box-sizing:border-box}
+  body{font-family:-apple-system,'Pretendard',sans-serif;margin:0;background:#f0f2f5;color:#222}
+  header{background:#1a1a2e;color:#fff;padding:16px 24px;display:flex;align-items:center;gap:16px}
+  header h1{margin:0;font-size:20px;flex:1} header span{font-size:12px;color:#aaa}
+  header a{color:#9fd0ff;font-size:13px;text-decoration:none;font-weight:600}
+  main{max-width:1100px;margin:24px auto;padding:0 16px}
+  section{background:#fff;border-radius:10px;padding:18px 22px;margin-bottom:22px;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+  h2{margin:0 0 14px;font-size:15px;color:#444;border-bottom:2px solid #e0e7ff;padding-bottom:8px}
+  table{border-collapse:collapse;width:100%;font-size:13px}
+  th,td{padding:7px 11px;border-bottom:1px solid #eee;text-align:left;white-space:nowrap}
+  th{background:#f7f8fc;font-weight:600;color:#555} tr:last-child td{border-bottom:none}
+  tr:hover td{background:#fafbff}
+  .lk-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+  .lk{border-radius:8px;padding:12px 10px;text-align:center;font-size:13px;border:1px solid #ddd}
+  .lk.free{background:#f5f5f5;color:#999} .lk.occupied{background:#fff3e0;border-color:#ffcc80}
+  .lk.ready{background:#e8f5e9;border-color:#a5d6a7}
+  .lk b{display:block;margin-bottom:4px;font-size:14px} .lk small{display:block;color:#666;line-height:1.5}
+  .code{font-family:monospace;font-weight:700;color:#d97706}
+  .btn{padding:3px 10px;border:none;border-radius:5px;cursor:pointer;font-size:12px}
+  .btn-save{background:#43a047;color:#fff}
+  input[type=number]{width:64px;padding:3px 6px;border:1px solid #ccc;border-radius:4px;font-size:13px}
+  .chip{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:700}
+  .c-QUEUED{background:#e3f2fd;color:#1565c0} .c-RUNNING{background:#fff3e0;color:#e65100}
+  .c-DONE{background:#e8f5e9;color:#2e7d32} .c-FAILED{background:#fce4ec;color:#c62828}
+  .c-CANCELED{background:#f5f5f5;color:#757575} .c-PICKED{background:#ede7f6;color:#5e35b1}
+  .empty{text-align:center;color:#aaa;padding:18px!important}
+</style>"""
+
+# 운영 패널(/admin) — 락커/대기큐/주문현황 (휘발 JSON, 실시간)
+# 관리자 패널(/admin) — 재고/락커/주문/큐/통계/이력 통합. 영속은 SQLite, 휘발은 JSON(repo가 분기).
+_ADMIN_HTML = """<!doctype html>
+<html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>관리자 패널</title>""" + _PANEL_CSS + """</head><body>
+<header><h1>관리자 패널</h1><span id="ts"></span></header>
+<main>
+  <section><h2>재고 관리 (box 제외)</h2>
+    <table><thead><tr><th>품목</th><th>표시명</th><th>재고</th><th>감지</th><th>설정</th></tr></thead>
+    <tbody id="stock"></tbody></table></section>
+  <section><h2>락커 현황</h2><div id="lockers" class="lk-grid"></div></section>
+  <section><h2>대기 큐</h2>
+    <table><thead><tr><th>품목</th><th>주문</th><th>상태</th></tr></thead><tbody id="queue"></tbody></table></section>
+  <section><h2>주문 현황</h2>
+    <table><thead><tr><th>번호표</th><th>상태</th><th>수령코드</th><th>락커</th><th>품목수</th><th>시각</th></tr></thead>
+    <tbody id="orders"></tbody></table></section>
+  <section><h2>픽 통계 (누적)</h2>
+    <table><thead><tr><th>품목</th><th>성공</th><th>실패</th><th>최근 실패</th></tr></thead><tbody id="stats"></tbody></table></section>
+  <section><h2>처리 이력 (최신)</h2>
+    <table><thead><tr><th>번호표</th><th>품목</th><th>상태</th><th>시각</th></tr></thead><tbody id="hist"></tbody></table></section>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const chip=s=>`<span class="chip c-${s}">${s}</span>`;
+const LK={free:'비어있음',occupied:'배달중',ready:'수령대기'};
+async function j(u){try{const r=await fetch(u);return r.ok?await r.json():null}catch{return null}}
+function emptyRow(tb,cols,msg){tb.innerHTML=`<tr><td class="empty" colspan="${cols}">${msg}</td></tr>`}
+async function setStock(cn){
+  const v=parseInt($('s-'+cn).value);if(isNaN(v))return;
+  await fetch('/api/admin/stock/'+cn,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({stock:v})});
+  load();
+}
+async function load(){
+  $('ts').textContent=new Date().toLocaleTimeString('ko-KR');
+  const [cat,lk,q,od,st,hi]=await Promise.all([
+    j('/api/catalog'),j('/api/lockers'),j('/api/queue'),j('/api/orders'),j('/api/stats'),j('/api/history')]);
+  const cb=$('stock');
+  if(cat&&cat.length)cb.innerHTML=cat.map(c=>`<tr><td>${c.class_name}</td><td>${c.display_name}</td>
+    <td>${c.stock}</td><td>${c.available?'✅':'—'}</td>
+    <td><input type=number id="s-${c.class_name}" value="${c.stock}" min=0>
+    <button class="btn btn-save" onclick="setStock('${c.class_name}')">저장</button></td></tr>`).join('');
+  else emptyRow(cb,5,'품목 없음');
+  const lb=$('lockers'); const lks=(lk&&lk.lockers)||[];
+  lb.innerHTML=Array.from({length:8},(_,i)=>{
+    const l=lks.find(x=>x.id===i+1)||{id:i+1,status:'free',ticket_no:'',qr_token:''};
+    const code=(l.status!=='free'&&l.qr_token)?`<small class="code">🔑 ${l.qr_token}</small>`:'';
+    return `<div class="lk ${l.status}"><b>${l.id}번</b><small>${LK[l.status]||l.status}</small>
+      <small>${l.ticket_no||'—'}</small>${code}</div>`}).join('');
+  const qb=$('queue');
+  if(q&&q.length)qb.innerHTML=q.map(i=>`<tr><td>${i.class_name}</td><td>${i.order_id}</td><td>${chip(i.status)}</td></tr>`).join('');
+  else emptyRow(qb,3,'대기 없음');
+  const ob=$('orders');
+  if(od&&od.length)ob.innerHTML=od.map(o=>`<tr><td>${o.ticket_no}</td><td>${chip(o.status)}</td>
+    <td class="code">${o.qr_token||'—'}</td><td>${o.locker_id?o.locker_id+'번':'—'}</td>
+    <td>${o.item_count}</td><td>${(o.created_at||'').replace('T',' ').slice(0,19)}</td></tr>`).join('');
+  else emptyRow(ob,6,'주문 없음');
+  const sb=$('stats');
+  if(st&&st.length)sb.innerHTML=st.map(s=>`<tr><td>${s.class_name}</td><td>${s.success||0}</td>
+    <td>${s.fail||0}</td><td>${s.last_fail_reason||'—'}</td></tr>`).join('');
+  else emptyRow(sb,4,'기록 없음');
+  const hb=$('hist');
+  if(hi&&hi.length)hb.innerHTML=hi.slice(0,80).map(h=>`<tr><td>${h.ticket_no||'—'}</td><td>${h.class_name}</td>
+    <td>${chip(h.status)}</td><td>${(h.at||'').replace('T',' ').slice(0,19)}</td></tr>`).join('');
+  else emptyRow(hb,4,'이력 없음');
+}
+load(); setInterval(load,2000);
+</script></body></html>"""
+
+
 class OrderBody(BaseModel):
     lines: list[tuple[str, int]]   # [(class_name, qty)]
+    code: str | None = None        # 유저 지정 4자리 수령 코드(없으면 자동 생성)
 
 
 def _node():
@@ -300,8 +452,12 @@ def create_order(body: OrderBody):
     n = _node()
     if not body.lines:
         raise HTTPException(400, '빈 주문')
-    order = n.submit_order(body.lines)
-    return {'order_id': order.order_id, 'ticket_no': order.ticket_no}
+    try:
+        order = n.submit_order(body.lines, body.code)
+    except RuntimeError as e:        # 락커 만석 / 코드 오류·중복
+        raise HTTPException(409, str(e))
+    return {'order_id': order.order_id, 'ticket_no': order.ticket_no,
+            'locker_id': order.locker_id, 'qr_token': order.qr_token}
 
 
 @app.get('/api/orders/{order_id}')
@@ -328,6 +484,63 @@ def cancel_order(order_id: str):
     return {'ok': True}
 
 
+# ── 수령(QR/락커) ───────────────────────────────────────────────
+class TokenBody(BaseModel):
+    token: str
+
+
+class StockBody(BaseModel):
+    stock: int   # 재고 수량(0 이상)
+
+
+@app.get('/api/pickup/qr')
+def pickup_qr(token: str):
+    """수령 QR PNG. qrcode 미설치 시 503 → 프론트는 코드 텍스트 입력으로 폴백."""
+    if not token:
+        raise HTTPException(400, '토큰 없음')
+    try:
+        import io
+        import qrcode
+        buf = io.BytesIO()
+        qrcode.make(token).save(buf, format='PNG')
+        return Response(content=buf.getvalue(), media_type='image/png')
+    except ImportError:
+        raise HTTPException(503, 'qrcode 미설치 — 코드 입력 사용')
+
+
+@app.post('/api/pickup/scan')
+def pickup_scan(body: TokenBody):
+    """QR/코드 조회 → 락커 안내 정보."""
+    n = _node()
+    n.repo.reload()
+    info = n.repo.locker_info_by_token(body.token)
+    if info is None:
+        raise HTTPException(404, '유효하지 않은 QR/코드')
+    return info
+
+
+@app.post('/api/pickup/confirm')
+def pickup_confirm(body: TokenBody):
+    """유저 수령 완료 → 락커 해제."""
+    n = _node()
+    n.repo.reload()
+    res = n.repo.confirm_pickup(body.token)
+    if res is None:
+        raise HTTPException(404, '유효하지 않은 QR/코드')
+    if not res.get('ok'):
+        raise HTTPException(409, f"아직 수령할 수 없습니다 (상태={res.get('status')})")
+    n._emit_queue_if_changed()
+    return res
+
+
+@app.get('/api/lockers')
+def get_lockers():
+    """락커 현황(유저·관리자 공용)."""
+    n = _node()
+    n.repo.reload()   # 타 프로세스(관리자 해제/리셋/수령) 변경 반영
+    return {'lockers': n.repo.list_lockers()}
+
+
 @app.get('/api/queue')
 def get_queue():
     return _node()._queue_dump()
@@ -339,6 +552,45 @@ def get_state():
     return {'state': n.pick_place_state,
             'available': sorted(n.detected_classes),
             'error': n.last_error_text}
+
+
+# ── 관리자 패널(/admin) — 재고/큐/주문/락커/픽통계/이력 ──
+@app.get('/api/orders')
+def list_all_orders(status: str | None = None):
+    n = _node()
+    statuses = {status} if status else None
+    orders = n.repo.list_orders(statuses)
+    orders.sort(key=lambda o: o.order_id, reverse=True)   # 최신순
+    return [{'order_id': o.order_id, 'ticket_no': o.ticket_no, 'status': o.status,
+             'qr_token': o.qr_token, 'locker_id': o.locker_id,
+             'created_at': o.created_at, 'item_count': len(o.item_ids)}
+            for o in orders]
+
+
+@app.get('/api/history')
+def get_history():
+    return list(reversed(_node().repo.list_history()))   # 최신순
+
+
+@app.get('/api/stats')
+def get_stats():
+    return _node().repo.get_pick_stats()
+
+
+@app.put('/api/admin/stock/{class_name}')
+def set_stock(class_name: str, body: StockBody):
+    n = _node()
+    if n.repo.get_catalog_item(class_name) is None:
+        raise HTTPException(404, f"품목 '{class_name}' 없음")
+    if body.stock < 0:
+        raise HTTPException(400, '재고는 0 이상이어야 합니다')
+    n.repo.set_stock(class_name, body.stock)
+    return {'ok': True}
+
+
+@app.get('/admin', response_class=HTMLResponse)
+def admin_page():
+    return _ADMIN_HTML
 
 
 @app.websocket('/ws')

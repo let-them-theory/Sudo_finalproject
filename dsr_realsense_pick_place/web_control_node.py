@@ -50,6 +50,7 @@ HTTP 엔드포인트
 import json
 import os
 import re
+import socket as _socket
 import sqlite3
 import subprocess
 import threading
@@ -67,7 +68,7 @@ from sensor_msgs.msg import Image, JointState, Range
 from std_msgs.msg import Int32, String
 from std_srvs.srv import SetBool, Trigger
 from dsr_gripper_tcp_interfaces.msg import GripperState
-from dsr_realsense_pick_place.task_repository import JsonRepository, OrderStatus, ItemStatus
+from dsr_realsense_pick_place.task_repository import HybridRepository, OrderStatus, ItemStatus
 
 try:
     from cv_bridge import CvBridge
@@ -123,8 +124,8 @@ DEFAULT_SETTINGS = {
     'min_safe_z': 0.0,
     'grip_current_default': 200,
     'grip_class_names': ["ramen", "pack", "ssnack", "bsnack", "water",
-                         "jelly", "box", "can", "boxsnack", "wafers"],
-    'grip_class_currents': [150, 150, 150, 120, 180, 140, 180, 200, 170, 150],
+                         "jelly", "can", "boxsnack", "wafers"],
+    'grip_class_currents': [150, 150, 150, 120, 180, 140, 200, 170, 150],
 }
 
 
@@ -199,6 +200,7 @@ class WebControlNode(Node):
 
         # ── 상태 캐시(ROS 스레드 전용) ──────────────────────────────────────
         self.pick_place_state = 'IDLE'
+        self._pending_calib = None  # {'x', 'y', 'z'} — DETECTING 진입 시 적용 대기
         self.last_error_text = ''
         self.hw_state = -1
         self.speed_mode = 0
@@ -218,6 +220,7 @@ class WebControlNode(Node):
         self.last_hw_state_time = 0.0
         self.last_speed_mode_time = 0.0
         self.last_ultrasonic_time = 0.0
+        self.current_model_path = ''  # set_model 성공 시 갱신
 
         # HTTP 스레드가 읽는 최신 JPEG 프레임(불변 bytes, GIL 하에서 참조 교체는 원자적).
         self.latest_jpeg = None
@@ -278,7 +281,7 @@ class WebControlNode(Node):
         # ── 유저 주문 큐 저장소(같은 패키지의 task_repository) ─────────────────
         # 관리자 웹이 유저 주문 큐를 읽기 위해 동일한 JSON DB를 공유한다(읽기 전용 위주).
         try:
-            self._order_repo = JsonRepository()
+            self._order_repo = HybridRepository()   # 영속=SQLite(store.db 공유), 휘발=JSON
         except Exception:
             self._order_repo = None
 
@@ -350,6 +353,13 @@ class WebControlNode(Node):
                 pose_z     REAL,
                 reachable  INTEGER,
                 ts         REAL
+            );
+            CREATE TABLE IF NOT EXISTS error_log (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts        REAL NOT NULL,
+                level     TEXT NOT NULL DEFAULT 'WAR',
+                text      TEXT NOT NULL,
+                ticket_no TEXT NOT NULL DEFAULT ''
             );
             """
         )
@@ -557,11 +567,44 @@ class WebControlNode(Node):
         self.gripper_init_progress_t = time.monotonic()
 
     def _cb_state(self, msg: String):
+        prev = self.pick_place_state
         self.pick_place_state = msg.data
         self.last_state_time = time.monotonic()
+        if self.pick_place_state == 'DETECTING' and prev != 'DETECTING' and self._pending_calib:
+            p = self._pending_calib
+            self._pending_calib = None
+            if self.cli_object_set_parameters.service_is_ready():
+                req = SetParameters.Request()
+                req.parameters = [
+                    self._make_param('absolute_calib_x_mm', ParameterType.PARAMETER_DOUBLE, p['x']),
+                    self._make_param('absolute_calib_y_mm', ParameterType.PARAMETER_DOUBLE, p['y']),
+                    self._make_param('absolute_calib_z_mm', ParameterType.PARAMETER_DOUBLE, p['z']),
+                ]
+                self.cli_object_set_parameters.call_async(req)
+                self.get_logger().info(
+                    f'pending calib 적용: x={p["x"]} y={p["y"]} z={p["z"]}mm')
 
     def _cb_error(self, msg: String):
         self.last_error_text = msg.data
+        text = msg.data
+        level = 'ERR' if text.startswith('[ERR]') else 'WAR'
+        ticket = ''
+        try:
+            repo = self._order_repo
+            if repo is not None:
+                repo.reload()
+                for o in repo.list_orders({OrderStatus.RUNNING}):
+                    ticket = o.ticket_no or ''
+                    break
+        except Exception:
+            pass
+        try:
+            self.db.execute(
+                'INSERT INTO error_log(ts, level, text, ticket_no) VALUES (?, ?, ?, ?)',
+                (time.time(), level, text, ticket))
+            self.db.commit()
+        except Exception:
+            pass
 
     def _cb_ultrasonic(self, msg: Range):
         if msg.range is not None and msg.range > 0.0:
@@ -631,6 +674,13 @@ class WebControlNode(Node):
         grip_state = (
             'ok' if self.gripper_hw_ready
             else ('warn' if fresh(self.gripper_init_progress_t, 30.0) else 'bad'))
+        try:
+            _s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+            _s.settimeout(0.1)
+            _kiosk_up = _s.connect_ex(('127.0.0.1', 8000)) == 0
+            _s.close()
+        except Exception:
+            _kiosk_up = False
         system_status = {
             'HW':   'ok' if fresh(self.last_hw_state_time) else 'warn',
             'GRIP': grip_state,
@@ -639,6 +689,7 @@ class WebControlNode(Node):
             'PICK': 'ok' if (self.cli_run_once.service_is_ready() and fresh(self.last_state_time)) else 'bad',
             'ARD':  'ok' if fresh(self.last_ultrasonic_time) else 'bad',
             'SPD':  'ok' if fresh(self.last_speed_mode_time) else 'warn',
+            'USER': 'ok' if _kiosk_up else 'bad',
         }
 
         self._put_state('pick_place_state', self.pick_place_state)
@@ -653,6 +704,7 @@ class WebControlNode(Node):
                         None if self.ultrasonic_range_m is None else round(self.ultrasonic_range_m * 1000.0, 1))
         self._put_state('system_status', system_status)
         self._put_state('system_reset_phase', self._system_reset_phase)
+        self._put_state('current_model_path', self.current_model_path)
 
         # 검출 물체 테이블 교체(매 갱신마다 비우고 다시 채움).
         self.db.execute('DELETE FROM detected_objects')
@@ -788,17 +840,17 @@ class WebControlNode(Node):
             return
 
         if action == 'set_calibration':
-            # 기존 GUI와 동일하게 IDLE 상태에서만 허용.
-            if self.pick_place_state != 'IDLE':
-                self._mark_command(cmd_id, 'failed', '캘리브레이션 적용은 IDLE 상태에서만 가능')
-                return
             x = float(payload.get('x', 0.0)); y = float(payload.get('y', 0.0)); z = float(payload.get('z', 0.0))
-            self._set_params(cmd_id, self.cli_object_set_parameters, [
-                ('absolute_calib_x_mm', ParameterType.PARAMETER_DOUBLE, x),
-                ('absolute_calib_y_mm', ParameterType.PARAMETER_DOUBLE, y),
-                ('absolute_calib_z_mm', ParameterType.PARAMETER_DOUBLE, z),
-            ])
             self._set_setting('calib_x_mm', x); self._set_setting('calib_y_mm', y); self._set_setting('calib_z_mm', z)
+            if self.pick_place_state == 'IDLE':
+                self._set_params(cmd_id, self.cli_object_set_parameters, [
+                    ('absolute_calib_x_mm', ParameterType.PARAMETER_DOUBLE, x),
+                    ('absolute_calib_y_mm', ParameterType.PARAMETER_DOUBLE, y),
+                    ('absolute_calib_z_mm', ParameterType.PARAMETER_DOUBLE, z),
+                ])
+            else:
+                self._pending_calib = {'x': x, 'y': y, 'z': z, 'cmd_id': cmd_id}
+                self._mark_command(cmd_id, 'done', f'다음 DETECTING 시 적용 예약 (현재 {self.pick_place_state})')
             return
 
         if action == 'set_model':
@@ -809,6 +861,7 @@ class WebControlNode(Node):
             self._set_params(cmd_id, self.cli_object_set_parameters,
                              [('yolo_model', ParameterType.PARAMETER_STRING, path)])
             self._set_setting('yolo_model_path', path)
+            self.current_model_path = path
             return
 
         if action == 'set_camera_auto_exposure':
@@ -1111,7 +1164,18 @@ class WebControlNode(Node):
                     self._send_json(self._read_commands())
                     return
                 if path == '/api/orders':
-                    self._send_json(self._read_orders())
+                    qs = self.path.split('?', 1)[1] if '?' in self.path else ''
+                    show_all = 'all=1' in qs
+                    self._send_json(self._read_orders(show_all=show_all))
+                    return
+                if path == '/api/lockers':
+                    self._send_json(self._read_lockers())
+                    return
+                if path == '/api/log':
+                    self._send_json(self._read_log())
+                    return
+                if path == '/api/models':
+                    self._send_json(self._scan_models())
                     return
                 if path.startswith('/api/command/'):
                     try:
@@ -1126,7 +1190,9 @@ class WebControlNode(Node):
             # ---- POST ----
             def do_POST(self):
                 path = self.path.split('?', 1)[0]
-                if path not in ('/api/command', '/api/orders/cancel', '/api/orders/pause'):
+                if path not in ('/api/command', '/api/orders/cancel', '/api/orders/pause',
+                                '/api/orders/cancel_item', '/api/lockers/release',
+                                '/api/lockers/reset', '/api/lockers/pickup'):
                     self._send_json({'error': 'not found'}, 404)
                     return
                 length = int(self.headers.get('Content-Length', 0))
@@ -1164,6 +1230,47 @@ class WebControlNode(Node):
                             paused = not node._order_repo.is_queue_paused()
                         node._order_repo.set_queue_paused(paused)
                         self._send_json({'ok': True, 'paused': paused})
+                    except Exception as e:
+                        self._send_json({'ok': False, 'error': str(e)}, 500)
+                    return
+                # 락커 관리(강제해제 / 전체리셋 / 대리수령).
+                if path in ('/api/lockers/release', '/api/lockers/reset',
+                            '/api/lockers/pickup'):
+                    if node._order_repo is None:
+                        self._send_json({'ok': False, 'error': 'DB 없음'}, 503)
+                        return
+                    try:
+                        node._order_repo.reload()
+                        if path == '/api/lockers/release':
+                            try:
+                                lid = int(body.get('id', 0))
+                            except (TypeError, ValueError):
+                                self._send_json({'ok': False, 'error': 'id는 정수여야 함'}, 400)
+                                return
+                            self._send_json({'ok': bool(node._order_repo.release_locker(lid))})
+                        elif path == '/api/lockers/reset':
+                            node._order_repo.reset_lockers()
+                            self._send_json({'ok': True})
+                        else:
+                            res = node._order_repo.confirm_pickup(
+                                str(body.get('token', '') or ''))
+                            self._send_json(
+                                {'ok': bool(res and res.get('ok')), 'detail': res})
+                    except Exception as e:
+                        self._send_json({'ok': False, 'error': str(e)}, 500)
+                    return
+                if path == '/api/orders/cancel_item':
+                    if node._order_repo is None:
+                        self._send_json({'ok': False, 'error': 'DB 없음'}, 503)
+                        return
+                    item_id = str(body.get('item_id', '') or '')
+                    if not item_id:
+                        self._send_json({'ok': False, 'error': 'item_id 누락'}, 400)
+                        return
+                    try:
+                        node._order_repo.reload()
+                        node._order_repo.cancel_item(item_id)
+                        self._send_json({'ok': True})
                     except Exception as e:
                         self._send_json({'ok': False, 'error': str(e)}, 500)
                     return
@@ -1222,32 +1329,53 @@ class WebControlNode(Node):
                 conn.close()
                 return [dict(r) for r in rows]
 
-            def _read_orders(self):
-                # 같은 패키지의 task_repository(JsonRepository)에서 미완료 유저 주문 큐를 읽는다.
+            def _read_orders(self, show_all=False):
                 repo = node._order_repo
                 if repo is None:
                     return {'orders': [], 'paused': False, 'error': 'DB 없음'}
                 try:
                     repo.reload()
-                    active = {OrderStatus.QUEUED, OrderStatus.RUNNING, OrderStatus.PAUSED}
+                    if show_all:
+                        statuses = {OrderStatus.QUEUED, OrderStatus.RUNNING, OrderStatus.PAUSED,
+                                    OrderStatus.DONE, OrderStatus.FAILED, OrderStatus.CANCELED}
+                    else:
+                        # DONE(배달완료=수령대기) 포함 — 락커별 수령 상태 표시용.
+                        statuses = {OrderStatus.QUEUED, OrderStatus.RUNNING,
+                                    OrderStatus.PAUSED, OrderStatus.DONE}
                     orders = []
-                    for o in repo.list_orders(active):
+                    for o in repo.list_orders(statuses):
                         items = []
                         for iid in o.item_ids:
                             it = repo.get_item(iid)
                             if it is None:
                                 continue
-                            items.append({'class_name': it.class_name, 'status': it.status})
+                            items.append({
+                                'class_name': it.class_name,
+                                'status': it.status,
+                                'item_id': iid,
+                            })
                         orders.append({
                             'order_id': o.order_id,
                             'ticket_no': o.ticket_no,
                             'status': o.status,
                             'items': items,
                             'created_at': o.created_at,
+                            'locker_id': o.locker_id,
+                            'qr_token': o.qr_token,
                         })
                     return {'orders': orders, 'paused': bool(repo.is_queue_paused())}
                 except Exception as e:
                     return {'orders': [], 'paused': False, 'error': str(e)}
+
+            def _read_lockers(self):
+                repo = node._order_repo
+                if repo is None:
+                    return {'lockers': [], 'error': 'DB 없음'}
+                try:
+                    repo.reload()
+                    return {'lockers': repo.list_lockers()}
+                except Exception as e:
+                    return {'lockers': [], 'error': str(e)}
 
             def _read_command(self, cid):
                 conn = self._db()
@@ -1258,6 +1386,70 @@ class WebControlNode(Node):
                 if row is None:
                     return {'error': 'not found'}
                 return dict(row)
+
+            def _read_log(self):
+                conn = self._db()
+                try:
+                    cmd_rows = conn.execute(
+                        'SELECT ts, action as text, status, result, done_ts, id '
+                        'FROM command_queue ORDER BY ts DESC LIMIT 200').fetchall()
+                    err_rows = conn.execute(
+                        'SELECT ts, text, level, ticket_no, id '
+                        'FROM error_log ORDER BY ts DESC LIMIT 200').fetchall()
+                finally:
+                    conn.close()
+                import datetime
+                def fmt(ts):
+                    if ts is None: return ''
+                    try: return datetime.datetime.fromtimestamp(ts).strftime('%H:%M:%S')
+                    except: return str(ts)
+                entries = []
+                for r in cmd_rows:
+                    entries.append({
+                        'ts': r['ts'], 'ts_str': fmt(r['ts']),
+                        'type': 'cmd', 'source': '관리자',
+                        'text': r['text'], 'status': r['status'],
+                        'detail': r['result'] or '', 'done_ts_str': fmt(r['done_ts']),
+                    })
+                for r in err_rows:
+                    ticket = r['ticket_no'] or ''
+                    src = f'#{ticket} (유저 큐)' if ticket else '시스템'
+                    entries.append({
+                        'ts': r['ts'], 'ts_str': fmt(r['ts']),
+                        'type': r['level'].lower(),  # 'err' or 'war'
+                        'source': src,
+                        'text': r['text'], 'status': r['level'],
+                        'detail': '', 'done_ts_str': '',
+                    })
+                entries.sort(key=lambda x: x['ts'] or 0, reverse=True)
+                return entries[:300]
+
+            def _scan_models(self):
+                import glob, os
+                search_dirs = [
+                    os.path.expanduser('~/Downloads'),
+                    os.path.expanduser('~/'),
+                    os.path.expanduser('~/models'),
+                ]
+                try:
+                    from ament_index_python.packages import get_package_share_directory
+                    search_dirs.append(
+                        os.path.join(get_package_share_directory('dsr_realsense_pick_place'), 'models'))
+                except Exception:
+                    pass
+                found = []
+                seen = set()
+                for d in search_dirs:
+                    for p in glob.glob(os.path.join(d, '*.pt')):
+                        ap = os.path.abspath(p)
+                        if ap not in seen:
+                            seen.add(ap)
+                            found.append(ap)
+                found.sort()
+                current = node.current_model_path
+                if current and os.path.isfile(current) and current not in seen:
+                    found.insert(0, current)
+                return {'models': found, 'current': current}
 
         self._httpd = ThreadingHTTPServer((self.http_host, self.http_port), Handler)
         self._http_thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
@@ -1285,299 +1477,720 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>DSR Pick &amp; Place 웹 제어</title>
 <style>
-  :root { color-scheme: dark; }
-  body { font-family: system-ui, sans-serif; margin: 0; background:#1e1e1e; color:#e0e0e0; }
-  header { background:#101820; padding:8px 14px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
-  .dot { padding:2px 8px; border-radius:4px; font-size:12px; font-weight:bold; background:#666; }
-  .ok{background:#1a7a1a;} .warn{background:#b38600;} .bad{background:#cc0000;}
-  main { display:flex; gap:14px; padding:14px; flex-wrap:wrap; align-items:flex-start; }
-  .col { flex:1; min-width:320px; }
-  .card { background:#2a2a2a; border-radius:10px; padding:12px; margin-bottom:12px; }
-  .card h3 { margin:0 0 8px; font-size:14px; color:#9fd0ff; }
-  button { background:#374151; color:#fff; border:none; border-radius:6px; padding:8px 10px;
-           font-size:13px; cursor:pointer; margin:3px; }
-  button:hover { background:#4b5563; }
-  button.danger { background:#cc0000; } button.danger:hover{background:#ff1a1a;}
-  button.warn   { background:#e65c00; } button.go{background:#1a7a1a;}
-  input, select { background:#1e1e1e; color:#fff; border:1px solid #555; border-radius:4px; padding:4px; }
-  #activity { font-weight:bold; color:#cfe8ff; }
-  #banner { color:#ff6666; font-weight:bold; padding:6px; display:none; }
-  table { width:100%; border-collapse:collapse; font-size:12px; }
-  td,th { border-bottom:1px solid #444; padding:3px 4px; text-align:left; }
-  .obj { background:#333; border-radius:6px; padding:6px; margin:4px 0; cursor:pointer; }
-  .obj:hover { background:#3d4f63; }
-  .obj.unreach { opacity:.4; cursor:not-allowed; }
-  img { max-width:100%; border-radius:8px; background:#111; }
-  .row { display:flex; gap:6px; align-items:center; margin:4px 0; flex-wrap:wrap; }
-  label { font-size:12px; }
-  small { color:#999; }
-  .order { border-radius:6px; padding:6px 8px; margin:5px 0; border-left:5px solid #666; background:#333; }
-  .order.run    { border-left-color:#1a7a1a; background:#1f3320; }
-  .order.pause  { border-left-color:#e6a700; background:#33301f; }
-  .order.queued { border-left-color:#888; background:#333; }
-  .order .tk { font-weight:bold; }
-  .order .badge { font-size:11px; padding:1px 6px; border-radius:4px; background:#666; margin-left:6px; }
-  .badge.run{background:#1a7a1a;} .badge.pause{background:#e6a700;color:#222;} .badge.queued{background:#666;}
-  .order .items { font-size:12px; color:#cfe8ff; margin-top:3px; }
-  .order .cancel { float:right; background:#a33; padding:2px 8px; }
-  #select-grid { display:flex; flex-wrap:wrap; gap:4px; margin-bottom:6px; }
-  .selbtn { background:#374151; }
-  .selbtn.active { background:#1a7a1a; outline:2px solid #9fffaf; outline-offset:1px; }
-  #sel-auto.active { background:#1a7a1a; outline:2px solid #9fffaf; outline-offset:1px; }
+  :root{color-scheme:dark;}
+  *{box-sizing:border-box;}
+  body{font-family:system-ui,sans-serif;margin:0;background:#1a1a1a;color:#e0e0e0;}
+  header{background:#0d1520;padding:8px 14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;border-bottom:1px solid #2a3a50;}
+  .dot{padding:2px 7px;border-radius:4px;font-size:11px;font-weight:bold;background:#555;}
+  .ok{background:#1a7a1a;} .warn{background:#8a6000;} .bad{background:#a00000;}
+  .dot-sep{border-left:1px solid #444;margin:0 4px;height:16px;display:inline-block;vertical-align:middle;}
+  nav{background:#111820;padding:0 14px;display:flex;gap:2px;border-bottom:1px solid #2a3a50;}
+  .tab{background:none;border:none;color:#8ab;padding:10px 18px;cursor:pointer;font-size:13px;border-bottom:3px solid transparent;border-radius:0;margin:0;}
+  .tab:hover{color:#def;}
+  .tab.active{color:#9fd0ff;border-bottom-color:#9fd0ff;}
+  .page{display:none;}
+  .page.active{display:block;}
+  .cols{display:flex;gap:12px;padding:12px;flex-wrap:wrap;align-items:flex-start;}
+  .col{flex:1;min-width:300px;}
+  .col-wide{flex:1.6;min-width:360px;}
+  .card{background:#252525;border-radius:10px;padding:11px 13px;margin-bottom:11px;border:1px solid #333;}
+  .card h3{margin:0 0 8px;font-size:13px;color:#9fd0ff;font-weight:600;}
+  button{background:#374151;color:#fff;border:none;border-radius:6px;padding:7px 10px;font-size:12px;cursor:pointer;margin:2px;}
+  button:hover{background:#4b5a6e;}
+  button.danger{background:#8b0000;} button.danger:hover{background:#c00000;}
+  button.warn{background:#7a3200;} button.warn:hover{background:#b04800;}
+  button.go{background:#1a5e1a;} button.go:hover{background:#1e8a1e;}
+  button.active-sel{background:#1a7a1a;outline:2px solid #6fffaf;outline-offset:1px;}
+  input,select{background:#1a1a1a;color:#fff;border:1px solid #555;border-radius:4px;padding:4px 6px;font-size:12px;}
+  #activity{font-weight:bold;color:#cfe8ff;font-size:12px;}
+  #banner{color:#ff8888;font-weight:bold;padding:6px 14px;display:none;background:#2a0808;border-bottom:1px solid #a00;}
+  .row{display:flex;gap:6px;align-items:center;margin:4px 0;flex-wrap:wrap;}
+  label{font-size:12px;color:#bbb;}
+  small{color:#888;font-size:11px;}
+  /* camera — D455 16:9 aspect ratio */
+  #cam-wrap{position:relative;background:#111;border-radius:8px;overflow:hidden;aspect-ratio:16/9;width:100%;}
+  #cam{position:absolute;inset:0;width:100%;height:100%;display:block;border-radius:8px;object-fit:contain;}
+  #cam-no{position:absolute;inset:0;display:none;align-items:center;justify-content:center;color:#ff3333;font-size:22px;font-weight:bold;letter-spacing:3px;background:#0a0a0a;}
+  /* detect objects */
+  .obj-info{background:#2a2a2a;border-radius:5px;padding:5px 7px;margin:3px 0;font-size:12px;border-left:3px solid #555;}
+  .obj-info.reach{border-left-color:#2a6a2a;}
+  .obj-info.unreach{opacity:.5;}
+  .obj-row-wrap{display:flex;align-items:center;gap:4px;margin:6px 0 2px;height:34px;}
+  .obj-row-label{font-size:10px;color:#666;min-width:44px;text-align:right;flex-shrink:0;}
+  .obj-row-btns{display:flex;gap:4px;overflow-x:auto;overflow-y:hidden;flex:1;height:34px;align-items:center;}
+  .obj-row-btns::-webkit-scrollbar{height:3px;}.obj-row-btns::-webkit-scrollbar-thumb{background:#444;}
+  /* orders */
+  .order{border-radius:7px;padding:7px 9px;margin:5px 0;border-left:5px solid #555;background:#2a2a2a;}
+  .order.running,.order.run{border-left-color:#1a8a1a;background:#1a2e1a;}
+  .order.pause{border-left-color:#c89000;background:#2a2610;}
+  .order.queued{border-left-color:#666;background:#2a2a2a;}
+  .order.done{border-left-color:#2255aa;background:#1a1e2a;opacity:.75;}
+  .order.failed{border-left-color:#993300;background:#2a1a10;opacity:.85;}
+  .order.canceled{border-left-color:#553300;opacity:.6;}
+  .order .tk{font-weight:bold;font-size:13px;}
+  .badge{font-size:10px;padding:1px 6px;border-radius:4px;background:#555;display:inline-block;margin:1px;}
+  .badge.run,.badge.running{background:#1a7a1a;}
+  .badge.pause{background:#c89000;color:#111;}
+  .badge.queued{background:#555;}
+  .locker-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;}
+  .lk{border-radius:6px;padding:6px;font-size:11px;background:#2a2a2a;border-left:5px solid #555;}
+  .lk.free{border-left-color:#555;opacity:.55;}
+  .lk.occupied{border-left-color:#c89000;background:#2a2610;}
+  .lk.ready{border-left-color:#1a8a1a;background:#1a2e1a;}
+  .lk .lkid{font-weight:bold;font-size:13px;}
+  .lk .lkcode{font-family:monospace;font-size:14px;font-weight:bold;letter-spacing:2px;color:#ffd24d;margin-top:2px;}
+  .lk button{font-size:10px;padding:2px 5px;margin:3px 2px 0 0;}
+  .badge.done{background:#2255aa;}
+  .badge.failed{background:#993300;}
+  .badge.canceled{background:#553300;}
+  .item-row{display:flex;align-items:center;gap:5px;margin:2px 0;}
+  .item-cancel{background:#6a2020;padding:1px 6px;font-size:11px;}
+  /* robot action grid */
+  .act-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;margin-bottom:4px;}
+  .act-grid button{margin:0;width:100%;}
+  .act-grid span{display:block;}
+  /* gripper chart */
+  #gchart{width:100%;height:90px;border-radius:6px;background:#111;display:block;}
+  /* ultrasonic bar */
+  .us-wrap{background:#1a1a1a;border-radius:5px;height:24px;position:relative;overflow:hidden;border:1px solid #444;margin:6px 0;}
+  .us-fill{height:100%;transition:width .3s,background .5s;border-radius:4px;}
+  .us-mark{position:absolute;top:0;bottom:0;width:2px;background:#fff8;pointer-events:none;}
+  .us-lbl{position:absolute;right:6px;top:50%;transform:translateY(-50%);font-size:11px;font-weight:bold;color:#fff;}
+  /* grip table */
+  .grip-tbl{width:100%;font-size:12px;border-collapse:collapse;margin-top:5px;}
+  .grip-tbl td,.grip-tbl th{padding:3px 5px;border-bottom:1px solid #333;text-align:left;}
+  .grip-tbl th{color:#9fd0ff;font-weight:600;}
+  .grip-tbl input{width:65px;}
+  /* log */
+  .log-filter{display:flex;gap:4px;margin-bottom:8px;}
+  .log-filter button{font-size:11px;padding:4px 10px;}
+  .log-filter button.active-sel{background:#1a5ea0;}
+  .log-entry{border-radius:6px;padding:6px 9px;margin:4px 0;border-left:4px solid #555;background:#252525;}
+  .log-entry.cmd{border-left-color:#4466aa;}
+  .log-entry.err{border-left-color:#cc2222;background:#280a0a;}
+  .log-entry.war{border-left-color:#cc7700;background:#251800;}
+  .log-entry.user-src{background:#1c1c24!important;}
+  .log-row1{display:flex;gap:10px;font-size:11px;color:#888;margin-bottom:2px;}
+  .log-row2{font-size:12px;}
+  .log-badge{padding:1px 6px;border-radius:3px;font-size:10px;font-weight:bold;}
+  .log-badge.cmd{background:#1a3a6a;} .log-badge.err{background:#8a0000;} .log-badge.war{background:#7a4000;}
+  .log-badge.done{background:#1a5a1a;} .log-badge.failed{background:#6a2200;} .log-badge.pending{background:#555;} .log-badge.running{background:#1a4a1a;}
+  #loglist{max-height:calc(100vh - 160px);overflow-y:auto;}
+  /* user tab */
+  #user-stats{display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap;}
+  .stat-box{background:#1e2a3a;border-radius:7px;padding:6px 14px;text-align:center;min-width:72px;}
+  .stat-box .sval{font-size:22px;font-weight:bold;color:#9fd0ff;}
+  .stat-box .slbl{font-size:10px;color:#888;}
 </style>
 </head>
 <body>
 <header>
-  <strong>DSR Pick &amp; Place</strong>
+  <strong style="font-size:14px;color:#9fd0ff;">DSR Pick &amp; Place</strong>
   <span id="status-dots"></span>
-  <span id="activity">연결 중...</span>
+  <span id="activity" style="margin-left:auto;">연결 중...</span>
 </header>
 <div id="banner"></div>
-<main>
-  <div class="col">
+<nav>
+  <button class="tab active" id="tab-main" onclick="showTab('main')">🤖 메인</button>
+  <button class="tab" id="tab-user" onclick="showTab('user')">👤 유저 큐</button>
+  <button class="tab" id="tab-gripper" onclick="showTab('gripper')">🦾 그리퍼</button>
+  <button class="tab" id="tab-log" onclick="showTab('log')">📋 로그</button>
+</nav>
+
+<!-- ═══════════════ 메인 탭 ═══════════════ -->
+<div class="page active" id="page-main">
+<div class="cols">
+  <!-- Col 1: Queue + Camera -->
+  <div class="col col-wide">
     <div class="card">
-      <h3>유저 주문 큐 <span id="queue-paused"></span></h3>
-      <div class="row">
-        <button id="pauseBtn" onclick="toggleQueue()">큐 보류/재개</button>
-      </div>
+      <h3>작업 중인 유저 주문</h3>
       <div id="orders"><small>불러오는 중...</small></div>
     </div>
     <div class="card">
-      <h3>카메라 / 검출</h3>
-      <img id="cam" alt="카메라 영상" src="">
-      <div id="objects"></div>
-      <button onclick="cmd('select_object',{label:''})">자동 선택</button>
+      <h3>락커 현황 <button onclick="resetLockers()" style="float:right;font-size:11px;padding:2px 8px">전체 리셋</button></h3>
+      <div id="lockers" class="locker-grid"><small>불러오는 중...</small></div>
     </div>
     <div class="card">
-      <h3>검출 물체 선택 <span id="sel-cur"><small>선택: 자동</small></span></h3>
-      <div id="select-grid"></div>
-      <button id="sel-auto" onclick="selectObject('')">🎯 자동 선택</button>
-      <div><small>box(상자)는 이동 대상이 아니므로 선택할 수 없습니다.</small></div>
+      <h3>카메라 / 검출 &nbsp;<small id="sel-label" style="color:#9fd0ff;">선택: 자동</small></h3>
+      <div id="cam-wrap">
+        <img id="cam" alt="카메라 영상" src="">
+        <div id="cam-no">NO CAMERA</div>
+      </div>
+      <div class="obj-row-wrap">
+        <span class="obj-row-label">Known</span>
+        <div id="known-row" class="obj-row-btns"></div>
+      </div>
+      <div class="obj-row-wrap">
+        <span class="obj-row-label">Unknown</span>
+        <div id="unknown-row" class="obj-row-btns"></div>
+      </div>
     </div>
   </div>
 
+  <!-- Col 2: Controls + Tuning -->
   <div class="col">
     <div class="card">
       <h3>긴급 제어</h3>
-      <button class="danger" onclick="cmd('e_stop')">⛔ 긴급정지</button>
+      <button id="estop-btn" class="danger" style="width:100%;padding:14px;font-size:15px;font-weight:bold;margin-bottom:6px;" onclick="toggleEStop()">⛔ 긴급정지</button>
       <button class="warn" onclick="cmd('cancel')">🚫 태스크 중단</button>
-      <button class="go" onclick="cmd('e_stop_reset')">✅ 긴급정지 해제</button>
-      <button onclick="cmd('clear_error')">에러 해제</button>
+      <button onclick="cmd('clear_error')">🔄 에러 해제</button>
+      <button onclick="cmd('go_home')">🏠 홈 복귀</button>
     </div>
     <div class="card">
       <h3>로봇 동작</h3>
-      <button onclick="cmd('run_once')">▶ 한 번 실행</button>
-      <button class="go" onclick="cmd('sort_all')">🗂 자동 분류(Sort All)</button>
-      <button onclick="cmd('run_once_package')">📦 패키지 픽(테스트)</button>
-      <button onclick="cmd('go_home')">🏠 HOME 이동</button>
-      <button onclick="cmd('recover_to_home')">에러복구 &amp; HOME</button>
-      <div class="row">
+      <div class="act-grid">
+        <button onclick="cmd('run_once')">▶ 한번실행</button>
+        <button class="go" onclick="cmd('sort_all')">🗂 자동 분류</button>
+        <button onclick="cmd('run_once_package')">📦 패키지 픽</button>
         <button onclick="cmd('speed_normal')">🟢 정상속도</button>
-        <button onclick="cmd('speed_reduced')">🟡 감속</button>
-        <button onclick="cmd('servo_on')">서보 ON</button>
-        <button class="warn" onclick="if(confirm('서보 OFF? 중력으로 로봇이 떨어질 수 있습니다'))cmd('servo_off')">서보 OFF</button>
+        <button onclick="cmd('speed_reduced')">🟡 저속</button>
+        <span></span>
+        <button id="servo-btn" onclick="toggleServo()">서보 ON/OFF</button>
         <button onclick="cmd('safety_normal')">정상운전</button>
         <button onclick="cmd('safety_backdrive')">역구동</button>
       </div>
     </div>
     <div class="card">
-      <h3>그리퍼</h3>
-      <button onclick="cmd('gripper_open')">OPEN</button>
-      <button onclick="cmd('gripper_close')">CLOSE</button>
-      <button onclick="cmd('gripper_enable',{enable:true})">토크 ON</button>
-      <button onclick="cmd('gripper_enable',{enable:false})">토크 OFF</button>
-      <button onclick="cmd('restart_gripper_bridge')">🔧 브릿지 재시작</button>
-      <div><small>전류: <span id="g_curr">-</span> mA · 위치: <span id="g_pos">-</span> · 초음파: <span id="us">-</span> mm</small></div>
-    </div>
-  </div>
-
-  <div class="col">
-    <div class="card">
       <h3>검출 / 카메라 튜닝</h3>
       <div class="row"><label>신뢰도</label>
-        <input id="conf" type="number" step="0.01" min="0.05" max="0.95" style="width:70px">
+        <input id="conf" type="number" step="0.01" min="0.05" max="0.95" style="width:65px">
         <button onclick="cmd('set_confidence',{value:+v('conf')})">적용</button></div>
       <div class="row"><label>자동노출</label>
         <button onclick="cmd('set_camera_auto_exposure',{enable:true})">ON</button>
         <button onclick="cmd('set_camera_auto_exposure',{enable:false})">OFF</button>
-        <input id="exp" type="number" min="20" max="5000" style="width:80px">
-        <button onclick="cmd('set_camera_exposure',{value:+v('exp')})">노출적용</button></div>
+        <input id="exp" type="number" min="20" max="5000" style="width:70px">
+        <button onclick="cmd('set_camera_exposure',{value:+v('exp')})">적용</button></div>
     </div>
     <div class="card">
       <h3>캘리브레이션 (mm, IDLE 전용)</h3>
       <div class="row">
-        X<input id="cx" type="number" step="1" style="width:70px">
-        Y<input id="cy" type="number" step="1" style="width:70px">
-        Z<input id="cz" type="number" step="1" style="width:70px">
+        X<input id="cx" type="number" step="1" style="width:65px">
+        Y<input id="cy" type="number" step="1" style="width:65px">
+        Z<input id="cz" type="number" step="1" style="width:65px">
       </div>
       <button onclick="cmd('load_calibration')">불러오기</button>
       <button onclick="cmd('set_calibration',{x:+v('cx'),y:+v('cy'),z:+v('cz')})">적용</button>
     </div>
+  </div>
+
+  <!-- Col 3: Model + 전류 그래프 + 초음파 -->
+  <div class="col">
     <div class="card">
-      <h3>그리퍼 정밀 / 안전</h3>
-      <div class="row">열기<input id="goc" type="number" style="width:70px">
-        닫기<input id="gcc" type="number" style="width:70px">
-        이송<input id="gtc" type="number" style="width:70px"></div>
-      <div class="row">속도<input id="gpv" type="number" style="width:70px">
-        가속<input id="gpa" type="number" style="width:70px">
+      <h3>모델 / 시스템</h3>
+      <div style="margin-bottom:6px;"><small>현재 모델:</small><br>
+        <code id="model-path" style="font-size:11px;color:#adf;word-break:break-all;">-</code>
+      </div>
+      <div class="row">
+        <select id="model-sel" style="flex:1;min-width:0;" onchange="if(this.value)$('model').value=this.value">
+          <option value="">-- 스캔된 파일 --</option>
+        </select>
+        <button onclick="loadModels()">🔍</button>
+      </div>
+      <div class="row">
+        <input id="model" type="text" placeholder=".pt 경로 직접 입력" style="flex:1;min-width:0;">
+        <button onclick="cmd('set_model',{path:v('model')})">적용</button>
+      </div>
+      <div style="margin-top:6px;">
+        <button class="go" onclick="cmd('save_yaml')">💾 yaml 저장</button>
+        <button class="warn" onclick="if(confirm('노드 재시작?'))cmd('system_reset')">🔄 시스템 리셋</button>
+      </div>
+    </div>
+    <div class="card">
+      <h3>그리퍼 전류 &nbsp;<small><span id="g_curr2">-</span> mA &nbsp;위치: <span id="g_pos2">-</span></small></h3>
+      <canvas id="gchart"></canvas>
+    </div>
+    <div class="card">
+      <h3>초음파 거리 &nbsp;<small>grasp 기준: <span id="us-thresh">40</span> mm</small></h3>
+      <div class="us-wrap">
+        <div class="us-fill" id="us-fill" style="width:0%;background:#555;"></div>
+        <div class="us-mark" id="us-mark" style="left:20%;"></div>
+        <span class="us-lbl" id="us-lbl">- mm</span>
+      </div>
+      <small>0mm ←──────────────────────── 400mm</small>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- ═══════════════ 유저 큐 탭 ═══════════════ -->
+<div class="page" id="page-user">
+<div style="padding:12px;">
+  <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap;">
+    <strong style="font-size:14px;">유저 주문 관리</strong>
+    <span id="user-q-badge"></span>
+    <button id="user-pause-btn" onclick="toggleQueue();setTimeout(pollUser,400)">⏸ 보류/재개</button>
+    <label style="margin-left:8px;display:flex;align-items:center;gap:4px;">
+      <input type="checkbox" id="show-history" onchange="pollUser()"> 완료/취소 이력 포함
+    </label>
+    <button onclick="pollUser()" style="margin-left:auto;">🔄 새로고침</button>
+  </div>
+  <div id="user-stats"></div>
+  <div id="user-orders"><small>로딩 중...</small></div>
+</div>
+</div>
+
+<!-- ═══════════════ 그리퍼 탭 ═══════════════ -->
+<div class="page" id="page-gripper">
+<div class="cols">
+  <div class="col">
+    <div class="card">
+      <h3>그리퍼 제어</h3>
+      <button onclick="cmd('gripper_open')">OPEN</button>
+      <button onclick="cmd('gripper_close')">CLOSE</button>
+      <button onclick="cmd('gripper_enable',{enable:true})">토크 ON</button>
+      <button class="warn" onclick="cmd('gripper_enable',{enable:false})">토크 OFF</button>
+      <button onclick="cmd('gripper_reinit')">🔁 재초기화</button>
+      <button class="warn" onclick="cmd('restart_gripper_bridge')">🔧 브릿지 재시작</button>
+    </div>
+  </div>
+  <div class="col">
+    <div class="card">
+      <h3>기본 파라미터 (mA / step) <small style="float:right;color:#5a9;font-size:10px;">적용 시 yaml 자동 저장</small></h3>
+      <div class="row">열기<input id="goc" type="number" style="width:65px">
+        닫기<input id="gcc" type="number" style="width:65px">
+        이송<input id="gtc" type="number" style="width:65px"></div>
+      <div class="row">속도<input id="gpv" type="number" style="width:65px">
+        가속<input id="gpa" type="number" style="width:65px">
         <button onclick="applyGripper()">적용</button></div>
-      <div class="row">Min Safe Z(m)<input id="msz" type="number" step="0.005" style="width:80px">
+      <div class="row">Min Safe Z(m)<input id="msz" type="number" step="0.005" style="width:75px">
         <button onclick="cmd('set_min_safe_z',{value:+v('msz')})">적용</button></div>
     </div>
     <div class="card">
-      <h3>모델 / 시스템</h3>
-      <div class="row"><input id="model" type="text" placeholder="YOLO .pt 경로" style="flex:1">
-        <button onclick="cmd('set_model',{path:v('model')})">적용</button></div>
-      <button class="go" onclick="cmd('save_yaml')">💾 전체 yaml 저장</button>
-      <button class="warn" onclick="if(confirm('GUI 제외 전 노드 재시작?'))cmd('system_reset')">🔄 시스템 리셋</button>
-      <div><small>설정 변경은 DB에 즉시 저장되고, 위 튜닝값은 yaml에도 자동 기록됩니다.</small></div>
-    </div>
-    <div class="card">
-      <h3>최근 명령</h3>
-      <table id="log"><tbody></tbody></table>
+      <h3>물체별 파지 강도 (mA) <small style="float:right;color:#5a9;font-size:10px;">적용 시 yaml 자동 저장</small></h3>
+      <div class="row">기본 전류<input id="gcd" type="number" style="width:65px">
+        <button onclick="applyGripStrength()">전체 적용</button></div>
+      <table class="grip-tbl">
+        <thead><tr><th>물체</th><th>파지 전류(mA)</th></tr></thead>
+        <tbody id="grip-tbl-body"></tbody>
+      </table>
     </div>
   </div>
-</main>
+</div>
+</div>
+
+<!-- ═══════════════ 로그 탭 ═══════════════ -->
+<div class="page" id="page-log">
+<div style="padding:12px;">
+  <div class="log-filter">
+    <button class="active-sel" id="lf-all" onclick="setLogFilter('all')">전체</button>
+    <button id="lf-cmd" onclick="setLogFilter('cmd')">CMD</button>
+    <button id="lf-err" onclick="setLogFilter('err')">🔴 ERR</button>
+    <button id="lf-war" onclick="setLogFilter('war')">🟠 WAR</button>
+    <button onclick="pollLog()" style="margin-left:auto;">🔄 새로고침</button>
+  </div>
+  <div id="loglist"><small>로그 탭 클릭 시 로드됩니다.</small></div>
+</div>
+</div>
+
 <script>
 const $ = id => document.getElementById(id);
-const v = id => $(id).value;
-async function cmd(action, payload={}) {
-  const r = await fetch('/api/command', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({action, payload})});
-  const j = await r.json();
-  $('activity').textContent = '명령 #' + (j.id||'?') + ' ' + action + ' 전송';
-  return j;
-}
-function applyGripper(){ cmd('set_gripper_params', {
-  open_current:+v('goc'), close_current:+v('gcc'), transport_current:+v('gtc'),
-  profile_velocity:+v('gpv'), profile_acceleration:+v('gpa')}); }
+const v = id => $(id) ? $(id).value : '';
 
-let settingsLoaded = false;
-async function loadSettings(){
-  const s = await (await fetch('/api/settings')).json();
-  const set=(id,k)=>{ if($(id) && s[k]!=null && $(id).value==='') $(id).value=s[k]; };
-  set('conf','confidence_threshold'); set('exp','camera_exposure');
-  set('cx','calib_x_mm'); set('cy','calib_y_mm'); set('cz','calib_z_mm');
-  set('goc','gripper_open_current'); set('gcc','gripper_close_current');
-  set('gtc','gripper_transport_current'); set('gpv','gripper_profile_velocity');
-  set('gpa','gripper_profile_acceleration'); set('msz','min_safe_z'); set('model','yolo_model_path');
-  settingsLoaded = true;
+// ── 탭 전환 ─────────────────────────────────────────────────────────────────
+function showTab(t){
+  ['main','user','gripper','log'].forEach(n=>{
+    const p=$('page-'+n), tb=$('tab-'+n);
+    if(p) p.className='page'+(n===t?' active':'');
+    if(tb) tb.className='tab'+(n===t?' active':'');
+  });
+  if(t==='log') pollLog();
+  if(t==='user') pollUser();
 }
+
+// ── cmd() ────────────────────────────────────────────────────────────────────
+async function cmd(action, payload={}){
+  try{
+    const r = await fetch('/api/command',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action,payload})});
+    const j = await r.json();
+    $('activity').textContent='명령 #'+(j.id||'?')+' '+action+' 전송';
+    return j;
+  }catch(e){
+    $('activity').textContent='오류: '+e;
+    return {};
+  }
+}
+
+function applyGripper(){
+  cmd('set_gripper_params',{
+    open_current:+v('goc'),close_current:+v('gcc'),transport_current:+v('gtc'),
+    profile_velocity:+v('gpv'),profile_acceleration:+v('gpa')});
+}
+
+// ── 설정 로드 ────────────────────────────────────────────────────────────────
+let settingsLoaded=false, gripNames=[], gripCurrents=[];
+async function loadSettings(){
+  try{
+    const s=await(await fetch('/api/settings')).json();
+    const set=(id,k)=>{if($(id)&&s[k]!=null&&$(id).value==='')$(id).value=s[k];};
+    set('conf','confidence_threshold'); set('exp','camera_exposure');
+    set('cx','calib_x_mm'); set('cy','calib_y_mm'); set('cz','calib_z_mm');
+    set('goc','gripper_open_current'); set('gcc','gripper_close_current');
+    set('gtc','gripper_transport_current'); set('gpv','gripper_profile_velocity');
+    set('gpa','gripper_profile_acceleration'); set('msz','min_safe_z');
+    set('gcd','grip_current_default');
+    gripNames=s.grip_class_names||[]; gripCurrents=s.grip_class_currents||[];
+    renderGripTable();
+    settingsLoaded=true;
+  }catch(e){}
+}
+
+function renderGripTable(){
+  const tb=$('grip-tbl-body'); if(!tb)return;
+  tb.innerHTML=gripNames.map((n,i)=>
+    `<tr><td>${n}</td><td><input type="number" id="gc_${i}" value="${gripCurrents[i]||200}" style="width:65px"></td></tr>`
+  ).join('');
+}
+
+function applyGripStrength(){
+  const names=[...gripNames];
+  const currents=gripNames.map((_,i)=>+v('gc_'+i)||200);
+  const def=+v('gcd')||200;
+  cmd('set_grip_strength',{names,currents,default:def});
+}
+
+// ── 모델 스캔 ────────────────────────────────────────────────────────────────
+async function loadModels(){
+  try{
+    const d=await(await fetch('/api/models')).json();
+    const sel=$('model-sel');
+    sel.innerHTML='<option value="">-- 스캔된 파일 선택 --</option>'+
+      (d.models||[]).map(p=>{
+        const name=p.split('/').pop();
+        const cur=p===(d.current||'');
+        return `<option value="${p}"${cur?' selected':''}>${name}</option>`;
+      }).join('');
+  }catch(e){}
+}
+
+// ── 상태 코드 매핑 ────────────────────────────────────────────────────────────
 const HW={0:'INIT',1:'STANDBY',2:'MOVING',3:'SAFE_OFF',4:'TEACH',5:'SAFE_STOP',
   6:'E-STOP',7:'HOMING',8:'RECOVERY',15:'NOT_READY','-1':'?'};
+
+// ── 서보 토글 ─────────────────────────────────────────────────────────────────
+let lastHwState=-1;
+function updateServoBtn(hwState){
+  lastHwState=hwState;
+  const btn=$('servo-btn');
+  if(!btn)return;
+  if(hwState===3){
+    btn.textContent='⚡ 서보 ON';
+    btn.className='go';
+  }else{
+    btn.textContent='서보 OFF';
+    btn.className='warn';
+  }
+}
+function toggleServo(){
+  if(lastHwState===3){cmd('servo_on');}
+  else{if(confirm('서보 OFF? 로봇 낙하 위험'))cmd('servo_off');}
+}
+
+// ── 긴급정지 토글 ─────────────────────────────────────────────────────────────
+function updateEStopBtn(hwState){
+  const btn=$('estop-btn');
+  if(!btn)return;
+  if(hwState===6){ // E-STOP
+    btn.textContent='✅ 긴급정지 해제';
+    btn.className='go';
+    btn.style.cssText='width:100%;padding:14px;font-size:15px;font-weight:bold;margin-bottom:6px;';
+  }else{
+    btn.textContent='⛔ 긴급정지';
+    btn.className='danger';
+    btn.style.cssText='width:100%;padding:14px;font-size:15px;font-weight:bold;margin-bottom:6px;';
+  }
+}
+function toggleEStop(){
+  if(lastHwState===6){cmd('e_stop_reset');}
+  else{cmd('e_stop');}
+}
+
+// ── 그리퍼 전류 sparkline (0 중앙, ±300mA, close=빨강/open=파랑) ─────────────
+const GC_LEN=60;
+const gcBuf=new Array(GC_LEN).fill(0);
+const GC_RANGE=300; // ±300 mA
+function gcPush(val){gcBuf.shift();gcBuf.push(Math.max(-GC_RANGE,Math.min(GC_RANGE,+val||0)));}
+function gcDraw(){
+  const c=$('gchart'); if(!c)return;
+  const W=c.offsetWidth||300, H=90;
+  c.width=W; c.height=H;
+  const ctx=c.getContext('2d');
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle='#111'; ctx.fillRect(0,0,W,H);
+  const mid=H/2;
+  const valToY=v=>mid-((v/GC_RANGE)*mid);
+  // grid
+  ctx.strokeStyle='#2a2a2a'; ctx.lineWidth=1;
+  [-300,-150,0,150,300].forEach(v=>{
+    const y=valToY(v);
+    ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();
+  });
+  // zero line (brighter)
+  ctx.strokeStyle='#444'; ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(0,mid);ctx.lineTo(W,mid);ctx.stroke();
+  // labels
+  ctx.font='10px monospace';ctx.textAlign='left';
+  [[-300,'#5577ff'],[0,'#888'],[300,'#ff4444']].forEach(([v,col])=>{
+    const y=valToY(v);
+    ctx.fillStyle=col;
+    ctx.fillText((v>0?'+':'')+v,3,y<10?12:(y>H-10?H-2:y+10));
+  });
+  // draw line in colored segments
+  ctx.lineWidth=2;
+  gcBuf.forEach((val,i)=>{
+    if(i===0)return;
+    const x1=W*((i-1)/(GC_LEN-1)), y1=valToY(gcBuf[i-1]);
+    const x2=W*(i/(GC_LEN-1)),     y2=valToY(val);
+    ctx.strokeStyle=val>=0?'#ff4444':'#4488ff';
+    ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);ctx.stroke();
+  });
+}
+
+// ── 초음파 바 ────────────────────────────────────────────────────────────────
+let graspThresh=40;
+function usColor(mm){
+  if(mm>300)return'#555';
+  if(mm>200)return'#888800';
+  if(mm>100)return'#cc7700';
+  if(mm>graspThresh)return'#ee4400';
+  return'#ff1111';
+}
+function updateUs(mm){
+  const fill=$('us-fill'),lbl=$('us-lbl'),mark=$('us-mark');
+  if(mm==null||mm<0){
+    if(fill)fill.style.width='0%';
+    if(lbl)lbl.textContent='- mm';
+    return;
+  }
+  const MAX=400, pct=Math.min(100,mm/MAX*100);
+  if(fill){fill.style.width=pct+'%';fill.style.background=usColor(mm);}
+  if(lbl)lbl.textContent=mm+' mm';
+  if(mark)mark.style.left=(graspThresh/MAX*100)+'%';
+}
+
+// ── 검출 물체 + 선택 ─────────────────────────────────────────────────────────
+let selectedLabel='';
+function selectObject(label){
+  selectedLabel=label||'';
+  cmd('select_object',{label:selectedLabel});
+  updateSelLabel();
+}
+function updateSelLabel(){
+  const el=$('sel-label');
+  if(el)el.textContent='선택: '+(selectedLabel||'자동');
+}
+function renderObjArea(objects){
+  const selBtns=objects.filter(o=>o.label!=='box'&&o.label!=='source_zone'&&o.reachable);
+  const seen={},knownLabels=[],unknownLabels=[];
+  selBtns.forEach(o=>{
+    if(!seen[o.label]){
+      seen[o.label]=1;
+      if(o.label.startsWith('unknown')) unknownLabels.push(o.label);
+      else knownLabels.push(o.label);
+    }
+  });
+  const mkBtn=lb=>{
+    const act=lb===selectedLabel?'active-sel':'';
+    return `<button class="${act}" onclick="selectObject('${lb}')">${lb}</button>`;
+  };
+  const kRow=$('known-row');
+  if(kRow) kRow.innerHTML=knownLabels.map(mkBtn).join('');
+  const uRow=$('unknown-row');
+  if(uRow) uRow.innerHTML=unknownLabels.map(mkBtn).join('');
+  updateSelLabel();
+}
+
+// ── 메인 poll ────────────────────────────────────────────────────────────────
 async function poll(){
   try{
-    const s = await (await fetch('/api/state')).json();
-    // 상태점
-    const ss = s.system_status||{};
-    $('status-dots').innerHTML = Object.entries(ss).map(([k,st])=>
-      `<span class="dot ${st}">${k}</span>`).join(' ');
-    const stt = s.pick_place_state||'?';
-    $('activity').textContent = `상태: ${stt} · HW: ${HW[s.hw_state]||s.hw_state} · 속도: ${s.speed_mode===1?'감속':'정상'}`;
-    const err = (stt==='ERROR') ? (s.error_text||'ERROR') : '';
-    $('banner').style.display = err?'block':'none'; $('banner').textContent = err?('🔴 '+err):'';
-    $('g_curr').textContent = s.gripper_current_ma; $('g_pos').textContent = s.gripper_position_raw;
-    $('us').textContent = s.ultrasonic_mm==null?'-':s.ultrasonic_mm;
-    // 검출 물체
-    $('objects').innerHTML = (s.detected_objects||[]).map(o=>{
-      const isBox = (o.label==='box');           // box 는 이동 금지 → 선택 불가
-      const selectable = o.reachable && !isBox;
-      const cls = selectable?'obj':'obj unreach';
-      const onclick = selectable?`onclick="cmd('select_object',{label:'${o.label}'}).then(()=>cmd('run_once'))"`:'';
-      const p=o.pose||{};
-      return `<div class="${cls}" ${onclick}>${o.label} `+
-             `<small>conf ${(o.confidence||0).toFixed(2)} · [${(p.x||0).toFixed(2)},${(p.y||0).toFixed(2)},${(p.z||0).toFixed(2)}]m`+
-             `${isBox?' · 이동불가(box)':(o.reachable?'':' · 도달불가')}</small></div>`;
-    }).join('') || '<small>검출된 물체 없음</small>';
-    if(s.has_image) $('cam').src = '/api/image.jpg?t=' + Date.now();
-    // 명령 로그
-    const logs = await (await fetch('/api/commands')).json();
-    $('log').querySelector('tbody').innerHTML = logs.map(l=>
-      `<tr><td>#${l.id}</td><td>${l.action}</td><td>${l.status}</td><td><small>${l.result||''}</small></td></tr>`).join('');
-  }catch(e){ $('activity').textContent='연결 끊김: '+e; }
-  if(!settingsLoaded) loadSettings();
-}
-setInterval(poll, 500); poll();
-
-// ── 검출 물체 선택 (gui_node 패리티) ─────────────────────────────────────────
-// box 는 이동 금지 → 선택 버튼에서 제외. 선택된 라벨은 색 강조 + 현재 라벨 표시.
-let selectedLabel = '';  // '' = 자동 선택
-function selectObject(label){
-  selectedLabel = label || '';
-  cmd('select_object', {label: selectedLabel});
-  $('sel-cur').innerHTML = '<small>선택: ' + (selectedLabel || '자동') + '</small>';
-  renderSelectGrid(lastSelectLabels);
-}
-let lastSelectLabels = [];
-function renderSelectGrid(labels){
-  lastSelectLabels = labels;
-  const grid = $('select-grid');
-  if(!grid) return;
-  if(!labels.length){ grid.innerHTML = '<small>검출된 물체 없음</small>'; }
-  else {
-    grid.innerHTML = labels.map(lb=>{
-      const act = (lb===selectedLabel && selectedLabel!=='') ? ' active' : '';
-      return `<button class="selbtn${act}" onclick="selectObject('${lb}')">${lb}</button>`;
-    }).join('');
-  }
-  $('sel-auto').className = (selectedLabel==='') ? 'active' : '';
-}
-async function pollSelect(){
-  try{
-    const s = await (await fetch('/api/state')).json();
-    // box 제외 + 중복 제거(여러 개 검출 시 라벨 1개만). 검출 자체는 백엔드 유지.
-    const seen = {};
-    const labels = [];
-    for(const o of (s.detected_objects||[])){
-      const lb = o.label||'';
-      if(!lb || lb==='box') continue;
-      if(seen[lb]) continue;
-      seen[lb] = 1; labels.push(lb);
+    const s=await(await fetch('/api/state')).json();
+    const ss=s.system_status||{};
+    $('status-dots').innerHTML=Object.entries(ss).map(([k,st])=>{
+      const sep=k==='USER'?'<span class="dot-sep"></span>':'';
+      return sep+`<span class="dot ${st}">${k}</span>`;
+    }).join(' ');
+    const stt=s.pick_place_state||'?';
+    $('activity').textContent=`상태: ${stt} · HW: ${HW[s.hw_state]||s.hw_state} · 속도: ${s.speed_mode===1?'감속':'정상'}`;
+    const err=(stt==='ERROR')?(s.error_text||'ERROR'):'';
+    $('banner').style.display=err?'block':'none';
+    $('banner').textContent=err?('🔴 '+err):'';
+    updateServoBtn(s.hw_state);
+    updateEStopBtn(s.hw_state);
+    if(s.has_image){
+      $('cam').src='/api/image.jpg?t='+Date.now();
+      $('cam').style.display='block'; $('cam-no').style.display='none';
+    }else{
+      $('cam').style.display='none'; $('cam-no').style.display='flex';
     }
-    renderSelectGrid(labels);
-  }catch(e){ /* poll() 가 연결 끊김 표시 처리 */ }
+    renderObjArea(s.detected_objects||[]);
+    const gc=s.gripper_current_ma;
+    const gp=s.gripper_position_raw;
+    if($('g_curr2'))$('g_curr2').textContent=gc;
+    if($('g_pos2'))$('g_pos2').textContent=gp;
+    gcPush(gc); gcDraw();
+    updateUs(s.ultrasonic_mm);
+    const mp=s.current_model_path||'';
+    if(mp&&$('model-path'))$('model-path').textContent=mp;
+  }catch(e){$('activity').textContent='연결 끊김: '+e;}
+  if(!settingsLoaded)loadSettings();
 }
-setInterval(pollSelect, 1200); pollSelect();
+setInterval(poll,200); poll();
 
-// ── 유저 주문 큐 ────────────────────────────────────────────────────────────
-const ST_CLS = {RUNNING:'run', PAUSED:'pause', QUEUED:'queued'};
-function statusKo(s){ return s==='RUNNING'?'처리중':(s==='PAUSED'?'보류':(s==='QUEUED'?'대기':s)); }
+// ── 공통 주문 헬퍼 ───────────────────────────────────────────────────────────
+const ST_CLS={RUNNING:'running',PAUSED:'pause',QUEUED:'queued',DONE:'done',FAILED:'failed',CANCELED:'canceled'};
+function statusKo(s){return{RUNNING:'처리중',PAUSED:'보류',QUEUED:'대기',DONE:'완료',FAILED:'실패',CANCELED:'취소'}[s]||s;}
 async function cancelOrder(id){
-  if(!confirm('이 주문을 취소할까요? (처리중 품목은 보호됩니다)')) return;
-  const r = await fetch('/api/orders/cancel', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({order_id:id})});
-  const j = await r.json();
-  if(!j.ok) alert('취소 실패: ' + (j.error||'처리중 품목 보호'));
-  pollOrders();
+  if(!confirm('주문 취소? (처리중 품목 보호)'))return;
+  const r=await fetch('/api/orders/cancel',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({order_id:id})});
+  const j=await r.json();
+  if(!j.ok)alert('취소 실패: '+(j.error||'처리중 품목 보호'));
+  pollOrders(); pollUser();
+}
+async function cancelItem(itemId){
+  if(!confirm('이 품목을 취소?'))return;
+  const r=await fetch('/api/orders/cancel_item',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({item_id:itemId})});
+  const j=await r.json();
+  if(!j.ok)alert('취소 실패: '+(j.error||''));
+  pollOrders(); pollUser();
 }
 async function toggleQueue(){
-  const r = await fetch('/api/orders/pause', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({})});
-  await r.json();
+  await fetch('/api/orders/pause',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
   pollOrders();
 }
+function renderOrderCard(o){
+  const cls=ST_CLS[o.status]||'queued';
+  const items=(o.items||[]).map(it=>{
+    const ic=ST_CLS[it.status]||'queued';
+    const cb=it.status==='QUEUED'?`<button class="item-cancel" onclick="cancelItem('${it.item_id||''}')">✕</button>`:'';
+    return `<div class="item-row"><span class="badge ${ic}">${it.class_name}</span>`+
+           `<span class="badge ${ic}" style="font-size:9px;">${statusKo(it.status)}</span>${cb}</div>`;
+  }).join('');
+  const isDone=o.status==='DONE'||o.status==='CANCELED'||o.status==='FAILED';
+  const lk=o.locker_id?`<span class="badge done" style="margin-left:6px;">🔒${o.locker_id}번</span>`:'';
+  // 수령대기(DONE)는 대리수령, 진행 중이면 취소.
+  const actBtn = o.status==='DONE' && o.qr_token
+    ? `<button class="item-cancel" style="margin-left:auto;background:#1a7a1a;" onclick="pickupLocker('${o.qr_token}')">수령</button>`
+    : (isDone?'':`<button class="item-cancel" style="margin-left:auto;" onclick="cancelOrder('${o.order_id}')">취소</button>`);
+  return `<div class="order ${cls}">`+
+    `<div style="display:flex;align-items:center;margin-bottom:4px;">`+
+    `<span class="tk">${o.ticket_no||o.order_id}</span>`+
+    `<span class="badge ${cls}" style="margin-left:6px;">${statusKo(o.status)}</span>`+
+    lk+actBtn+`</div>`+
+    `${items||'<small>품목 없음</small>'}`+
+    `<div style="margin-top:3px;"><small>${o.created_at||''}</small></div></div>`;
+}
+
+// ── 메인 탭: RUNNING 주문 하나만 표시 ─────────────────────────────────────────
 async function pollOrders(){
   try{
-    const d = await (await fetch('/api/orders')).json();
-    const pz = $('queue-paused');
-    if(d.error){ pz.innerHTML = '<span class="badge pause">'+d.error+'</span>'; }
-    else if(d.paused){ pz.innerHTML = '<span class="badge pause">큐 보류중</span>'; }
-    else { pz.innerHTML = '<span class="badge run">큐 동작중</span>'; }
-    const orders = d.orders||[];
-    $('orders').innerHTML = orders.map(o=>{
-      const cls = ST_CLS[o.status] || 'queued';
-      const items = (o.items||[]).map(it=>
-        `<span class="badge ${ST_CLS[it.status]||'queued'}">${it.class_name}</span>`).join(' ');
-      return `<div class="order ${cls}">`+
-             `<button class="cancel" onclick="cancelOrder('${o.order_id}')">취소</button>`+
-             `<span class="tk">${o.ticket_no||o.order_id}</span>`+
-             `<span class="badge ${cls}">${statusKo(o.status)}</span>`+
-             `<div class="items">${items||'<small>품목 없음</small>'}</div>`+
-             `<div><small>${o.created_at||''}</small></div></div>`;
-    }).join('') || '<small>대기 중인 주문 없음</small>';
-  }catch(e){ $('orders').innerHTML = '<small>주문 큐 로드 실패: '+e+'</small>'; }
+    const d=await(await fetch('/api/orders')).json();
+    const orders=d.orders||[];
+    const running=orders.filter(o=>o.status==='RUNNING');
+    const el=$('orders');
+    if(!el)return;
+    if(d.error){el.innerHTML=`<small>${d.error}</small>`;}
+    else if(running.length){el.innerHTML=running.map(o=>renderOrderCard(o)).join('');}
+    else{el.innerHTML='<small style="color:#666;">작업 중인 주문 없음</small>';}
+  }catch(e){const el=$('orders');if(el)el.innerHTML='<small>큐 로드 실패: '+e+'</small>';}
 }
-setInterval(pollOrders, 1500); pollOrders();
+setInterval(pollOrders,1500); pollOrders();
+
+// ── 락커 현황 ───────────────────────────────────────────────────────────────
+const LK_KO={free:'비어있음',occupied:'배달중',ready:'수령대기'};
+async function releaseLocker(id){
+  if(!confirm(id+'번 락커를 강제 해제할까요?'))return;
+  await fetch('/api/lockers/release',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
+  pollLockers(); pollOrders();
+}
+async function pickupLocker(token){
+  if(!confirm('대리 수령 처리할까요? (락커 해제)'))return;
+  const j=await(await fetch('/api/lockers/pickup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token})})).json();
+  if(!j.ok)alert('수령 처리 실패: '+(j.error||(j.detail&&j.detail.status)||'아직 준비 안 됨'));
+  pollLockers(); pollOrders();
+}
+async function resetLockers(){
+  if(!confirm('모든 락커를 초기화할까요?'))return;
+  await fetch('/api/lockers/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+  pollLockers(); pollOrders();
+}
+async function pollLockers(){
+  try{
+    const d=await(await fetch('/api/lockers')).json();
+    const el=$('lockers'); if(!el)return;
+    el.innerHTML=(d.lockers||[]).map(l=>{
+      const st=l.status||'free', tk=l.ticket_no?(' '+l.ticket_no):'';
+      // 수령 번호(qr_token) — 점유 칸만. 관리자 확인/대리수령용.
+      const code=(st!=='free'&&l.qr_token)?`<div class="lkcode">🔑 ${l.qr_token}</div>`:'';
+      let b=''; if(st==='ready')b+=`<button onclick="pickupLocker('${l.qr_token}')">수령처리</button>`;
+      if(st!=='free')b+=`<button onclick="releaseLocker(${l.id})">해제</button>`;
+      return `<div class="lk ${st}"><div class="lkid">#${l.id}</div><div>${LK_KO[st]||st}${tk}</div>${code}${b}</div>`;
+    }).join('')||'<small>락커 없음</small>';
+  }catch(e){const el=$('lockers');if(el)el.innerHTML='<small>락커 로드 실패: '+e+'</small>';}
+}
+setInterval(pollLockers,1500); pollLockers();
+
+// ── 유저 큐 탭 전체 관리 ─────────────────────────────────────────────────────
+async function pollUser(){
+  const showAll=$('show-history')&&$('show-history').checked;
+  try{
+    const d=await(await fetch('/api/orders'+(showAll?'?all=1':''))).json();
+    const pb=$('user-q-badge');
+    if(pb){
+      if(d.error)pb.innerHTML=`<span class="badge failed">${d.error}</span>`;
+      else if(d.paused)pb.innerHTML='<span class="badge pause">⏸ 큐 보류중</span>';
+      else pb.innerHTML='<span class="badge run">▶ 동작중</span>';
+    }
+    const pBtn=$('user-pause-btn');
+    if(pBtn)pBtn.textContent=d.paused?'▶ 큐 재개':'⏸ 큐 보류';
+    const orders=d.orders||[];
+    const cnt={RUNNING:0,QUEUED:0,PAUSED:0,DONE:0,FAILED:0,CANCELED:0};
+    orders.forEach(o=>{if(cnt[o.status]!==undefined)cnt[o.status]++;});
+    const stats=$('user-stats');
+    if(stats)stats.innerHTML=['RUNNING','QUEUED','PAUSED','DONE','FAILED','CANCELED'].map(k=>{
+      const ko={RUNNING:'처리중',QUEUED:'대기',PAUSED:'보류',DONE:'완료',FAILED:'실패',CANCELED:'취소'}[k];
+      return `<div class="stat-box"><div class="sval">${cnt[k]}</div><div class="slbl">${ko}</div></div>`;
+    }).join('');
+    const uo=$('user-orders');
+    if(uo)uo.innerHTML=orders.length?orders.map(o=>renderOrderCard(o)).join(''):'<small>주문 없음</small>';
+  }catch(e){const uo=$('user-orders');if(uo)uo.innerHTML='<small>로드 실패: '+e+'</small>';}
+}
+
+// ── 로그 탭 ──────────────────────────────────────────────────────────────────
+let logFilter='all';
+function setLogFilter(f){
+  logFilter=f;
+  ['all','cmd','err','war'].forEach(k=>{
+    const b=$('lf-'+k);
+    if(b)b.className=k===f?'active-sel':'';
+  });
+  pollLog();
+}
+(function(){const h=location.hash.replace('#','');if(h&&['main','user','gripper','log'].includes(h))showTab(h);})();
+
+async function pollLog(){
+  try{
+    const data=await(await fetch('/api/log')).json();
+    const list=$('loglist');
+    if(!list)return;
+    const filtered=logFilter==='all'?data:data.filter(e=>e.type===logFilter);
+    if(!filtered.length){list.innerHTML='<small>로그 없음</small>';return;}
+    list.innerHTML=filtered.map(e=>{
+      const isUser=e.source&&e.source.includes('유저');
+      const userCls=isUser?' user-src':'';
+      const typeBadge=`<span class="log-badge ${e.type}">${e.type.toUpperCase()}</span>`;
+      const stBadge=e.status?`<span class="log-badge ${e.status.toLowerCase()}">${e.status}</span>`:'';
+      const done=e.done_ts_str?` → ${e.done_ts_str}`:'';
+      return `<div class="log-entry ${e.type}${userCls}">`+
+        `<div class="log-row1"><span>${e.ts_str}${done}</span>`+
+        `<span style="color:${isUser?'#999':'#ccc'}">${e.source}</span></div>`+
+        `<div class="log-row2">${typeBadge} ${stBadge} ${e.text}${e.detail?` <small>· ${e.detail}</small>`:''}</div>`+
+        `</div>`;
+    }).join('');
+  }catch(e){const l=$('loglist');if(l)l.innerHTML='<small>로그 로드 실패: '+e+'</small>';}
+}
 </script>
 </body>
 </html>
