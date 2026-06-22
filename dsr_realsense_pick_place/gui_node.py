@@ -387,7 +387,6 @@ class PickPlaceGuiNode(Node):
 
         _add(self._repo_root())
         _add(Path.cwd())
-        _add(Path.cwd() / 'mini_project')
 
         # 설치본(install/share) 경로 — colcon build 후 ros2 launch로 실행하면
         # __file__이 site-packages라 소스 트리를 못 찾는다. ament share 디렉터리를 직접 추가해
@@ -401,7 +400,6 @@ class PickPlaceGuiNode(Node):
         for parent in Path(__file__).resolve().parents:
             _add(parent)
             _add(parent / 'src')
-            _add(parent / 'src' / 'mini_project')
 
         return roots
 
@@ -785,9 +783,9 @@ class PickPlaceGuiNode(Node):
         self._error_log.append((self._error_seq, time.strftime('%H:%M:%S'), msg.data))
 
     def _cb_ultrasonic(self, msg: Range):
-        if msg.range is not None and msg.range > 0.0:
-            self.ultrasonic_range_m = float(msg.range)
+        if msg.range is not None:
             self.last_ultrasonic_time = time.monotonic()
+            self.ultrasonic_range_m = float(msg.range)
 
     def _cb_gripper_service_state(self, msg: GripperState):
         self.gripper_hw_ready = msg.ready
@@ -3371,7 +3369,7 @@ class PickPlaceGui(QWidget):
         )
         if us_fresh and self.ros_node.ultrasonic_range_m is not None:
             self.ultrasonic_status_label.setText(
-                f'초음파 거리: {self.ros_node.ultrasonic_range_m * 1000:.0f} mm')
+                f'초음파 거리: {self.ros_node.ultrasonic_range_m * 1000:.1f} mm')
         else:
             self.ultrasonic_status_label.setText('초음파 거리: -- mm')
 

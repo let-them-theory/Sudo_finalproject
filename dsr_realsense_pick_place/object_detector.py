@@ -42,7 +42,7 @@ import cv2
 import pyrealsense2 as rs
 
 from sensor_msgs.msg import Image, CameraInfo
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Vector3Stamped
 from std_msgs.msg import Bool, Int32, String
 from cv_bridge import CvBridge, CvBridgeError
 import message_filters
@@ -821,12 +821,10 @@ class ObjectDetectorNode(Node):
 
         _add(self._repo_root())
         _add(Path.cwd())
-        _add(Path.cwd() / 'mini_project')
 
         for parent in Path(__file__).resolve().parents:
             _add(parent)
             _add(parent / 'src')
-            _add(parent / 'src' / 'mini_project')
 
         return roots
 
@@ -921,65 +919,42 @@ class ObjectDetectorNode(Node):
             self.get_logger().warn(f'FastSAM 로드 실패 — unknown 검출 비활성화: {e}')
             return False
 
-    def _roi_rect(self, frame_w: int, frame_h: int) -> tuple:
-        """unknown 검출 ROI 사각형 (x1,y1,x2,y2). realsense_fastsam_segment.py와 동일 로직."""
-        cx = frame_w // 2 + self.unknown_roi_shift_x
-        cy = frame_h // 2 + self.unknown_roi_shift_y
-        x1 = max(0, cx - self.unknown_roi_w // 2)
-        y1 = max(0, cy - self.unknown_roi_h // 2)
-        x2 = min(frame_w, x1 + self.unknown_roi_w)
-        y2 = min(frame_h, y1 + self.unknown_roi_h)
+    def _roi_rect_for(self, prefix: str, frame_w: int, frame_h: int) -> tuple:
+        """{prefix}_shift_x/y, {prefix}_w/h 파라미터로 ROI 사각형 (x1,y1,x2,y2) 계산.
+
+        중심 = 프레임 중앙 + shift, 크기 = (w,h), 프레임 경계로 clamp.
+        unknown_roi / box_roi / box_roi2~5 가 모두 동일 로직이라 prefix로 통합.
+        """
+        shift_x = getattr(self, f'{prefix}_shift_x')
+        shift_y = getattr(self, f'{prefix}_shift_y')
+        w = getattr(self, f'{prefix}_w')
+        h = getattr(self, f'{prefix}_h')
+        cx = frame_w // 2 + shift_x
+        cy = frame_h // 2 + shift_y
+        x1 = max(0, cx - w // 2)
+        y1 = max(0, cy - h // 2)
+        x2 = min(frame_w, x1 + w)
+        y2 = min(frame_h, y1 + h)
         return x1, y1, x2, y2
+
+    def _roi_rect(self, frame_w: int, frame_h: int) -> tuple:
+        """unknown 검출 ROI 사각형 (x1,y1,x2,y2)."""
+        return self._roi_rect_for('unknown_roi', frame_w, frame_h)
 
     def _box_roi_rect(self, frame_w: int, frame_h: int) -> tuple:
-        """박스 위치 ROI 사각형 (x1,y1,x2,y2). unknown_roi와 동일 로직, 박스용 파라미터 사용."""
-        cx = frame_w // 2 + self.box_roi_shift_x
-        cy = frame_h // 2 + self.box_roi_shift_y
-        x1 = max(0, cx - self.box_roi_w // 2)
-        y1 = max(0, cy - self.box_roi_h // 2)
-        x2 = min(frame_w, x1 + self.box_roi_w)
-        y2 = min(frame_h, y1 + self.box_roi_h)
-        return x1, y1, x2, y2
+        return self._roi_rect_for('box_roi', frame_w, frame_h)
 
     def _box_roi2_rect(self, frame_w: int, frame_h: int) -> tuple:
-        """박스 위치 ROI 2 사각형 (x1,y1,x2,y2). 동일 로직, box_roi2 파라미터 사용."""
-        cx = frame_w // 2 + self.box_roi2_shift_x
-        cy = frame_h // 2 + self.box_roi2_shift_y
-        x1 = max(0, cx - self.box_roi2_w // 2)
-        y1 = max(0, cy - self.box_roi2_h // 2)
-        x2 = min(frame_w, x1 + self.box_roi2_w)
-        y2 = min(frame_h, y1 + self.box_roi2_h)
-        return x1, y1, x2, y2
+        return self._roi_rect_for('box_roi2', frame_w, frame_h)
 
     def _box_roi3_rect(self, frame_w: int, frame_h: int) -> tuple:
-        """박스 위치 ROI 3 사각형 (x1,y1,x2,y2). 동일 로직, box_roi3 파라미터 사용."""
-        cx = frame_w // 2 + self.box_roi3_shift_x
-        cy = frame_h // 2 + self.box_roi3_shift_y
-        x1 = max(0, cx - self.box_roi3_w // 2)
-        y1 = max(0, cy - self.box_roi3_h // 2)
-        x2 = min(frame_w, x1 + self.box_roi3_w)
-        y2 = min(frame_h, y1 + self.box_roi3_h)
-        return x1, y1, x2, y2
+        return self._roi_rect_for('box_roi3', frame_w, frame_h)
 
     def _box_roi4_rect(self, frame_w: int, frame_h: int) -> tuple:
-        """박스 위치 ROI 4 사각형 (x1,y1,x2,y2). 동일 로직, box_roi4 파라미터 사용."""
-        cx = frame_w // 2 + self.box_roi4_shift_x
-        cy = frame_h // 2 + self.box_roi4_shift_y
-        x1 = max(0, cx - self.box_roi4_w // 2)
-        y1 = max(0, cy - self.box_roi4_h // 2)
-        x2 = min(frame_w, x1 + self.box_roi4_w)
-        y2 = min(frame_h, y1 + self.box_roi4_h)
-        return x1, y1, x2, y2
+        return self._roi_rect_for('box_roi4', frame_w, frame_h)
 
     def _box_roi5_rect(self, frame_w: int, frame_h: int) -> tuple:
-        """박스 위치 ROI 5 사각형 (x1,y1,x2,y2). 동일 로직, box_roi5 파라미터 사용."""
-        cx = frame_w // 2 + self.box_roi5_shift_x
-        cy = frame_h // 2 + self.box_roi5_shift_y
-        x1 = max(0, cx - self.box_roi5_w // 2)
-        y1 = max(0, cy - self.box_roi5_h // 2)
-        x2 = min(frame_w, x1 + self.box_roi5_w)
-        y2 = min(frame_h, y1 + self.box_roi5_h)
-        return x1, y1, x2, y2
+        return self._roi_rect_for('box_roi5', frame_w, frame_h)
 
     def _rebuild_sort_class_zone_map(self, names: list, zones: list):
         """클래스명 → box_roi 구역 번호(1~5) 맵 재구성."""
@@ -1510,8 +1485,8 @@ class ObjectDetectorNode(Node):
             yaw_deg = None
             if self.use_object_yaw_for_grasp:
                 yaw_deg = self._estimate_object_yaw_deg(depth_img, u, v, w, h, depth_m)
-                if yaw_deg is not None and self.use_manual_absolute_origin:
-                    self._set_pose_yaw_deg(pose_abs, yaw_deg)
+                if yaw_deg is not None:
+                    self._apply_object_yaw_to_pose(pose_abs, yaw_deg)
             pos = pose_abs.pose.position
 
             candidates.append({
@@ -1532,6 +1507,8 @@ class ObjectDetectorNode(Node):
             unknown_draw.append((seg, uid, cidx))
 
         # ── 시각화 합성 (realsense_fastsam_segment.py 스타일) ──
+        # 마스크 색칠 오버레이·윤곽선·객체 라벨은 그대로 표시한다. 객체별 장축선(yaw axis,
+        # _draw_yaw_axis_roi)만 프레임 드랍 완화를 위해 그리지 않는다.
         vis = (color_img.astype(np.float32) * 0.35).astype(np.uint8)
         roi_base = color_img[ry1:ry2, rx1:rx2].copy()
         roi_overlay = roi_base.copy()
@@ -1903,8 +1880,8 @@ class ObjectDetectorNode(Node):
             yaw_deg = None
             if self.use_object_yaw_for_grasp:
                 yaw_deg = self._estimate_object_yaw_deg(depth_img, u, v, w, h, depth_m)
-                if yaw_deg is not None and self.use_manual_absolute_origin:
-                    self._set_pose_yaw_deg(pose_abs, yaw_deg)
+                if yaw_deg is not None:
+                    self._apply_object_yaw_to_pose(pose_abs, yaw_deg)
 
             pos = pose_abs.pose.position
 
@@ -2158,6 +2135,47 @@ class ObjectDetectorNode(Node):
         proj_y = -axis_u
         yaw_deg = math.degrees(math.atan2(proj_y, proj_x))
         return self._normalize_grasp_yaw_deg(yaw_deg)
+
+    def _apply_object_yaw_to_pose(self, pose_abs: PoseStamped, yaw_cam_deg: float) -> bool:
+        """PCA yaw(카메라 이미지 평면) → base_link Z 회전으로 변환해 pose에 기록."""
+        yaw_rad = math.radians(float(yaw_cam_deg))
+        # project camera XY → optical XY (x_opt=-x_proj, y_opt=y_proj)
+        ox = -math.cos(yaw_rad)
+        oy = math.sin(yaw_rad)
+
+        vs = Vector3Stamped()
+        vs.header.frame_id = self.camera_frame
+        vs.header.stamp = pose_abs.header.stamp
+        vs.vector.x = ox
+        vs.vector.y = oy
+        vs.vector.z = 0.0
+
+        try:
+            vs_base = self.tf_buffer.transform(
+                vs,
+                self.robot_base_frame,
+                timeout=rclpy.duration.Duration(seconds=0.1),
+            )
+        except Exception as e:
+            self.get_logger().warn(
+                f'물체 yaw TF 변환 실패 — 카메라 yaw 그대로 적용: {e}',
+                throttle_duration_sec=5.0,
+            )
+            self._set_pose_yaw_deg(pose_abs, yaw_cam_deg)
+            return False
+
+        bx = float(vs_base.vector.x)
+        by = float(vs_base.vector.y)
+        if math.hypot(bx, by) < 1e-6:
+            return False
+
+        yaw_base = self._normalize_grasp_yaw_deg(math.degrees(math.atan2(by, bx)))
+        self._set_pose_yaw_deg(pose_abs, yaw_base)
+        self.get_logger().info(
+            f'[yaw] cam={yaw_cam_deg:+.1f}° → base={yaw_base:+.1f}° ({self.yaw_axis_reference})',
+            throttle_duration_sec=2.0,
+        )
+        return True
 
     def _normalize_grasp_yaw_deg(self, yaw_deg: float) -> float:
         """그리퍼 180도 대칭을 고려해 yaw를 [-90, 90) 범위로 접는다."""

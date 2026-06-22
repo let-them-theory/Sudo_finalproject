@@ -137,25 +137,31 @@ class PickPlaceNode(Node):
         # _move_to_cart에서 강제 클램프한다. 검출 오차·잘못된 place 좌표 등 경로와 무관하게 작동.
         # 기본 0.0 = base_link 평면(현재 동작과 동일). 실제 테이블/안전 높이를 알면 그 값으로 올린다.
         self.declare_parameter('min_safe_z',                  0.0)
-        self.declare_parameter('gripper_close_len',           0.145)  # RH-P12-RN close 시 flange→손끝(m). min_safe_z를 flange로 환산.
+        self.declare_parameter('gripper_close_len',           0.132)  # RH-P12-RN close 시 flange→손끝(m, 실측). min_safe_z를 flange로 환산.
         self.declare_parameter('robot_base_frame',            'base_link')
         self.declare_parameter('target_pose_topic',           '/selected_object_pose')
         self.declare_parameter('selected_object_topic',       '/selected_object_label')
         self.declare_parameter('use_target_pose_yaw',         True)
         self.declare_parameter('grasp_yaw_offset_deg',        0.0)
-        self.declare_parameter('max_grip_pos',                700)
+        self.declare_parameter('max_grip_pos',                735)
         # grasp_min_pos: LIFT 후 파지 판정 하한. 이하면 close 명령이 안 먹어 그리퍼가
         # 거의 열린 상태(안 닫힘) → 파지 실패. (max_grip_pos 초과 = 빈손 완전닫힘)
         self.declare_parameter('grasp_min_pos',               50)
         # 초음파 파지 — false(기본)이면 카메라 Z로 바로 하강, true이면 HC-SR04 거리 기반 스텝 하강
         self.declare_parameter('use_ultrasonic_grasp',        False)
-        self.declare_parameter('grasp_distance_m',            0.07)
+        self.declare_parameter('ultrasonic_grasp_priority',   True)
+        self.declare_parameter('grasp_distance_m',            0.04)
         self.declare_parameter('ultrasonic_step_m',           0.01)
         self.declare_parameter('ultrasonic_settle_sec',       0.15)
         self.declare_parameter('ultrasonic_range_topic',      '/ultrasonic_range')
         self.declare_parameter('ultrasonic_max_age_sec',      1.0)
+        self.declare_parameter('ultrasonic_floor_wait_sec',   4.0)
         # 비동기 연속 하강 속도(mm/s). 느릴수록 move_stop overshoot↓.
         self.declare_parameter('ultrasonic_descend_vel_mmps', 25.0)
+        # 초음파 파지 시 하강 안전바닥(m, base 기준). 카메라 z가 노이즈로 튀므로(0.01~0.44 관측)
+        # 초음파 우선 모드에선 카메라 z를 안 믿고 이 고정 바닥까지 내려가며 초음파가 grasp_distance에서
+        # 멈춘다. min_safe_z(손끝 절대 하한)가 최종 안전망. 비초음파 폴백은 카메라 z를 그대로 쓴다.
+        self.declare_parameter('ultrasonic_descend_floor_z',  0.03)
         # 낙하 감지 debounce: 연속 N프레임 조건 지속 시에만 낙하 판정 (위치 기반: pos>max_grip_pos)
         self.declare_parameter('object_lost_debounce_frames',  5)
         # 물체별 파지 전류(강도) — 클래스명↔전류 1:1 매핑 + 미인식 기본값 + clamp 범위
@@ -247,12 +253,18 @@ class PickPlaceNode(Node):
         self.max_grip_pos_mm = float(self.max_grip_pos)
         self.grasp_min_pos = self.get_parameter('grasp_min_pos').value
         self.use_ultrasonic_grasp  = bool(self.get_parameter('use_ultrasonic_grasp').value)
+        self.ultrasonic_grasp_priority = bool(
+            self.get_parameter('ultrasonic_grasp_priority').value)
         self.grasp_distance_m      = float(self.get_parameter('grasp_distance_m').value)
         self.ultrasonic_step_m     = float(self.get_parameter('ultrasonic_step_m').value)
         self.ultrasonic_settle_sec = float(self.get_parameter('ultrasonic_settle_sec').value)
         self.ultrasonic_max_age_sec = float(self.get_parameter('ultrasonic_max_age_sec').value)
+        self.ultrasonic_floor_wait_sec = float(
+            self.get_parameter('ultrasonic_floor_wait_sec').value)
         self.ultrasonic_descend_vel = float(
             self.get_parameter('ultrasonic_descend_vel_mmps').value)
+        self.ultrasonic_descend_floor_z = float(
+            self.get_parameter('ultrasonic_descend_floor_z').value)
         self._latest_range_m: float | None = None
         self._latest_range_t: float = 0.0
         self.object_lost_debounce_frames = self.get_parameter(
@@ -894,18 +906,16 @@ class PickPlaceNode(Node):
         use_movej_transit = self._place_use_joints_for_zone(zone_idx)
         transit_waypoints = self._place_transit_waypoints_for_zone(zone_idx)
 
-        # ① pick 위치 접근 상승 — 구역별 approach_dz>0 일 때만 (zone1/2=0 → LIFT 높이 유지)
-        if (approach_dz > 1e-4 and self.place_horizontal_transit
-                and current_z < approach_z - 1e-4):
+        # ① 수평 이동 전 항상 안전 높이까지 먼저 수직 상승 — "z상승 → 수평 이동" 순서 보장.
+        # transit 높이 = LIFT 높이(current_z)와 place 접근 높이(approach_z) 중 높은 쪽.
+        # place 높이가 LIFT보다 높은 구역(박스 등)에서 낮게 수평 이동하다 다른 물체와 부딪히던
+        # 문제를 막는다(approach_dz=0 이어도 place z가 LIFT보다 높으면 그 높이까지 먼저 올린다).
+        transit_z = max(current_z, approach_z)
+        if self.place_horizontal_transit and current_z < transit_z - 1e-4:
             self.get_logger().info(
-                f'Place 접근 — 접근 높이 상승 z={current_z:.3f}→{approach_z:.3f}')
-            self._move_to_cart(current_x, current_y, approach_z, grasp_rpy)
-            current_z = approach_z
-        elif approach_dz <= 1e-4 and self.place_horizontal_transit:
-            self.get_logger().info(
-                f'Place 접근 — LIFT 높이 유지 z={current_z:.3f} (구역 접근상승=0)')
-
-        transit_z = current_z if approach_dz <= 1e-4 else max(current_z, approach_z)
+                f'Place 접근 — 수평 이동 전 상승 z={current_z:.3f}→{transit_z:.3f}')
+            self._move_to_cart(current_x, current_y, transit_z, grasp_rpy)
+            current_z = transit_z
 
         def _needs_move(tx, ty, tz):
             return (abs(current_x - tx) > 1e-4 or abs(current_y - ty) > 1e-4
@@ -1243,16 +1253,23 @@ class PickPlaceNode(Node):
                     z_surface = (self._target_z_surface
                                  if self._target_z_surface is not None
                                  else pose.pose.position.z)
-                    z_floor = z_surface + self.pick_dz  # 초음파 안전바닥 = 카메라 원본 Z 기준
 
                     if not self.use_ultrasonic_grasp:
                         # 기본: 카메라 z 좌표로 바로 하강
+                        z_floor = z_surface + self.pick_dz
                         self.get_logger().info('Pick 위치로 하강 (카메라 z)')
                         self._move_to_cart(x, y, z_floor, rpy, vel=50.0, acc=100.0)
                     else:
-                        # 초음파: 비동기 연속 하강 + 병렬 감시 → grasp_distance 시 정지·파지
-                        self._ultrasonic_descend(
-                            x, y, pose.pose.position.z + self.pre_pick_dz, z_floor, rpy)
+                        # 초음파 우선: 노이즈 큰 카메라 z 대신 고정 안전바닥까지 하강 → 초음파가 멈춤
+                        z_floor = self.ultrasonic_descend_floor_z
+                        if not self._ultrasonic_descend(
+                                x, y, pose.pose.position.z + self.pre_pick_dz, z_floor, rpy):
+                            self._log_failure(
+                                'PICK',
+                                f'초음파 {self.grasp_distance_m * 1000:.0f}mm 미감지 — 파지 중단',
+                                obj=self._target_object_class, dest=self._dest_str())
+                            self._set_state(State.HOME)
+                            continue
 
                     self._gripper_close()
                     self._set_state(State.LIFT)
@@ -1534,12 +1551,27 @@ class PickPlaceNode(Node):
 
             # ── 4. PICK ───────────────────────────────────────────────────
             self._set_state(State.PICK)
-            z_floor = pz_obj + self.pick_dz
             if not self.use_ultrasonic_grasp:
+                # 비초음파 폴백: 카메라 원본 Z(_target_z_surface) 기준 하강. 클램프된 pz_obj가
+                # 아니라 원본을 써야 실제 물체(낮은 z)까지 내려간다(FSM PICK과 동일).
+                z_surface = (self._target_z_surface
+                             if self._target_z_surface is not None else pz_obj)
+                z_floor = z_surface + self.pick_dz
                 self._move_to_cart(px_obj, py_obj, z_floor, rpy, vel=50.0, acc=100.0)
-            else:
-                self._ultrasonic_descend(
-                    px_obj, py_obj, pz_obj + self.pre_pick_dz, z_floor, rpy)
+            elif not self._ultrasonic_descend(
+                    px_obj, py_obj, pz_obj + self.pre_pick_dz,
+                    self.ultrasonic_descend_floor_z, rpy):
+                self._log_failure(
+                    'PICK(sort)',
+                    f'초음파 {self.grasp_distance_m * 1000:.0f}mm 미감지 — 파지 중단',
+                    obj=object_class,
+                    dest=f'box_roi{(place_zone_idx or 0) + 1}'
+                    if place_zone_idx is not None else '')
+                with self.state_lock:
+                    self.pick_requested = False
+                self._set_state(State.HOME)
+                self._go_home()
+                continue
             self._gripper_close()
 
             # ── 5. LIFT ───────────────────────────────────────────────────
@@ -1647,12 +1679,18 @@ class PickPlaceNode(Node):
         if busy:
             res.success = False
             res.message = '현재 작업 중이어서 1회 실행을 시작할 수 없습니다.'
+            self.get_logger().warn(
+                f'run_once 거절(작업 중): state={self.state.name}, '
+                f'pending={self.pending_command}')
             return res
         # Fix C — 그리퍼 미준비 시 거절. 에러 해제 직후 reinit 중 PRE_PICK gripper/open이
         # 들어가 TCP race가 발생하던 시나리오(로그 45) 차단.
         if not self._gripper_ready:
             res.success = False
             res.message = '그리퍼 준비 미완료(reinit 중일 수 있음). 잠시 후 다시 시도하세요.'
+            self.get_logger().warn(
+                'run_once 거절: 그리퍼 미준비(_gripper_ready=False). '
+                '/gripper_service/state 의 ready=True 수신 여부를 확인하세요.')
             return res
         if not self._enqueue_command('run_once'):
             res.success = False
@@ -1676,10 +1714,16 @@ class PickPlaceNode(Node):
         if busy:
             res.success = False
             res.message = '현재 작업 중이어서 1회 실행을 시작할 수 없습니다.'
+            self.get_logger().warn(
+                f'run_once_package 거절(작업 중): state={self.state.name}, '
+                f'pending={self.pending_command}')
             return res
         if not self._gripper_ready:
             res.success = False
             res.message = '그리퍼 준비 미완료(reinit 중일 수 있음). 잠시 후 다시 시도하세요.'
+            self.get_logger().warn(
+                'run_once_package 거절: 그리퍼 미준비(_gripper_ready=False). '
+                '/gripper_service/state 의 ready=True 수신 여부를 확인하세요.')
             return res
         if not self._enqueue_command('run_once_package'):
             res.success = False
@@ -2403,45 +2447,68 @@ class PickPlaceNode(Node):
         self._call_service(self.cli_movel, req,
                            f'movel_async({x:.3f},{y:.3f},{z:.3f})', timeout=30.0)
 
-    def _ultrasonic_descend(self, x, y, z_start, z_floor, rpy):
-        """비동기 연속 하강 + 초음파 병렬 감시. grasp_distance 도달 시 move_stop(SSTOP)으로
-        그 자리에서 멈춰 파지. 못 만나면 z_floor(안전바닥)까지 내려가 파지.
-        끊김 없이 내려가며 실시간 초음파 반영 — 동기 step 방식보다 빠르고 정확."""
+    def _ultrasonic_descend(self, x, y, z_start, z_floor, rpy) -> bool:
+        """비동기 하강 + 초음파 감시. grasp_distance 이하일 때만 True(파지 허용).
+
+        ultrasonic_grasp_priority=True(기본): z_floor는 하강 한계만, 카메라 높이 폴백 파지 없음.
+        False(구동작): z_floor 도달 시 초음파 없어도 True 반환."""
         vel = self.ultrasonic_descend_vel
         dist_mm = max(1.0, (z_start - z_floor) * 1000.0)
-        expected = dist_mm / max(1.0, vel) + 2.0   # 도착 추정시간 + 여유(가감속/지연)
+        expected = dist_mm / max(1.0, vel) + 2.0
+        thresh_mm = self.grasp_distance_m * 1000.0
         self.get_logger().info(
-            f'Pick 비동기 하강 시작 (vel={vel:.0f}mm/s, z {z_start:.3f}→{z_floor:.3f}, '
-            f'초음파 {self.grasp_distance_m*1000:.0f}mm 시 정지)')
+            f'Pick 초음파 하강 (vel={vel:.0f}mm/s, z {z_start:.3f}→{z_floor:.3f}, '
+            f'임계 {thresh_mm:.0f}mm, 우선={self.ultrasonic_grasp_priority})')
         self._move_to_cart_async(x, y, z_floor, rpy, vel=vel, acc=self.cacc)
         t0 = time.monotonic()
+        at_floor = False
+        floor_t0 = 0.0
         try:
             while rclpy.ok() and self.state == State.PICK:
                 if self._stop_event.is_set():
-                    self._hw_move_stop(stop_mode=2)   # cancel/estop → 정지 후 인터럽트
+                    self._hw_move_stop(stop_mode=2)
                     raise _MotionInterrupt(self._stop_mode)
+
                 rng = self._fresh_range()
                 if rng is not None:
-                    self.get_logger().info(f'초음파 거리: {rng*1000:.0f}mm',
-                                           throttle_duration_sec=0.3)
+                    self.get_logger().info(
+                        f'초음파 거리: {rng * 1000:.0f}mm',
+                        throttle_duration_sec=0.3)
                     if rng <= self.grasp_distance_m:
                         self.get_logger().info(
-                            f'초음파 {rng*1000:.0f}mm ≤ {self.grasp_distance_m*1000:.0f}mm '
-                            f'→ SSTOP 정지·파지')
+                            f'초음파 {rng * 1000:.0f}mm ≤ {thresh_mm:.0f}mm → 정지·파지')
                         self._hw_move_stop(stop_mode=2)
                         time.sleep(self.ultrasonic_settle_sec)
                         self._set_motion_active(False)
-                        # 하강 중 알람(도달불가 등) → _Unreachable 라우팅, close 전 차단(status3 방어)
                         self._check_motion_alarm('ultrasonic_descend')
-                        return
-                if time.monotonic() - t0 > expected:
-                    self.get_logger().warn('안전바닥(z_floor) 도달 추정 — 여기서 파지')
+                        return True
+
+                now = time.monotonic()
+                if not at_floor and now - t0 > expected:
+                    at_floor = True
+                    floor_t0 = now
+                    self._hw_move_stop(stop_mode=2)
                     self._set_motion_active(False)
                     self._check_motion_alarm('ultrasonic_descend')
-                    return
+                    if self.ultrasonic_grasp_priority:
+                        self.get_logger().warn(
+                            f'안전바닥 도달 — 초음파 {thresh_mm:.0f}mm 대기 중 '
+                            f'({self.ultrasonic_floor_wait_sec:.0f}s)')
+                    else:
+                        self.get_logger().warn('안전바닥 도달 — 카메라 Z 폴백 파지')
+                        return True
+
+                if at_floor and self.ultrasonic_grasp_priority:
+                    if now - floor_t0 > self.ultrasonic_floor_wait_sec:
+                        self.get_logger().warn(
+                            f'초음파 우선: {thresh_mm:.0f}mm 미감지 — 파지 안 함')
+                        return False
+
                 time.sleep(0.02)
         finally:
             self._set_motion_active(False)
+
+        return False
 
     def _grasp_rpy_for_pose(self, pose: PoseStamped):
         rpy = [float(v) for v in self.grasp_rpy]
