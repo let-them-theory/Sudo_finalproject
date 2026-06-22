@@ -132,14 +132,18 @@ fi
 
 # ── 3. 정리 검증 ───────────────────────────────────────────────────────────
 echo "[start_all] [3/4] 정리 검증..."
-# ros2_control이 graceful 25s 후에도 살아있으면 DRCF close hang → SIGKILL 강행(제어권 wedge 가능).
+# ros2_control은 SIGINT로만 graceful 종료(소멸자 Drfl.close_connection이 DRCF authority 반납).
+# SIGKILL하면 제어권 wedge → 다음 launch 거부. graceful 미완이면 SIGINT 재시도(KILL 금지).
 if pgrep -f "ros2_control_node" >/dev/null 2>&1; then
-    echo "[start_all]   ⚠ ros2_control graceful 미완(DRCF hang) — SIGKILL 강행. 제어권 안 잡히면 로봇 재부팅 필요."
-    pkill -KILL -f "ros2_control_node" 2>/dev/null || true
-    sleep 2
+    echo "[start_all]   ⚠ ros2_control 잔존 — SIGINT 재시도(제어권 반납 위해 SIGKILL 안 함)..."
+    pkill -INT -f "ros2_control_node" 2>/dev/null || true
+    for _i in $(seq 1 15); do pgrep -f "ros2_control_node" >/dev/null 2>&1 || break; sleep 1; done
+    pgrep -f "ros2_control_node" >/dev/null 2>&1 && \
+        echo "[start_all]   ❌ ros2_control graceful 실패 — 제어권 꼬임 위험. 수동 확인 후 재시도." && exit 1
 fi
+# ros2_control 외 잔재만 SIGKILL (ros2_control은 위에서 SIGINT 처리, 절대 KILL 안 함).
 if report_busy; then
-    echo "[start_all]   ⚠ 잔재 남음 — SIGKILL 강제 정리..."
+    echo "[start_all]   ⚠ 잔재 남음 — SIGKILL 강제 정리(ros2_control 제외)..."
     pkill -KILL -f "pick_place_node|web_control_node|object_detector|gripper_service|gripper_node|rh_p12_rna|realsense2|ultrasonic|web_kiosk/backend/main.py|ros2 launch dsr_realsense" 2>/dev/null || true
     free_port "$WEB_PORT"; free_port "$KIOSK_PORT"
     sleep 2
@@ -178,9 +182,7 @@ wait_listen "$WEB_PORT" 40 \
     || echo "[start_all]   ⚠ 관리자 포트 $WEB_PORT 미응답 — launch 로그 확인 (로봇 이더넷?)"
 if wait_listen "$KIOSK_PORT" 20; then
     echo "[start_all]   ✅ 유저 키오스크: http://localhost:$KIOSK_PORT"
-    # 관리자 패널(8000/admin) 창 자동 오픈 — 키오스크 백엔드(8000)가 서빙.
-    echo "[start_all]   관리자 패널 창 오픈: http://localhost:$KIOSK_PORT/admin"
-    google-chrome --new-window "http://localhost:$KIOSK_PORT/admin" >/dev/null 2>&1 &
+    echo "[start_all]   관리자 패널: http://localhost:$KIOSK_PORT/admin (수동 접속)"
 else
     echo "[start_all]   ⚠ 키오스크 포트 $KIOSK_PORT 미응답 — launch 로그 확인"
 fi

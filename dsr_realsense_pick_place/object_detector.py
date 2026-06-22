@@ -636,6 +636,8 @@ class ObjectDetectorNode(Node):
 
         self.selected_object_label = ''
         self.last_logged_selected_label = None
+        # 현재 pick 대상으로 발행한 라벨(자동/수동) — 카메라 화면 좌하단 표시용(1프레임 지연).
+        self._render_selected_label = ''
 
         # pick_place 상태 구독 — LIFT/MOVE_TO_PLACE 중에는 "검출되지 않음" WARN을 억제한다.
         self._pick_place_state = ''
@@ -1593,6 +1595,11 @@ class ObjectDetectorNode(Node):
                f'ROI({rx1},{ry1})-({rx2},{ry2})')
         cv2.putText(vis, hud, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                     (255, 255, 0), 2, cv2.LINE_AA)
+        # 현재 선택(잡으러 가는) 객체 — 좌하단 표시(sort_all 중 어떤 물체인지). 노랑.
+        _sel = getattr(self, '_render_selected_label', '')
+        if _sel:
+            cv2.putText(vis, f'SELECTED: {_sel}', (10, H - 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
         return vis
 
     # ────────────────────────────────────────────────────────────────────
@@ -2004,15 +2011,26 @@ class ObjectDetectorNode(Node):
                 f'x={pos.x:.3f} y={pos.y:.3f} z={pos.z:.3f}',
                 throttle_duration_sec=2.0)
             return
-        self.pub_pose.publish(pose_base)
-        self.pub_selected_pose.publish(pose_base)
+        # ⚠️ 발행 순서: class/place_zone/grasp_width를 pose보다 먼저 발행한다.
+        # pose를 먼저 내면 pick_place가 pose 콜백서 잡으러 가는데 class/zone는 직전 값이라
+        # "can 좌표인데 ramen으로 처리"되는 race가 난다(클래스↔좌표 섞임).
         # 그리퍼 강도 룩업용 — 표시 라벨([1]) 아닌 원본 클래스 이름을 발행
         self.pub_selected_class.publish(String(data=selected.get('class_name', selected['label'])))
+        # 카메라 좌하단 표시용 — 현재 pick 대상 인스턴스 라벨(예: ramen, unknown_3).
+        # pick 진행 중(PRE_PICK~POST_PLACE)엔 표시 유지 — 그 물체 완료 후 다음 타겟(DETECTING)에서만
+        # 갱신해 "잡는 중 다음 물체로 바뀜" 헷갈림 방지.
+        if self._pick_place_state not in (
+                'PRE_PICK', 'PICK', 'LIFT', 'MOVE_TO_PLACE', 'PLACE', 'POST_PLACE'):
+            self._render_selected_label = str(
+                selected.get('label', selected.get('class_name', '')))
         # 단축 폭(mm) 발행 — pick_place가 동적 초음파 파지거리 산출. 미상이면 0.0(폴백 신호).
         _gw = selected.get('grasp_width_mm')
         self.pub_grasp_width.publish(Float32(data=float(_gw) if _gw and _gw > 0 else 0.0))
         place_zone = int(selected.get('place_zone', 0))
         self.pub_selected_place_zone.publish(Int32(data=place_zone))
+        # 좌표는 맨 마지막 — 위 메타(class/zone/width)가 먼저 도착하도록.
+        self.pub_pose.publish(pose_base)
+        self.pub_selected_pose.publish(pose_base)
         self.get_logger().info(
             f'[{selected["label"]}] 절대좌표: '
             f'x={pos.x:.3f} y={pos.y:.3f} z={pos.z:.3f} m '

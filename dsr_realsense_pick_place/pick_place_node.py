@@ -488,6 +488,8 @@ class PickPlaceNode(Node):
         self.pub_error       = self.create_publisher(String,          '/pick_place_error', 10)
         # 사이클 결과 발행 — 키오스크가 구독해 DONE/FAILED 정확 판정(grasp 추론 fallback 대체).
         self.pub_cycle_result = self.create_publisher(String,         '/pick_place/cycle_result', 10)
+        # sort_all 한 물체 place 완료 시 분류 클래스 발행 — 키오스크가 받아 재고 +1(입고).
+        self.pub_sorted_class = self.create_publisher(String,         '/pick_place/sorted_class', 10)
         # 자동 분류(sort_all) 중 object_detector 자동선택을 ws(박스밖) 물체로만 제한.
         self.pub_sort_ws_only = self.create_publisher(Bool,           '/sort_ws_only', 10)
         self.pub_motion_active = self.create_publisher(Bool, '/gripper_service/motion_active', 10)
@@ -685,16 +687,28 @@ class PickPlaceNode(Node):
                     self.get_logger().warn(
                         f'작업 공간 밖 무시: x={pos.x:.3f} y={pos.y:.3f} z={pos.z:.3f}')
 
+    def _pick_busy(self) -> bool:
+        # 픽 사이클 진행 중(PRE_PICK~POST_PLACE)이면 True. 이 동안 detector가 매 프레임
+        # 발행하는 새 타겟(class/zone/width/label)을 무시해 "가는 중 타겟 변경"(섞임) 차단.
+        return self.state in (State.PRE_PICK, State.PICK, State.LIFT,
+                              State.MOVE_TO_PLACE, State.PLACE, State.POST_PLACE)
+
     def _cb_selected_label(self, msg: String):
         # 사용자가 GUI에서 클릭한 라벨 추적. _cb_pose의 race 검증에 사용.
+        if self._pick_busy():
+            return
         self._selected_object_label = msg.data.strip()
 
     def _cb_selected_class(self, msg: String):
         # object_detector가 선택된 물체 좌표와 함께 발행하는 클래스명. 파지 강도 룩업에 쓴다.
+        if self._pick_busy():   # 픽 진행 중 class 갱신 차단(can↔ramen 섞임 방지)
+            return
         self._target_object_class = msg.data.strip()
 
     def _cb_grasp_width(self, msg: Float32):
         # object_detector가 좌표와 함께 발행하는 PCA 단축 폭(mm). <=0이면 미상(고정거리 폴백).
+        if self._pick_busy():
+            return
         self._target_grasp_width_mm = float(msg.data) if msg.data > 0.0 else None
 
     def _grasp_dist_m_for_width(self, width_mm) -> float:
@@ -720,6 +734,8 @@ class PickPlaceNode(Node):
 
     def _cb_selected_place_zone(self, msg: Int32):
         # object_detector가 결정한 배치 box_roi 구역(1~5). 카메라 box_roi와 1:1 대응.
+        if self._pick_busy():   # 픽 진행 중 zone 갱신 차단(place 위치 변경 방지)
+            return
         self._target_place_zone = int(msg.data)
 
     def _cb_zone_dynamic_place_targets(self, msg: String):
@@ -1662,6 +1678,9 @@ class PickPlaceNode(Node):
             self._move_to_cart(px, py, pz + self.pre_place_dz, place_rpy)
 
             picked_count += 1
+            # 분류 완료 클래스 발행 → 키오스크 재고 +1(place 완료한 실제 클래스, race 없음).
+            if object_class:
+                self.pub_sorted_class.publish(String(data=object_class))
             self.get_logger().info(
                 f'정렬 완료: {object_class!r} → ({px:.3f}, {py:.3f}, {pz:.3f}). '
                 f'누적 {picked_count}개')

@@ -62,6 +62,9 @@ class KioskBackend(Node):
         self.create_subscription(String, '/pick_place_error', self._cb_error, 10)
         # 사이클 결과(success/dropped/failed) — 상태추론 대신 이걸로 DONE/FAILED 판정.
         self.create_subscription(String, '/pick_place/cycle_result', self._cb_cycle_result, 10)
+        # sort_all 분류 완료 물체 클래스 — pick_place가 place 완료 시점에 실제 분류한 클래스만
+        # 발행(detector의 최신 selected와 달리 race 없음). 받으면 재고 +1(입고).
+        self.create_subscription(String, '/pick_place/sorted_class', self._cb_sorted_class, 10)
 
         self.pick_place_state = ''
         self.detected_classes: set[str] = set()
@@ -99,8 +102,16 @@ class KioskBackend(Node):
         self.last_error_text = msg.data
         self._emit('error', {'msg': msg.data})
 
+    def _cb_sorted_class(self, msg: String):
+        # sort_all이 한 물체 place 완료할 때마다 그 클래스를 발행. 받는 즉시 재고 +1.
+        cls = msg.data.strip()
+        if cls:
+            self.repo.adjust_stock(cls, 1)
+            self.get_logger().info(f'sort_all 분류 완료 → 재고 +1: {cls}')
+
     def _cb_cycle_result(self, msg: String):
         # pick_place가 사이클 끝에 발행. 'success'만 배달완료, 'dropped'/'failed'는 실패.
+        # 재고 +1(sort_all)은 /pick_place/sorted_class에서 처리, -1(package)은 done 판정부서.
         self._last_cycle_result = msg.data
 
     def _maybe_emit_order_done(self, iid):
@@ -170,6 +181,9 @@ class KioskBackend(Node):
                     self.repo.record_pick_result(
                         _it.class_name, done,
                         '' if done else (self.last_error_text or '미상'))
+                    # package 주문 배달완료 → 재고 1개 차감.
+                    if done:
+                        self.repo.adjust_stock(_it.class_name, -1)
                 if done:
                     self.get_logger().info(f'item {iid} 완료(DONE)')
                 else:

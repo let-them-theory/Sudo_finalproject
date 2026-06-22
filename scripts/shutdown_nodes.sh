@@ -51,6 +51,13 @@ term_pattern() {
   pkill -TERM -f "$1" 2>/dev/null || true
 }
 
+# rclcpp는 SIGINT만 graceful 처리 → ros2_control_node는 SIGINT라야 소멸자(~DRHWInterface)가
+# Drfl.close_connection()을 호출해 DRCF authority를 반납한다. SIGTERM/SIGKILL이면 소멸자를
+#안 타 제어권이 컨트롤러에 wedge돼 다음 launch가 거부된다(로봇 재부팅 필요).
+int_pattern() {
+  pkill -INT -f "$1" 2>/dev/null || true
+}
+
 kill_pattern() {
   pkill -KILL -f "$1" 2>/dev/null || true
 }
@@ -93,10 +100,13 @@ term_pattern "realsense2_camera_node"
 term_pattern "static_transform_publisher"
 sleep 2
 
-echo "[shutdown] [4/6] ros2_control_node SIGTERM (DRCF 해제, grace ${DRCF_GRACE}s)..."
-term_pattern "ros2_control_node"
+echo "[shutdown] [4/6] ros2_control_node SIGINT (DRCF authority 해제, grace ${DRCF_GRACE}s)..."
+int_pattern "ros2_control_node"   # SIGINT라야 소멸자가 Drfl.close_connection() 호출(제어권 반납)
 if ! wait_gone "ros2_control_node" "$DRCF_GRACE"; then
-  echo "[shutdown]     ros2_control_node 아직 실행 중 (DRCF 해제 지연 가능)"
+  echo "[shutdown]     ⚠ ros2_control_node 아직 실행 중 — SIGINT 한 번 더 + 추가 대기"
+  int_pattern "ros2_control_node"
+  wait_gone "ros2_control_node" "$DRCF_GRACE" || \
+    echo "[shutdown]     ⚠ graceful 미완 — SIGKILL 금지(제어권 wedge). 수동 확인 요망"
 fi
 
 echo "[shutdown] [5/6] 나머지 노드 SIGTERM..."
@@ -113,7 +123,7 @@ if [ "$KILL_LAUNCH" -eq 1 ]; then
   wait_gone "pick_place.launch.py" 8 || true
 fi
 
-echo "[shutdown] [6/6] 잔여 프로세스 SIGKILL..."
+echo "[shutdown] [6/6] 잔여 프로세스 SIGKILL (ros2_control_node 제외 — SIGKILL 시 DRCF wedge)..."
 for pat in \
   gripper_service_node \
   gripper_node \
@@ -124,7 +134,6 @@ for pat in \
   realsense2_camera_node \
   static_transform_publisher \
   robot_state_publisher \
-  ros2_control_node \
   pick_place.launch.py; do
   if pgrep -f "$pat" >/dev/null 2>&1; then
     echo "[shutdown]     SIGKILL: ${pat}"
