@@ -62,6 +62,9 @@ export default function App() {
 
   useEffect(() => {
     getCatalog().then(setCatalog).catch(() => {})
+    // 재고 실시간 반영 — admin/sort_all로 바뀐 재고를 주기적으로 다시 받아 품절/수량 갱신.
+    const t = setInterval(() => getCatalog().then(setCatalog).catch(() => {}), 3000)
+    return () => clearInterval(t)
   }, [])
 
   // 새로고침 시 영수증 복원.
@@ -175,9 +178,21 @@ export default function App() {
           />
         )}
         {page === 'confirm' && (
-          <ConfirmPage cart={cart} total={total} err=""
-            onBack={() => setPage('select')}
-            onPlace={() => { setErr(''); setPage('pay') }} />
+          <ConfirmPage cart={cart} total={total} err={err}
+            onBack={() => { setErr(''); setPage('select') }}
+            onPlace={async () => {
+              // DB 재고와 주문 대조 — 부족하면 다음(결제)으로 안 넘기고 막는다.
+              setErr('')
+              const cat = await getCatalog().catch(() => null)
+              if (cat) {
+                setCatalog(cat)   // 선택 화면 재고/품절도 최신으로
+                const short = Object.entries(cart)
+                  .filter(([c, q]) => { const it = cat.find((x) => x.class_name === c); return !it || it.stock < q })
+                  .map(([c]) => nameOf(c))
+                if (short.length) { setErr(`재고 부족: ${short.join(', ')} — 수량을 줄여주세요`); return }
+              }
+              setPage('pay')
+            }} />
         )}
         {page === 'pay' && (
           <PayPage total={total} onBack={() => setPage('confirm')}

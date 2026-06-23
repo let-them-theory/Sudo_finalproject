@@ -25,7 +25,7 @@ setup(
     data_files=[
         # ament 인덱스와 share 디렉터리에 패키지 메타데이터를 설치한다.
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
-        ('share/' + package_name, ['package.xml']),
+        ('share/' + package_name, ['package.xml', '_source_workspace.sh', 'source_ws.bash']),
         # launch, config 파일도 설치본에서 바로 찾을 수 있도록 함께 복사한다.
         (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
         (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
