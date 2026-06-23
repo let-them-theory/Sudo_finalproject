@@ -823,12 +823,14 @@ class ObjectDetectorNode(Node):
                 seen.add(resolved)
                 roots.append(resolved)
 
+        # 패키지 내부만 탐색한다 — 설치 share(배포) + 소스 트리(repo, 개발).
+        # cwd나 상위 디렉토리(홈·Downloads 등)는 제외 → 엉뚱한 위치의 모델을 읽지 않음.
+        try:
+            from ament_index_python.packages import get_package_share_directory
+            _add(Path(get_package_share_directory('dsr_realsense_pick_place')))
+        except Exception:
+            pass
         _add(self._repo_root())
-        _add(Path.cwd())
-
-        for parent in Path(__file__).resolve().parents:
-            _add(parent)
-            _add(parent / 'src')
 
         return roots
 

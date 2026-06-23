@@ -37,7 +37,7 @@ rosdep install --from-paths src --ignore-src -r -y || \
   echo "[setup] ⚠️ rosdep 일부 실패 — 로그 확인"
 
 echo "[setup] 4) Python 의존성 (ultralytics / torch 등)..."
-pip install -r src/Sudo_finalproject/mini_project/requirements.txt || \
+pip install -r src/Sudo_finalproject/requirements.txt || \
   echo "[setup] ⚠️ pip 실패 — GPU torch는 별도 설치 권장(pytorch.org)"
 
 echo "[setup] 5) colcon build..."
@@ -48,7 +48,7 @@ colcon build --symlink-install
 echo ""
 echo "[setup] ✅ 셋업 완료. 이제 IP와 모델만 설정하면 됩니다:"
 echo "  1) source install/setup.bash"
-echo "  2) src/Sudo_finalproject/mini_project/config/pick_place_params.yaml 의"
+echo "  2) src/Sudo_finalproject/config/pick_place_params.yaml 의"
 echo "     yolo_model 을 본인 모델(.pt) 절대경로로 수정"
 echo "  3) export QT_QPA_PLATFORM=xcb"
 echo "     ros2 launch dsr_realsense_pick_place pick_place.launch.py mode:=real host:=<로봇IP>"

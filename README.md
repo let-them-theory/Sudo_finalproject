@@ -348,7 +348,7 @@ pgrep -af 'gripper_service|gripper_node'   # 출력 없으면 정상
 전체 한 번에 시작(빌드 + 정리 + 로봇 + 키오스크 + 관리자 창):
 
 ```bash
-bash mini_project/scripts/start_all.sh
+bash scripts/start_all.sh
 ```
 
 데이터 계층은 **하이브리드** — 영속(재고/통계/이력)은 SQLite(`~/.config/dsr_realsense_pick_place/store.db`), 휘발(주문/큐/락커)은 JSON. UI·Robot은 DB 직접 접근 안 함(Main 경유).
@@ -377,7 +377,7 @@ colcon build --paths \
 
 ### 10.2 변경 이력 (날짜순)
 
-> 문제 → 원인 → 조치 형식으로 정리. Pick & Place는 `mini_project/` 기준, 학습 데이터 수집은 `~/ultralytics/collect_data.py` 기준.
+> 문제 → 원인 → 조치 형식으로 정리. (아래 과거 항목의 경로 `mini_project/`는 당시 구조 — 2026-06-23 repo 루트(`dsr_realsense_pick_place/`)로 통합·정리됨.) 학습 데이터 수집은 `~/ultralytics/collect_data.py` 기준.
 
 | 날짜 | 주요 영역 |
 |------|-----------|
@@ -390,6 +390,7 @@ colcon build --paths \
 | 2026-06-22 | 관리자 패널(`/admin`) 통합 · 하이브리드 SQLite(재고/통계/이력 영속) · 락커/QR 수령 · 키오스크 UX(결제/키패드/고정캔버스) · 모델·dist git 추적(재현성) |
 | 2026-06-22 | 제어/비전 머지(동적 초음파 파지 + 비전, feat/dynamic-grasp-ultrasonic) · cycle_result 복원 · 콜백 게이팅(픽 중 타겟 변경 방지) · ros2_control SIGINT 종료(DRCF wedge 방지) |
 | 2026-06-23 | sort_all 재고 입고(sorted_class) · 키오스크 재고 표시/품절 차단(+서버 검증) · admin 재고입력 폴링 덮어쓰기 수정 · QR jsQR 폴백 · ROI 적재 최적화(all-full valid:False, bbox footprint 점유) · SELECTED 표시 픽 중 유지 |
+| 2026-06-23 | repo 경량화 — `mini_project/` 복제본 제거(루트로 통합) · 모델 탐색 경로를 패키지 내(share+repo)로 고정(cwd/홈 제외) · `start_all.sh` 루트 `scripts/`로 이동 · 미사용 `realsense_fastsam_segment.py` 삭제 |
 | [2026-06-15](#2026-06-15--proto_v3-모델-교체) | YOLO `proto_v2.pt` → `proto_v3.pt` |
 | [2026-06-15](#2026-06-15--proto_v2-전환-후-gui-검출-불가) | `proto_v2.pt` 런치 교체, GUI 물체 버튼·응답 없음 수정 |
 
@@ -732,12 +733,12 @@ ros2 topic echo /detected_objects --once
 
 | 경로 | 역할 |
 |------|------|
-| `mini_project/launch/pick_place.launch.py` | 전체 노드 런치 (`gui:=false`/`web:=true` 기본) |
-| `mini_project/dsr_realsense_pick_place/web_control_node.py` | **관리자 웹 제어 (SQLite+HTTP, 포트 8080) — PyQt GUI 대체** |
-| `mini_project/web_kiosk/` | **유저 주문 키오스크 (React + FastAPI, 포트 8000)** |
-| `mini_project/dsr_realsense_pick_place/gui_node.py` | PyQt GUI (web_control로 대체, `gui:=true`로 사용 가능) |
-| `mini_project/dsr_realsense_pick_place/object_detector.py` | YOLO + FastSAM 검출 (클래스 다수결 안정화) |
-| `mini_project/dsr_realsense_pick_place/pick_place_node.py` | 픽 FSM (package/비동기 하강/status3 방어) |
+| `launch/pick_place.launch.py` | 전체 노드 런치 (`gui:=false`/`web:=true` 기본) |
+| `dsr_realsense_pick_place/web_control_node.py` | **관리자 웹 제어 (SQLite+HTTP, 포트 8080) — PyQt GUI 대체** |
+| `web_kiosk/` | **유저 주문 키오스크 (React + FastAPI, 포트 8000)** |
+| `dsr_realsense_pick_place/gui_node.py` | PyQt GUI (web_control로 대체, `gui:=true`로 사용 가능) |
+| `dsr_realsense_pick_place/object_detector.py` | YOLO + FastSAM 검출 (클래스 다수결 안정화) |
+| `dsr_realsense_pick_place/pick_place_node.py` | 픽 FSM (package/비동기 하강/status3 방어) |
 | `dsr_gripper_tcp/` | 그리퍼 TCP 브릿지 |
 | `scripts/shutdown_nodes.sh` | 정상 종료 (DRCF/DRL 순서 해제) |
 | `scripts/run_pick_place_real.sh` | 권장 기동 래퍼 (종료 시 shutdown 자동) |
@@ -747,8 +748,8 @@ ros2 topic echo /detected_objects --once
 | `scripts/restart_gripper_bridge.sh` | 그리퍼만 복구 |
 | `scripts/verify_pick_place_graph.sh` | Pick & Place 토픽·서비스·검출 연결 점검 |
 | `scripts/diagnose_drcf.py` | DRCF 연결 진단 |
-| `mini_project/config/pick_place_params.yaml` | 초음파·place·슬롯·zone 파라미터 |
-| `mini_project/_source_workspace.sh` | ROS 워크스페이스 자동 source (`sudo_ws` 우선) |
+| `config/pick_place_params.yaml` | 초음파·place·슬롯·zone 파라미터 |
+| `_source_workspace.sh` | ROS 워크스페이스 자동 source (`sudo_ws` 우선) |
 | `source_ws.bash` | 터미널용 환경 설정 |
 | `~/ultralytics/collect_data.py` | RealSense 학습 데이터 수집 GUI |
 

@@ -385,23 +385,14 @@ class PickPlaceGuiNode(Node):
                 seen.add(resolved)
                 roots.append(resolved)
 
-        _add(self._repo_root())
-        _add(Path.cwd())
-        _add(Path.cwd() / 'mini_project')
-
-        # 설치본(install/share) 경로 — colcon build 후 ros2 launch로 실행하면
-        # __file__이 site-packages라 소스 트리를 못 찾는다. ament share 디렉터리를 직접 추가해
-        # 클론→빌드→실행 시에도 config/pick_place_params.yaml을 확실히 찾게 한다.
+        # 패키지 내부만 탐색 — 설치 share(배포) + 소스 트리(repo, 개발).
+        # cwd나 상위 디렉토리(홈·Downloads 등)는 제외 → 엉뚱한 위치의 파일을 읽지 않음.
         try:
             from ament_index_python.packages import get_package_share_directory
             _add(Path(get_package_share_directory('dsr_realsense_pick_place')))
         except Exception:
             pass
-
-        for parent in Path(__file__).resolve().parents:
-            _add(parent)
-            _add(parent / 'src')
-            _add(parent / 'src' / 'mini_project')
+        _add(self._repo_root())
 
         return roots
 

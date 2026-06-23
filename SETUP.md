@@ -9,7 +9,7 @@ mkdir -p ~/ros2_ws/src && cd ~/ros2_ws
 git clone git@github.com:let-them-theory/Sudo_finalproject.git src/Sudo_finalproject
 bash src/Sudo_finalproject/setup.sh          # 외부 deps 설치 + 빌드 (1회)
 source install/setup.bash
-# pick_place_params.yaml 의 yolo_model 을 본인 모델 절대경로로 수정
+# 모델은 패키지 내장(models/proto_v3.pt) — 기본값이면 수정 불필요
 ros2 launch dsr_realsense_pick_place pick_place.launch.py mode:=real host:=<로봇IP>
 ```
 > **외부 ROS 패키지(Doosan 스택·realsense)는 repo에 없어** `setup.sh`가 자동 설치합니다.
@@ -26,7 +26,7 @@ ros2 launch dsr_realsense_pick_place pick_place.launch.py mode:=real host:=<로�
 mkdir -p ~/ros2_ws/src && cd ~/ros2_ws/src
 git clone git@github.com:let-them-theory/Sudo_finalproject.git
 ```
-이 repo 안의 3개 패키지(`mini_project`, `dsr_gripper_tcp`, `dsr_gripper_tcp_interfaces`)가 colcon에 인식됩니다.
+이 repo의 메인 패키지 `dsr_realsense_pick_place`(+ `dsr_gripper_tcp`, `dsr_gripper_tcp_interfaces`)를 빌드합니다. 루트 `package.xml` 때문에 colcon이 하위 패키지를 자동 탐색하지 못하므로 빌드 시 `--paths` 명시가 필요합니다(아래 4).
 
 ## 2. 외부 ROS 패키지 (repo에 없음 — 반드시 설치)
 ### 2-1. Doosan ROS2 스택 (필수: `dsr_msgs2`, `dsr_bringup2`, `dsr_controller2`, `dsr_hardware2`)
@@ -51,22 +51,28 @@ rosdep install --from-paths src --ignore-src -r -y
 
 ## 3. Python 의존성 (검출/추론)
 ```bash
-pip install -r ~/ros2_ws/src/Sudo_finalproject/mini_project/requirements.txt
+pip install -r ~/ros2_ws/src/Sudo_finalproject/requirements.txt
 # ultralytics(YOLO), torch/torchvision 등. GPU면 CUDA 빌드 torch 설치 권장.
 ```
 
 ## 4. 빌드
 ```bash
 cd ~/ros2_ws
-colcon build --symlink-install
+source ~/ros2_ws/install/setup.bash   # 두산 스택 먼저 빌드/소스
+# 루트 package.xml이 하위 탐색을 막으므로 --paths 필수. --symlink-install은 쓰지 말 것
+# (모델/yaml 갱신이 install에 반영 안 되는 stale 문제 발생).
+colcon build --paths \
+  src/Sudo_finalproject/dsr_gripper_tcp_interfaces \
+  src/Sudo_finalproject/dsr_gripper_tcp \
+  src/Sudo_finalproject
 source install/setup.bash      # 매 터미널에서 source (또는 ~/.bashrc 에 추가)
 ```
 
 ## 5. 설정 (실행 전 반드시)
-`mini_project/config/pick_place_params.yaml` 편집:
-- **`yolo_model`** — 본인 학습 모델(.pt)의 **절대경로**로 수정. (모델 파일은 repo에 없음 — 별도 보관/배치)
+`config/pick_place_params.yaml` 편집:
+- **`yolo_model`** — 패키지 내장 모델을 가리킴(`models/proto_v3.pt`, repo에 포함 — 재현성). 다른 모델 쓸 때만 `models/` 기준 경로로 교체.
   ```yaml
-  yolo_model: "/home/<user>/models/your_model.pt"
+  yolo_model: "models/proto_v3.pt"
   ```
 - **캘리브레이션** — `absolute_calib_*_mm`, `absolute_origin_in_camera_*` 를 현장 카메라 위치에 맞게.
   (object_detector는 이 값을 **launch 시점에만** 읽음 → 수정 후 재launch 또는 GUI "캘리브레이션 적용".)
@@ -100,7 +106,6 @@ bash $(ros2 pkg prefix dsr_realsense_pick_place)/share/dsr_realsense_pick_place/
 순서: DrlStop → gripper 정리 → ros2_control(DRCF 해제). `pkill -9` 대신 이 스크립트를 사용하면 재연결 시 로봇 전원 사이클이 대부분 불필요합니다.
 
 ---
-### repo에 없는 것 (의도적 제외)
-- 학습 데이터셋 / 학습 스크립트 (학습은 별도 진행)
-- 모델 가중치 `*.pt` (용량 — 별도 관리)
-- build/install/log (빌드 산물)
+### repo 포함 / 제외
+- 포함: 모델 가중치 `models/*.pt`(proto_v3, FastSAM-s) + 키오스크 빌드물 `web_kiosk/frontend/dist` → 재현성(clone 후 바로 실행)
+- 제외: 학습 데이터셋 / 학습 스크립트, build/install/log(빌드 산물), 두산 스택(별도 clone)

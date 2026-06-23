@@ -466,10 +466,7 @@ class WebControlNode(Node):
         here = Path(__file__).resolve()
         for parent in here.parents:
             candidates.append(parent / rel)
-            candidates.append(parent / 'mini_project' / rel)
-            candidates.append(parent / 'src' / 'mini_project' / rel)
         candidates.append(Path.cwd() / rel)
-        candidates.append(Path.cwd() / 'src' / 'mini_project' / rel)
 
         existing = []
         seen = set()

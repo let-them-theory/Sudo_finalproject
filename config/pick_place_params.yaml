@@ -16,7 +16,7 @@ object_detector:
     # --- YOLO 설정 ---
     use_yolo: true
     # 런치 실행 시 launch가 패키지 내장 models/proto_v3.pt 절대경로로 override한다(이 값보다 우선).
-    yolo_model: "proto_v3.pt"
+    yolo_model: "models/proto_v3.pt"
     confidence_threshold: 0.25
 
 
@@ -59,7 +59,7 @@ object_detector:
     # GUI 카메라 화면에 'unknown_N'(컬러 마스크)으로 표시한다.
     # (realsense_fastsam_segment.py와 동일 방식). 끄려면 use_fastsam_unknown: false.
     use_fastsam_unknown: true
-    fastsam_weights: "FastSAM-s.pt"
+    fastsam_weights: "models/FastSAM-s.pt"
     fastsam_conf: 0.5
     fastsam_iou: 0.7
     fastsam_imgsz: 640           # FastSAM 입력 크기. 낮추면(416/320) 더 빠름
