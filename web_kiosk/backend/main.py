@@ -408,11 +408,19 @@ async function load(){
   const [cat,lk,q,od,st,hi]=await Promise.all([
     j('/api/catalog'),j('/api/lockers'),j('/api/queue'),j('/api/orders'),j('/api/stats'),j('/api/history')]);
   const cb=$('stock');
-  if(cat&&cat.length)cb.innerHTML=cat.map(c=>`<tr><td>${c.class_name}</td><td>${c.display_name}</td>
-    <td>${c.stock}</td><td>${c.available?'✅':'—'}</td>
-    <td><input type=number id="s-${c.class_name}" value="${c.stock}" min=0>
-    <button class="btn btn-save" onclick="setStock('${c.class_name}')">저장</button></td></tr>`).join('');
-  else emptyRow(cb,5,'품목 없음');
+  // 폴링(2초)이 input을 덮어쓰지 않게: 행은 처음 1회만 생성하고, 이후엔 "현재재고"·available
+  // 셀만 갱신한다. input(s-)은 절대 다시 안 그림 → 사용자가 입력/스피너로 바꾼 값이 유지됨.
+  if(cat&&cat.length){
+    if(cb.querySelectorAll('input[id^="s-"]').length!==cat.length){
+      cb.innerHTML=cat.map(c=>`<tr><td>${c.class_name}</td><td>${c.display_name}</td>
+        <td id="stk-${c.class_name}">${c.stock}</td><td id="av-${c.class_name}">${c.available?'✅':'—'}</td>
+        <td><input type=number id="s-${c.class_name}" value="${c.stock}" min=0>
+        <button class="btn btn-save" onclick="setStock('${c.class_name}')">저장</button></td></tr>`).join('');
+    }else{
+      cat.forEach(c=>{const t=document.getElementById('stk-'+c.class_name);if(t)t.textContent=c.stock;
+        const a=document.getElementById('av-'+c.class_name);if(a)a.textContent=c.available?'✅':'—';});
+    }
+  }else emptyRow(cb,5,'품목 없음');
   const lb=$('lockers'); const lks=(lk&&lk.lockers)||[];
   lb.innerHTML=Array.from({length:8},(_,i)=>{
     const l=lks.find(x=>x.id===i+1)||{id:i+1,status:'free',ticket_no:'',qr_token:''};
@@ -466,6 +474,12 @@ def create_order(body: OrderBody):
     n = _node()
     if not body.lines:
         raise HTTPException(400, '빈 주문')
+    # 재고 검증 — 부족하면 거부(프론트 차단 우회/경합 방지).
+    stock = {c.class_name: c.stock for c in n.repo.list_catalog()}
+    for cls, qty in body.lines:
+        if stock.get(cls, 0) < qty:
+            raise HTTPException(
+                409, f'{cls} 재고 부족 (재고 {stock.get(cls, 0)}개, 요청 {qty}개)')
     try:
         order = n.submit_order(body.lines, body.code)
     except RuntimeError as e:        # 락커 만석 / 코드 오류·중복

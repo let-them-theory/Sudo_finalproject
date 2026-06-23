@@ -5,6 +5,7 @@ import {
   type Catalog, type OrderResp, type QueueItem, type LockerInfo, type LockerSlot,
 } from './api'
 import { nameOf, emojiOf } from './products'
+import jsQR from 'jsqr'   // 데스크톱 크롬/파폭엔 BarcodeDetector가 없어 QR 디코드 폴백으로 사용
 import {
   ChevronUp, ChevronDown, ChevronLeft, RefreshCw, Plus, Minus, Check, AlertTriangle, Clock, Package,
 } from 'lucide-react'
@@ -12,8 +13,6 @@ import {
 type Page = 'welcome' | 'select' | 'confirm' | 'pay' | 'setcode' | 'done' | 'pickup'
 type ReceiptItem = { class_name: string; qty: number }
 
-// 품절/미검출 표시 — 로직만 배선, 지금은 끔(큐→픽플레이스 검증 우선). 나중에 true.
-const SHOW_SOLDOUT = false
 const IDLE_MS = 60000               // 무동작 시 처음 화면 복귀
 const ORDER_KEY = 'kiosk_receipt'   // 새로고침 후 영수증 복원
 
@@ -51,7 +50,6 @@ export default function App() {
   const [order, setOrder] = useState<OrderResp | null>(null)
   const [receipt, setReceipt] = useState<ReceiptItem[]>([])
   const [state, setState] = useState('')
-  const [available, setAvailable] = useState<string[]>([])
   const [paused, setPaused] = useState(false)
   const [queue, setQueue] = useState<QueueItem[]>([])
   const [lockers, setLockers] = useState<LockerSlot[]>([])
@@ -79,7 +77,6 @@ export default function App() {
   useEffect(() => {
     const ws = connectWs((e) => {
       if (e.type === 'state') setState(e.value)
-      else if (e.type === 'detected') setAvailable(e.classes)
       else if (e.type === 'queue') setQueue(e.items)
       else if (e.type === 'paused') setPaused(e.paused)
       else if (e.type === 'order_done')
@@ -171,7 +168,6 @@ export default function App() {
         {page === 'select' && (
           <SelectPage
             catalog={catalog} cart={cart} total={total} kinds={kinds} cartOpen={cartOpen}
-            available={available}
             onToggleCart={() => setCartOpen((v) => !v)}
             onAdd={add} onSub={sub} onClear={() => setCart({})}
             onNext={() => total > 0 && setPage('confirm')}
@@ -360,7 +356,6 @@ function SelectPage(props: {
   total: number
   kinds: number
   cartOpen: boolean
-  available: string[]
   onToggleCart: () => void
   onAdd: (c: string) => void
   onSub: (c: string) => void
@@ -368,7 +363,7 @@ function SelectPage(props: {
   onNext: () => void
   onBack: () => void
 }) {
-  const { cart, total, kinds, cartOpen, available } = props
+  const { cart, total, kinds, cartOpen } = props
   // box(박스)는 판매/이동 대상 아님 — 선택 버튼에서 제외(검출은 백엔드서 계속).
   const catalog = props.catalog.filter((c) => c.class_name !== 'box')
   return (
@@ -385,12 +380,13 @@ function SelectPage(props: {
         <div className="grid grid-cols-3 gap-3">
           {catalog.map((c) => {
             const qty = cart[c.class_name] || 0
-            const sold = SHOW_SOLDOUT && !available.includes(c.class_name)
+            const sold = c.stock <= 0          // 재고 0 = 품절(주문 불가)
+            const maxed = qty >= c.stock       // 재고만큼 다 담음 → 추가 차단
             return (
               <button
                 key={c.class_name}
                 disabled={sold}
-                onClick={() => props.onAdd(c.class_name)}
+                onClick={() => { if (!maxed) props.onAdd(c.class_name) }}
                 className={`relative flex flex-col items-center gap-2 rounded-2xl border bg-white py-5 transition-all active:scale-95 ${
                   qty ? 'border-brand bg-brand-light' : 'border-line'
                 } ${sold ? 'opacity-40' : ''}`}
@@ -416,6 +412,9 @@ function SelectPage(props: {
                 )}
                 <span className="text-[42px]">{emojiOf(c.class_name)}</span>
                 <span className="text-[15px] font-semibold text-ink">{nameOf(c.class_name)}</span>
+                <span className={`text-[12px] font-medium ${sold ? 'text-muted' : 'text-sub'}`}>
+                  {sold ? '품절' : `재고 ${c.stock}`}
+                </span>
               </button>
             )
           })}
@@ -808,24 +807,35 @@ function PickupPage({ onBack }: { onBack: () => void }) {
         const v = videoRef.current
         if (!v) return
         v.srcObject = stream; await v.play()
-        if (!det) {
-          // 스캔 API 없음 — 카메라 미리보기만, QR은 코드 직접 입력.
-          setMsg('이 브라우저는 QR 자동인식 미지원 — 카메라 아래 코드를 직접 입력하세요')
-        } else {
-          const tick = async () => {
-            if (handledRef.current || !videoRef.current) return
-            try {
-              const codes = await det.detect(videoRef.current)
-              if (codes[0]?.rawValue && !handledRef.current) {
-                handledRef.current = true
-                lookup(codes[0].rawValue)
-                return
-              }
-            } catch { /* 프레임 스킵 */ }
-            raf = requestAnimationFrame(tick)
-          }
+        // 스캔 루프: BarcodeDetector(주로 안드로이드 크롬) 있으면 그걸로, 없으면(데스크톱
+        // 크롬/파폭/Safari) jsQR로 canvas 디코드 — 브라우저 무관 QR 인식.
+        const canvas = document.createElement('canvas')
+        const ctx = canvas.getContext('2d', { willReadFrequently: true })
+        const tick = async () => {
+          if (handledRef.current || !videoRef.current) return
+          const vid = videoRef.current
+          try {
+            let raw = ''
+            if (det) {
+              const codes = await det.detect(vid)
+              raw = codes[0]?.rawValue || ''
+            } else if (ctx && vid.videoWidth > 0) {
+              canvas.width = vid.videoWidth
+              canvas.height = vid.videoHeight
+              ctx.drawImage(vid, 0, 0, canvas.width, canvas.height)
+              const img = ctx.getImageData(0, 0, canvas.width, canvas.height)
+              const r = jsQR(img.data, img.width, img.height, { inversionAttempts: 'dontInvert' })
+              raw = r?.data || ''
+            }
+            if (raw && !handledRef.current) {
+              handledRef.current = true
+              lookup(raw)
+              return
+            }
+          } catch { /* 프레임 스킵 */ }
           raf = requestAnimationFrame(tick)
         }
+        raf = requestAnimationFrame(tick)
       } catch { setMsg('카메라를 열 수 없어요 — 코드를 직접 입력하세요') }
     }
     run()

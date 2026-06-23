@@ -1119,24 +1119,41 @@ class ObjectDetectorNode(Node):
         bw = max(1, x2 - x1)
         bh = max(1, y2 - y1)
         occupied: set = set()
-        points: list[tuple[int, int]] = []
+
+        def _mark_cell(u: int, v: int):
+            if x1 <= u < x2 and y1 <= v < y2:
+                c = min(cols - 1, max(0, (u - x1) * cols // bw))
+                r = min(rows - 1, max(0, (v - y1) * rows // bh))
+                occupied.add((r, c))
+
+        # YOLO 검출: centroid 점이 아니라 bbox(footprint) 전체가 걸치는 칸을 모두 점유로 본다.
+        # 큰 물체가 두 칸에 걸쳐도 옆 칸까지 점유 처리 → 그 위에 또 놓는 겹침 방지.
         for det in detections:
             label = det[4] if len(det) > 4 else ''
             if not self._class_counts_for_slot_occupancy(label):
                 continue
-            points.append((int(det[0]), int(det[1])))
+            cx, cy = int(det[0]), int(det[1])
+            w = int(det[2]) if len(det) > 2 else 0
+            h = int(det[3]) if len(det) > 3 else 0
+            ix1, iy1 = max(x1, cx - w // 2), max(y1, cy - h // 2)
+            ix2, iy2 = min(x2, cx + w // 2 + 1), min(y2, cy + h // 2 + 1)
+            if w <= 0 or h <= 0 or ix1 >= ix2 or iy1 >= iy2:
+                _mark_cell(cx, cy)   # bbox 정보 없으면 중심점만
+                continue
+            c_lo = max(0, (ix1 - x1) * cols // bw)
+            c_hi = min(cols - 1, (ix2 - 1 - x1) * cols // bw)
+            r_lo = max(0, (iy1 - y1) * rows // bh)
+            r_hi = min(rows - 1, (iy2 - 1 - y1) * rows // bh)
+            for rr in range(r_lo, r_hi + 1):
+                for cc in range(c_lo, c_hi + 1):
+                    occupied.add((rr, cc))
+        # candidate(보조)는 bbox 없으니 중심점만.
         if self.place_slot_mark_from_detections:
             for item in candidates:
                 if not self._class_counts_for_slot_occupancy(
                         item.get('class_name', '')):
                     continue
-                points.append((int(item['pixel_u']), int(item['pixel_v'])))
-        for u, v in points:
-            if not (x1 <= u < x2 and y1 <= v < y2):
-                continue
-            c = min(cols - 1, max(0, (u - x1) * cols // bw))
-            r = min(rows - 1, max(0, (v - y1) * rows // bh))
-            occupied.add((r, c))
+                _mark_cell(int(item['pixel_u']), int(item['pixel_v']))
         return occupied
 
     def _find_empty_slot_in_zone(
@@ -1202,14 +1219,15 @@ class ObjectDetectorNode(Node):
                 slot['x'], slot['y'], slot['z'] = xyz
             return slot
 
-        # 빈 칸 없음 — 중앙 칸 폴백 (pick_place yaml 앵커가 최종 좌표 산출)
+        # 빈 칸 없음 — valid:False로 알린다. pick_place가 받으면 로컬 filled-기반 다음 칸으로
+        # 폴백(같은 중앙 칸에 중복 적재 방지). 좌표는 디버그용으로 중앙 칸을 채워 둔다.
         cr, cc = rows // 2, cols // 2
         fallback = next(
             (c for c in cells if c['row'] == cr and c['col'] == cc), cells[0])
         u = (fallback['x1'] + fallback['x2']) // 2
         v = (fallback['y1'] + fallback['y2']) // 2
         slot = {
-            'valid': True,
+            'valid': False,
             'u': u, 'v': v,
             'row': fallback['row'], 'col': fallback['col'],
             'all_full': True,
