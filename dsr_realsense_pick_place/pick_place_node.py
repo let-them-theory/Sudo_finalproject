@@ -469,6 +469,9 @@ class PickPlaceNode(Node):
         self._hw_estop_latched = False
         self._object_lost_triggered = False
         self._object_lost_debounce_count = 0  # 낙하 조건 연속 프레임 카운터
+        # 사이클 결과(success/dropped/failed) — finish 시 /pick_place/cycle_result 발행.
+        # 키오스크 DONE 판정용(place 도달≠배달완료, 낙하/실패 구분).
+        self._cycle_result = 'idle'
         # status3(STATUS_IO_ERROR) false-positive 차단용 — 직전 GripperState.status 캐시.
         # 0이 아니면 그리퍼 통신 일시 장애 상태이므로 낙하 판정을 보류한다.
         self._gripper_last_status: int = 0
@@ -483,6 +486,10 @@ class PickPlaceNode(Node):
         # ── 퍼블리셔 / 구독 ─────────────────────────────────────────────
         self.pub_state       = self.create_publisher(String,          '/pick_place_state', 10)
         self.pub_error       = self.create_publisher(String,          '/pick_place_error', 10)
+        # 사이클 결과 발행 — 키오스크가 구독해 DONE/FAILED 정확 판정(grasp 추론 fallback 대체).
+        self.pub_cycle_result = self.create_publisher(String,         '/pick_place/cycle_result', 10)
+        # sort_all 한 물체 place 완료 시 분류 클래스 발행 — 키오스크가 받아 재고 +1(입고).
+        self.pub_sorted_class = self.create_publisher(String,         '/pick_place/sorted_class', 10)
         # 자동 분류(sort_all) 중 object_detector 자동선택을 ws(박스밖) 물체로만 제한.
         self.pub_sort_ws_only = self.create_publisher(Bool,           '/sort_ws_only', 10)
         self.pub_motion_active = self.create_publisher(Bool, '/gripper_service/motion_active', 10)
@@ -680,16 +687,28 @@ class PickPlaceNode(Node):
                     self.get_logger().warn(
                         f'작업 공간 밖 무시: x={pos.x:.3f} y={pos.y:.3f} z={pos.z:.3f}')
 
+    def _pick_busy(self) -> bool:
+        # 픽 사이클 진행 중(PRE_PICK~POST_PLACE)이면 True. 이 동안 detector가 매 프레임
+        # 발행하는 새 타겟(class/zone/width/label)을 무시해 "가는 중 타겟 변경"(섞임) 차단.
+        return self.state in (State.PRE_PICK, State.PICK, State.LIFT,
+                              State.MOVE_TO_PLACE, State.PLACE, State.POST_PLACE)
+
     def _cb_selected_label(self, msg: String):
         # 사용자가 GUI에서 클릭한 라벨 추적. _cb_pose의 race 검증에 사용.
+        if self._pick_busy():
+            return
         self._selected_object_label = msg.data.strip()
 
     def _cb_selected_class(self, msg: String):
         # object_detector가 선택된 물체 좌표와 함께 발행하는 클래스명. 파지 강도 룩업에 쓴다.
+        if self._pick_busy():   # 픽 진행 중 class 갱신 차단(can↔ramen 섞임 방지)
+            return
         self._target_object_class = msg.data.strip()
 
     def _cb_grasp_width(self, msg: Float32):
         # object_detector가 좌표와 함께 발행하는 PCA 단축 폭(mm). <=0이면 미상(고정거리 폴백).
+        if self._pick_busy():
+            return
         self._target_grasp_width_mm = float(msg.data) if msg.data > 0.0 else None
 
     def _grasp_dist_m_for_width(self, width_mm) -> float:
@@ -715,6 +734,8 @@ class PickPlaceNode(Node):
 
     def _cb_selected_place_zone(self, msg: Int32):
         # object_detector가 결정한 배치 box_roi 구역(1~5). 카메라 box_roi와 1:1 대응.
+        if self._pick_busy():   # 픽 진행 중 zone 갱신 차단(place 위치 변경 방지)
+            return
         self._target_place_zone = int(msg.data)
 
     def _cb_zone_dynamic_place_targets(self, msg: String):
@@ -1378,6 +1399,7 @@ class PickPlaceNode(Node):
                     px, py, pz = self._active_place_pos
                     self._move_to_cart(
                         px, py, pz + self.pre_place_dz, self._active_place_rpy)
+                    self._cycle_result = 'success'   # place 완료 — 여기 도달해야만 성공
                     self.get_logger().info('Pick & Place 완료!')
                     self._set_state(State.HOME)
 
@@ -1411,6 +1433,7 @@ class PickPlaceNode(Node):
                     self._set_state(State.EMERGENCY_STOP)
                 elif mi.mode == 'object_lost':
                     self.get_logger().warn('낙하 감지: 태스크를 취소하고 홈으로 복귀합니다.')
+                    self._cycle_result = 'dropped'   # 낙하 — 성공으로 오판 금지
                     self._safe_recover_to_home('낙하 복구')
                     self._finish_cycle()
                 elif mi.mode == 'backdrive':
@@ -1481,6 +1504,7 @@ class PickPlaceNode(Node):
                 raise RuntimeError('robot_mode=AUTO 준비 전입니다. 잠시 후 다시 시도하세요.')
             self._clear_target()
             self._object_lost_triggered = False
+            self._cycle_result = 'failed'   # 기본값 — POST_PLACE 도달 시에만 success로 승격
             self.pick_requested = True
             self._set_state(State.HOME)
             self._go_home()
@@ -1654,6 +1678,9 @@ class PickPlaceNode(Node):
             self._move_to_cart(px, py, pz + self.pre_place_dz, place_rpy)
 
             picked_count += 1
+            # 분류 완료 클래스 발행 → 키오스크 재고 +1(place 완료한 실제 클래스, race 없음).
+            if object_class:
+                self.pub_sorted_class.publish(String(data=object_class))
             self.get_logger().info(
                 f'정렬 완료: {object_class!r} → ({px:.3f}, {py:.3f}, {pz:.3f}). '
                 f'누적 {picked_count}개')
@@ -1689,6 +1716,12 @@ class PickPlaceNode(Node):
     def _finish_cycle(self):
         self.pick_requested = False
         self._object_lost_triggered = False
+        # 사이클 결과 발행 — web_kiosk가 DONE/FAILED 판정에 사용(상태추론 대신).
+        # IDLE 전이보다 먼저 발행해 소비측이 결과를 먼저 받게 한다.
+        rmsg = String()
+        rmsg.data = self._cycle_result
+        self.pub_cycle_result.publish(rmsg)
+        self._cycle_result = 'idle'
         self._clear_target()
         self._clear_selected_label()
         self._set_state(State.IDLE)

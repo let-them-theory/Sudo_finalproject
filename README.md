@@ -337,6 +337,44 @@ pgrep -af 'gripper_service|gripper_node'   # 출력 없으면 정상
 
 `pkill -9`로 `ros2_control_node` / 그리퍼를 직접 죽이지 마세요. DRCF authority가 컨트롤러에 남아 **재연결 시 로봇 전원 사이클**이 필요해질 수 있습니다.
 
+### 10.1.1 웹 인터페이스
+
+| 페이지 | 주소 | 내용 |
+|--------|------|------|
+| 유저 키오스크 | `http://localhost:8000` | 주문(재고 표시 · 품절 차단) · QR/코드 수령(jsQR 폴백) |
+| 관리자 패널 | `http://localhost:8000/admin` | 재고 조회·수정 · 락커 · 주문/큐 · 픽 통계 · 처리 이력 |
+| 로봇 제어 | `http://localhost:8080` | 그리퍼 전류/초음파 · 락커 · 로그 (web_control) |
+
+전체 한 번에 시작(빌드 + 정리 + 로봇 + 키오스크 + 관리자 창):
+
+```bash
+bash mini_project/scripts/start_all.sh
+```
+
+데이터 계층은 **하이브리드** — 영속(재고/통계/이력)은 SQLite(`~/.config/dsr_realsense_pick_place/store.db`), 휘발(주문/큐/락커)은 JSON. UI·Robot은 DB 직접 접근 안 함(Main 경유).
+
+**재고 연동**: `sort_all`이 한 물체 분류 완료 시 `/pick_place/sorted_class`로 클래스를 발행 → 키오스크가 재고 +1(입고). 주문 배달완료 시 재고 -1(출고). 키오스크는 상품별 재고를 표시하고 재고 0이면 주문을 막으며, 서버(`/api/orders`)도 재고를 재검증해 우회를 차단한다.
+
+**QR 수령**: 데스크톱 크롬·파이어폭스엔 `BarcodeDetector`가 없어(안드로이드 크롬만 안정) `jsQR` 폴백으로 디코드 — 브라우저 무관. 단 카메라 접근(`getUserMedia`)은 `localhost`/HTTPS에서만 허용(원격 `http://IP`는 브라우저 보안상 차단).
+
+**적재 안정화**: place 칸이 다 차면 `valid:False`로 중앙 중복 적재를 막고, 점유 판정은 물체 bbox(footprint) 기준이라 두 칸에 걸친 물체의 옆 칸도 점유 처리해 겹침을 방지한다.
+
+종료는 ros2_control을 **SIGINT**로만 정리한다 — 소멸자가 `Drfl.close_connection()`으로 DRCF authority를 반납하기 때문. SIGKILL/SIGTERM이면 제어권이 컨트롤러에 wedge돼 다음 launch가 거부된다(`shutdown_nodes.sh`가 처리).
+
+### 10.1.2 재현성 (clone 후 바로 실행)
+
+모델(`models/*.pt`)과 키오스크 빌드물(`web_kiosk/frontend/dist`)을 git에 포함 → clone 후 `npm run build` 없이 동작. 단 **빌드는 두산 underlay(ros2_ws) 먼저 source + `--paths` 지정**(루트 `package.xml` 때문에 colcon이 하위 패키지를 자동 탐색 못 함):
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/ros2_ws/install/setup.bash          # 두산 underlay 먼저 (필수)
+cd ~/kairos_ws
+colcon build --paths \
+  src/Sudo_finalproject/dsr_gripper_tcp_interfaces \
+  src/Sudo_finalproject/dsr_gripper_tcp \
+  src/Sudo_finalproject
+```
+
 ### 10.2 변경 이력 (날짜순)
 
 > 문제 → 원인 → 조치 형식으로 정리. Pick & Place는 `src/` 루트 패키지 기준, 학습 데이터 수집은 `~/ultralytics/collect_data.py` 기준.
@@ -349,6 +387,9 @@ pgrep -af 'gripper_service|gripper_node'   # 출력 없으면 정상
 | [2026-06-11](#2026-06-11--그리퍼-초기화-속도--place-구역) | status3 초기화 단축, box_roi ↔ place zone 매핑 |
 | [2026-06-12 ~ 14](#2026-06-12--14--gui--place-시퀀스--빈칸-배치) | GUI 분리/스크롤, zone4 시퀀스, 동적 place 슬롯 |
 | [2026-06-15](#2026-06-15--학습-데이터-수집-gui) | `collect_data.py` 화살표 선택, 클래스 추가 |
+| 2026-06-22 | 관리자 패널(`/admin`) 통합 · 하이브리드 SQLite(재고/통계/이력 영속) · 락커/QR 수령 · 키오스크 UX(결제/키패드/고정캔버스) · 모델·dist git 추적(재현성) |
+| 2026-06-22 | 제어/비전 머지(동적 초음파 파지 + 비전, feat/dynamic-grasp-ultrasonic) · cycle_result 복원 · 콜백 게이팅(픽 중 타겟 변경 방지) · ros2_control SIGINT 종료(DRCF wedge 방지) |
+| 2026-06-23 | sort_all 재고 입고(sorted_class) · 키오스크 재고 표시/품절 차단(+서버 검증) · admin 재고입력 폴링 덮어쓰기 수정 · QR jsQR 폴백 · ROI 적재 최적화(all-full valid:False, bbox footprint 점유) · SELECTED 표시 픽 중 유지 |
 | [2026-06-15](#2026-06-15--proto_v3-모델-교체) | YOLO `proto_v2.pt` → `proto_v3.pt` |
 | [2026-06-15](#2026-06-15--proto_v2-전환-후-gui-검출-불가) | `proto_v2.pt` 런치 교체, GUI 물체 버튼·응답 없음 수정 |
 

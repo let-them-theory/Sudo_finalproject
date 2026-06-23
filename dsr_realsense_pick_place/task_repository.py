@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 import random
-import string
+import sqlite3
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, asdict
@@ -26,9 +26,10 @@ from pathlib import Path
 class OrderStatus:
     QUEUED = 'QUEUED'
     RUNNING = 'RUNNING'
-    DONE = 'DONE'
+    DONE = 'DONE'          # 전 품목 배달 완료 — 락커 ready, 수령 대기
     CANCELED = 'CANCELED'
     PAUSED = 'PAUSED'
+    PICKED = 'PICKED'      # 유저 수령 완료 — 락커 free (DONE 이후 단말 상태)
 
 
 class ItemStatus:
@@ -41,6 +42,15 @@ class ItemStatus:
 
 # 큐(실행 대상)로 보는 item 상태 — 아직 안 끝난 것.
 _ACTIVE_ITEM = {ItemStatus.QUEUED, ItemStatus.RUNNING}
+
+# 락커 개수. 주문 시 빈 락커 배정, 수령 완료 시 해제.
+LOCKER_COUNT = 8
+
+# 락커 상태.
+class LockerStatus:
+    FREE = 'free'          # 비어 있음
+    OCCUPIED = 'occupied'  # 주문 배정됨(배달 중)
+    READY = 'ready'        # 배달 완료 — 수령 대기
 
 
 # ─── 데이터 모델 ────────────────────────────────────────────
@@ -58,7 +68,6 @@ class OrderItem:
     order_id: str
     class_name: str
     status: str = ItemStatus.QUEUED
-    retry_count: int = 0
 
 
 @dataclass
@@ -68,7 +77,9 @@ class Order:
     status: str = OrderStatus.QUEUED
     created_at: str = ''
     item_ids: list = field(default_factory=list)
-    pickup_code: str = ''      # 수령 확인 코드 (예: "A3K9")
+    locker_id: int = 0         # 배정 락커(1~N), 0=미배정
+    qr_token: str = ''         # 수령 QR 토큰
+    picked_at: str = ''        # 수령 완료 시각
 
 
 # ─── 리포지토리 인터페이스 ──────────────────────────────────
@@ -107,8 +118,6 @@ class TaskRepository(ABC):
     @abstractmethod
     def set_item_status(self, item_id: str, status: str) -> None: ...
     @abstractmethod
-    def retry_or_fail(self, item_id: str, max_retries: int = 3) -> bool: ...
-    @abstractmethod
     def cancel_item(self, item_id: str) -> None: ...
     @abstractmethod
     def reorder_item(self, item_id: str, new_index: int) -> None:
@@ -118,23 +127,11 @@ class TaskRepository(ABC):
     @abstractmethod
     def list_history(self) -> list[dict]: ...
 
-    # pick stats
+    # pick 통계 / 재고 (admin)
     @abstractmethod
     def record_pick_result(self, class_name: str, success: bool, reason: str = '') -> None: ...
     @abstractmethod
     def get_pick_stats(self) -> list[dict]: ...
-
-    # zone occupancy
-    @abstractmethod
-    def get_zones(self, max_zones: int = 6) -> list[dict]: ...
-    @abstractmethod
-    def occupy_next_zone(self, class_name: str, order_id: str, max_zones: int = 6) -> int | None: ...
-    @abstractmethod
-    def clear_zone(self, zone_id: int) -> None: ...
-    @abstractmethod
-    def is_all_zones_full(self, max_zones: int = 6) -> bool: ...
-
-    # stock management
     @abstractmethod
     def set_stock(self, class_name: str, qty: int) -> None: ...
 
@@ -158,8 +155,10 @@ class JsonRepository(TaskRepository):
             'items': {},     # item_id    -> OrderItem dict
             'queue': [],     # [item_id, ...] 실행 순서
             'history': [],   # [dict, ...]
+            'lockers': {},   # "1".."N" -> {status, order_id, qr_token, assigned_at, ready_at}
         }
         self._load()
+        self._ensure_schema()
 
     # ── 영속 ──
     def _load(self) -> None:
@@ -173,6 +172,21 @@ class JsonRepository(TaskRepository):
         읽기/쓰기 직전에 호출해 상대 프로세스의 변경을 반영한다."""
         with self._lock:
             self._load()
+            self._ensure_schema()
+
+    def _ensure_schema(self) -> None:
+        """구버전 JSON 호환 — 누락 키 보강 + 락커 N칸 초기화(락 비보유 호출 가정: __init__/reload 내부)."""
+        self._data.setdefault('lockers', {})
+        lk = self._data['lockers']
+        changed = False
+        for i in range(1, LOCKER_COUNT + 1):
+            key = str(i)
+            if key not in lk:
+                lk[key] = {'status': LockerStatus.FREE, 'order_id': '',
+                           'qr_token': '', 'assigned_at': '', 'ready_at': ''}
+                changed = True
+        if changed and self._path.exists():
+            self._save()
 
     def _save(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -212,24 +226,41 @@ class JsonRepository(TaskRepository):
             d['stock'] = max(0, int(d.get('stock', 0)) + delta)
             self._save()
 
+    def set_stock(self, class_name: str, qty: int) -> None:
+        with self._lock:
+            d = self._data['catalog'].get(class_name)
+            if d is None:
+                return
+            d['stock'] = max(0, int(qty))
+            self._save()
+
+    # ── pick 통계 (admin: 품목별 성공/실패) ──
+    def record_pick_result(self, class_name: str, success: bool, reason: str = '') -> None:
+        with self._lock:
+            stats = self._data.setdefault('pick_stats', {})
+            s = stats.setdefault(class_name, {'success': 0, 'fail': 0,
+                                              'last_fail_reason': '', 'last_fail_at': ''})
+            if success:
+                s['success'] = int(s.get('success', 0)) + 1
+            else:
+                s['fail'] = int(s.get('fail', 0)) + 1
+                s['last_fail_reason'] = reason
+                s['last_fail_at'] = self._now()
+            self._save()
+
+    def get_pick_stats(self) -> list[dict]:
+        with self._lock:
+            return [{'class_name': cn, **s}
+                    for cn, s in self._data.get('pick_stats', {}).items()]
+
     # ── order ──
     def create_order(self, lines: list[tuple[str, int]]) -> Order:
         with self._lock:
-            # 재고 검증: 주문 수량 > 현재 재고면 ValueError
-            for class_name, qty in lines:
-                cat = self._data['catalog'].get(class_name)
-                stock = int(cat.get('stock', 0)) if cat else 0
-                if stock < max(0, int(qty)):
-                    display = (cat.get('display_name', class_name) if cat else class_name)
-                    raise ValueError(
-                        f"재고 부족: '{display}' 재고={stock}, 주문={int(qty)}")
-
             self._data['order_counter'] += 1
             self._data['ticket_counter'] += 1
             oid = f"order{self._data['order_counter']}"
             ticket = f"A-{self._data['ticket_counter']:03d}"
-            pickup_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
-            order = Order(order_id=oid, ticket_no=ticket, pickup_code=pickup_code,
+            order = Order(order_id=oid, ticket_no=ticket,
                           status=OrderStatus.QUEUED, created_at=self._now())
             k = 0
             for class_name, qty in lines:
@@ -287,6 +318,141 @@ class JsonRepository(TaskRepository):
             self._data['queue_paused'] = bool(paused)
             self._save()
 
+    # ── 락커 (QR 수령) ──────────────────────────────────────────
+    def list_lockers(self) -> list[dict]:
+        """[{id, status, order_id, ticket_no, qr_token, assigned_at, ready_at}, ...] (id 오름차순)."""
+        with self._lock:
+            out = []
+            for i in range(1, LOCKER_COUNT + 1):
+                lk = dict(self._data['lockers'].get(str(i), {}))
+                lk['id'] = i
+                oid = lk.get('order_id', '')
+                od = self._data['orders'].get(oid) if oid else None
+                lk['ticket_no'] = od.get('ticket_no', '') if od else ''
+                out.append(lk)
+            return out
+
+    def free_locker_count(self) -> int:
+        with self._lock:
+            return sum(1 for v in self._data['lockers'].values()
+                       if v.get('status') == LockerStatus.FREE)
+
+    def assign_locker(self, order_id: str, code: str | None = None) -> dict | None:
+        """주문에 빈 락커 1칸 배정 + 수령 코드 발급. 만석/주문없음이면 None.
+        code(4자리 숫자)를 주면 유저 지정 코드 사용, 없으면 자동 생성.
+        code 형식 오류/중복이면 ValueError. 반환: {locker_id, qr_token}."""
+        with self._lock:
+            order = self._data['orders'].get(order_id)
+            if order is None:
+                return None
+            if int(order.get('locker_id', 0) or 0) > 0:
+                # 이미 배정됨 — 멱등 반환.
+                return {'locker_id': order['locker_id'], 'qr_token': order.get('qr_token', '')}
+            # 현재 점유 중 락커의 코드(중복 회피용).
+            used = {self._data['lockers'][str(j)].get('qr_token')
+                    for j in range(1, LOCKER_COUNT + 1)
+                    if self._data['lockers'][str(j)].get('status') != LockerStatus.FREE}
+            if code is not None:
+                code = str(code).strip()
+                if not (code.isdigit() and len(code) == 4):
+                    raise ValueError('수령 코드는 4자리 숫자여야 합니다')
+                if code in used:
+                    raise ValueError('이미 사용 중인 코드입니다 — 다른 코드를 입력하세요')
+                token = code
+            else:
+                token = f'{random.randint(0, 9999):04d}'
+                for _ in range(100):
+                    if token not in used:
+                        break
+                    token = f'{random.randint(0, 9999):04d}'
+            for i in range(1, LOCKER_COUNT + 1):
+                lk = self._data['lockers'].get(str(i))
+                if lk and lk.get('status') == LockerStatus.FREE:
+                    lk.update({'status': LockerStatus.OCCUPIED, 'order_id': order_id,
+                               'qr_token': token, 'assigned_at': self._now(), 'ready_at': ''})
+                    order['locker_id'] = i
+                    order['qr_token'] = token
+                    self._save()
+                    return {'locker_id': i, 'qr_token': token}
+            return None   # 만석
+
+    def locker_info_by_token(self, token: str) -> dict | None:
+        """수령 QR 조회. {locker_id, status, order_id, ticket_no, order_status, ready} 또는 None."""
+        token = (token or '').strip()
+        if not token:
+            return None
+        with self._lock:
+            for i in range(1, LOCKER_COUNT + 1):
+                lk = self._data['lockers'].get(str(i), {})
+                if lk.get('qr_token') == token:
+                    oid = lk.get('order_id', '')
+                    od = self._data['orders'].get(oid, {})
+                    return {
+                        'locker_id': i,
+                        'status': lk.get('status'),
+                        'order_id': oid,
+                        'ticket_no': od.get('ticket_no', ''),
+                        'order_status': od.get('status', ''),
+                        'ready': lk.get('status') == LockerStatus.READY,
+                    }
+            return None
+
+    def confirm_pickup(self, token: str) -> dict | None:
+        """유저 수령 완료. ready 상태일 때만 처리 — order PICKED, 락커 free. 결과 dict 또는 None."""
+        token = (token or '').strip()
+        with self._lock:
+            for i in range(1, LOCKER_COUNT + 1):
+                lk = self._data['lockers'].get(str(i), {})
+                if lk.get('qr_token') != token or not token:
+                    continue
+                if lk.get('status') != LockerStatus.READY:
+                    return {'ok': False, 'reason': 'not_ready', 'locker_id': i,
+                            'status': lk.get('status')}
+                oid = lk.get('order_id', '')
+                od = self._data['orders'].get(oid)
+                if od is not None:
+                    od['status'] = OrderStatus.PICKED
+                    od['picked_at'] = self._now()
+                self._free_locker_locked(i)
+                self._save()
+                return {'ok': True, 'locker_id': i, 'order_id': oid}
+            return None   # 토큰 매칭 없음
+
+    def release_locker(self, locker_id: int) -> bool:
+        """관리자 강제 해제 — 락커 free + 주문 바인딩 해제(주문 상태는 그대로)."""
+        with self._lock:
+            if str(locker_id) not in self._data['lockers']:
+                return False
+            self._free_locker_locked(int(locker_id))
+            self._save()
+            return True
+
+    def reset_lockers(self) -> None:
+        """관리자 전체 초기화 — 모든 락커 free."""
+        with self._lock:
+            for i in range(1, LOCKER_COUNT + 1):
+                self._free_locker_locked(i)
+            self._save()
+
+    def _free_locker_locked(self, locker_id: int) -> None:
+        self._data['lockers'][str(locker_id)] = {
+            'status': LockerStatus.FREE, 'order_id': '', 'qr_token': '',
+            'assigned_at': '', 'ready_at': ''}
+
+    def _sync_locker_to_order_locked(self, order: dict) -> None:
+        """주문 상태 변화에 락커 동기화 — DONE→ready, CANCELED→free. (락 보유 중 호출)"""
+        lid = int(order.get('locker_id', 0) or 0)
+        if lid <= 0:
+            return
+        lk = self._data['lockers'].get(str(lid))
+        if lk is None or lk.get('order_id') != order['order_id']:
+            return   # 이 락커가 다른 주문 소유면 건드리지 않음
+        if order['status'] == OrderStatus.DONE:
+            lk['status'] = LockerStatus.READY
+            lk['ready_at'] = self._now()
+        elif order['status'] == OrderStatus.CANCELED:
+            self._free_locker_locked(lid)
+
     # ── item / queue ──
     def get_item(self, item_id: str) -> OrderItem | None:
         with self._lock:
@@ -327,30 +493,6 @@ class JsonRepository(TaskRepository):
             self._refresh_order_status(it['order_id'])
             self._save()
 
-    def retry_or_fail(self, item_id: str, max_retries: int = 3) -> bool:
-        """픽 실패 후 재시도 여부 결정. True=재시도(큐 뒤로 이동), False=FAILED 확정."""
-        with self._lock:
-            it = self._data['items'].get(item_id)
-            if it is None:
-                return False
-            count = int(it.get('retry_count', 0))
-            if count < max_retries:
-                it['retry_count'] = count + 1
-                it['status'] = ItemStatus.QUEUED
-                q = self._data['queue']
-                if item_id in q:
-                    q.remove(item_id)
-                q.append(item_id)
-                self._save()
-                return True
-            else:
-                it['status'] = ItemStatus.FAILED
-                self._append_history_locked(it, ItemStatus.FAILED)
-                self._remove_from_queue(item_id)
-                self._refresh_order_status(it['order_id'])
-                self._save()
-                return False
-
     def cancel_item(self, item_id: str) -> None:
         self.set_item_status(item_id, ItemStatus.CANCELED)
 
@@ -368,75 +510,6 @@ class JsonRepository(TaskRepository):
     def list_history(self) -> list[dict]:
         with self._lock:
             return list(self._data['history'])
-
-    # ── pick stats ──
-    def record_pick_result(self, class_name: str, success: bool, reason: str = '') -> None:
-        with self._lock:
-            stats = self._data.setdefault('pick_stats', {})
-            s = stats.setdefault(class_name, {'success': 0, 'fail': 0,
-                                               'last_fail_reason': '', 'last_fail_at': ''})
-            if success:
-                s['success'] = int(s.get('success', 0)) + 1
-            else:
-                s['fail'] = int(s.get('fail', 0)) + 1
-                s['last_fail_reason'] = reason
-                s['last_fail_at'] = self._now()
-            self._save()
-
-    def get_pick_stats(self) -> list[dict]:
-        with self._lock:
-            return [{'class_name': cn, **s}
-                    for cn, s in self._data.get('pick_stats', {}).items()]
-
-    # ── zone occupancy ──
-    def get_zones(self, max_zones: int = 6) -> list[dict]:
-        with self._lock:
-            zones = self._data.get('zones', {})
-            result = []
-            for i in range(max_zones):
-                z = zones.get(str(i), {})
-                result.append({
-                    'zone_id': i,
-                    'occupied': bool(z.get('occupied', False)),
-                    'class_name': z.get('class_name', ''),
-                    'order_id': z.get('order_id', ''),
-                    'placed_at': z.get('placed_at', ''),
-                })
-            return result
-
-    def occupy_next_zone(self, class_name: str, order_id: str, max_zones: int = 6) -> int | None:
-        with self._lock:
-            zones = self._data.setdefault('zones', {})
-            for i in range(max_zones):
-                key = str(i)
-                if not zones.get(key, {}).get('occupied', False):
-                    zones[key] = {'occupied': True, 'class_name': class_name,
-                                  'order_id': order_id, 'placed_at': self._now()}
-                    self._save()
-                    return i
-            return None  # 모든 zone 점유됨
-
-    def clear_zone(self, zone_id: int) -> None:
-        with self._lock:
-            self._data.setdefault('zones', {})[str(zone_id)] = {
-                'occupied': False, 'class_name': '', 'order_id': '', 'placed_at': ''
-            }
-            self._save()
-
-    def is_all_zones_full(self, max_zones: int = 6) -> bool:
-        with self._lock:
-            zones = self._data.get('zones', {})
-            occupied = sum(1 for z in zones.values() if z.get('occupied', False))
-            return occupied >= max_zones
-
-    # ── stock management ──
-    def set_stock(self, class_name: str, qty: int) -> None:
-        with self._lock:
-            d = self._data['catalog'].get(class_name)
-            if d is None:
-                return
-            d['stock'] = max(0, int(qty))
-            self._save()
 
     # ── 내부 헬퍼 (락 보유 중 호출) ──
     def _remove_from_queue(self, item_id: str) -> None:
@@ -461,6 +534,8 @@ class JsonRepository(TaskRepository):
         order = self._data['orders'].get(order_id)
         if order is None:
             return
+        if order['status'] == OrderStatus.PICKED:
+            return   # 수령 완료는 단말 상태 — item 재계산이 덮어쓰지 않도록.
         statuses = [self._data['items'][i]['status']
                     for i in order['item_ids'] if i in self._data['items']]
         if not statuses:
@@ -472,8 +547,114 @@ class JsonRepository(TaskRepository):
             order['status'] = (OrderStatus.DONE
                                if any(s == ItemStatus.DONE for s in statuses)
                                else OrderStatus.CANCELED)
+            self._sync_locker_to_order_locked(order)   # DONE→락커 ready, CANCELED→free
         else:
             order['status'] = OrderStatus.QUEUED
+
+
+# ─── 하이브리드 구현 (영속 catalog/pick_stats/history = SQLite, 휘발 orders/queue/lockers = JSON) ───
+class HybridRepository(JsonRepository):
+    """영속 데이터(재고/통계/이력)는 SQLite, 휘발(주문/큐/락커)은 JSON.
+    JsonRepository 상속 — 휘발 로직 그대로 쓰고 영속 메서드만 SQLite로 override.
+    영속=SQLite 이유: 동시쓰기 안전·집계·누적 보존. 휘발=JSON 이유: 빈번갱신·세션성·가벼움."""
+    _PERSIST_DB = Path.home() / '.config' / 'dsr_realsense_pick_place' / 'store.db'
+
+    def __init__(self, path: Path | str = _DEFAULT_DB_PATH, db_path: Path | str | None = None):
+        super().__init__(path)                       # 휘발(JSON) 초기화
+        self._db_path = Path(db_path) if db_path else self._PERSIST_DB
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._db = sqlite3.connect(str(self._db_path), check_same_thread=False, timeout=5.0)
+        self._db.row_factory = sqlite3.Row
+        self._db.execute('PRAGMA journal_mode=WAL;')      # 동시 접근(web_kiosk+web_control)
+        self._db.execute('PRAGMA busy_timeout=5000;')
+        self._init_persist_schema()
+
+    def _init_persist_schema(self) -> None:
+        c = self._db
+        c.execute('''CREATE TABLE IF NOT EXISTS catalog(
+            class_name TEXT PRIMARY KEY, display_name TEXT,
+            default_grip INTEGER DEFAULT 200, stock INTEGER DEFAULT 0)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS pick_stats(
+            class_name TEXT PRIMARY KEY, success INTEGER DEFAULT 0, fail INTEGER DEFAULT 0,
+            last_fail_reason TEXT DEFAULT '', last_fail_at TEXT DEFAULT '')''')
+        c.execute('''CREATE TABLE IF NOT EXISTS history(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ticket_no TEXT, order_id TEXT,
+            class_name TEXT, status TEXT, at TEXT)''')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_history_at ON history(at)')  # 시간대별 통계 확장용
+        c.commit()
+
+    # ── catalog (SQLite) — box는 판매/재고 대상 아니므로 제외 ──
+    def seed_catalog(self, items: list[CatalogItem]) -> None:
+        with self._lock:
+            for it in items:
+                if it.class_name == 'box':
+                    continue
+                self._db.execute(
+                    'INSERT OR IGNORE INTO catalog(class_name,display_name,default_grip,stock) '
+                    'VALUES(?,?,?,?)',
+                    (it.class_name, it.display_name, it.default_grip, it.stock))
+            self._db.commit()
+
+    def list_catalog(self) -> list[CatalogItem]:
+        with self._lock:
+            return [CatalogItem(r['class_name'], r['display_name'], r['default_grip'], r['stock'])
+                    for r in self._db.execute('SELECT * FROM catalog ORDER BY class_name')]
+
+    def get_catalog_item(self, class_name: str) -> CatalogItem | None:
+        with self._lock:
+            r = self._db.execute('SELECT * FROM catalog WHERE class_name=?', (class_name,)).fetchone()
+            return CatalogItem(r['class_name'], r['display_name'],
+                               r['default_grip'], r['stock']) if r else None
+
+    def adjust_stock(self, class_name: str, delta: int) -> None:
+        with self._lock:
+            self._db.execute('UPDATE catalog SET stock=MAX(0,stock+?) WHERE class_name=?',
+                             (int(delta), class_name))
+            self._db.commit()
+
+    def set_stock(self, class_name: str, qty: int) -> None:
+        with self._lock:
+            self._db.execute('UPDATE catalog SET stock=MAX(0,?) WHERE class_name=?',
+                             (int(qty), class_name))
+            self._db.commit()
+
+    def _adjust_stock_locked(self, class_name: str, delta: int) -> None:
+        # super가 _lock(RLock) 보유 중 호출 — SQLite는 자체 락이라 중첩 안전.
+        self._db.execute('UPDATE catalog SET stock=MAX(0,stock+?) WHERE class_name=?',
+                         (int(delta), class_name))
+        self._db.commit()
+
+    # ── pick 통계 (SQLite) ──
+    def record_pick_result(self, class_name: str, success: bool, reason: str = '') -> None:
+        with self._lock:
+            self._db.execute('INSERT OR IGNORE INTO pick_stats(class_name) VALUES(?)', (class_name,))
+            if success:
+                self._db.execute('UPDATE pick_stats SET success=success+1 WHERE class_name=?',
+                                 (class_name,))
+            else:
+                self._db.execute('UPDATE pick_stats SET fail=fail+1,last_fail_reason=?,'
+                                 'last_fail_at=? WHERE class_name=?',
+                                 (reason, self._now(), class_name))
+            self._db.commit()
+
+    def get_pick_stats(self) -> list[dict]:
+        with self._lock:
+            return [dict(r) for r in self._db.execute('SELECT * FROM pick_stats ORDER BY class_name')]
+
+    # ── 처리 이력 (SQLite) — ticket_no(번호표) 함께 저장 ──
+    def _append_history_locked(self, item: dict, status: str) -> None:
+        # super가 _lock 보유 중 호출. ticket_no는 JSON orders에서 조회.
+        oid = item.get('order_id', '')
+        ticket = self._data['orders'].get(oid, {}).get('ticket_no', '')
+        self._db.execute(
+            'INSERT INTO history(ticket_no,order_id,class_name,status,at) VALUES(?,?,?,?,?)',
+            (ticket, oid, item.get('class_name', ''), status, self._now()))
+        self._db.commit()
+
+    def list_history(self) -> list[dict]:
+        with self._lock:
+            return [dict(r) for r in self._db.execute(
+                'SELECT ticket_no,order_id,class_name,status,at FROM history ORDER BY id')]
 
 
 # ─── 스모크 테스트 ──────────────────────────────────────────

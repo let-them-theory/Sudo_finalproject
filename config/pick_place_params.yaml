@@ -81,28 +81,28 @@ object_detector:
     box_roi_enable: true
     box_roi_w: 240               # 가로 크기
     box_roi_h: 185               # 세로 크기
-    box_roi_shift_x: 170  # 화면 중앙에서 좌우 이동 (+우 / -좌)
+    box_roi_shift_x: 110  # 화면 중앙에서 좌우 이동 (+우 / -좌)
     box_roi_shift_y: -55          # 화면 중앙에서 상하 이동 (+아래 / -위)
 
     # --- 박스 위치 ROI 2 (또 하나, 초록 사각형) ---
     box_roi2_enable: true
-    box_roi2_w: 220  # 가로 크기
-    box_roi2_h: 190  # 세로 크기
-    box_roi2_shift_x: 385  # 화면 중앙에서 좌우 이동 (+우 / -좌)
+    box_roi2_w: 240  # 가로 크기
+    box_roi2_h: 185  # 세로 크기
+    box_roi2_shift_x: 320  # 화면 중앙에서 좌우 이동 (+우 / -좌)
     box_roi2_shift_y: -55        # 화면 중앙에서 상하 이동 (+아래 / -위)
 
     # --- 박스 위치 ROI 3 (또 하나, 분홍 사각형) ---
     box_roi3_enable: true
-    box_roi3_w: 255  # 가로 크기
-    box_roi3_h: 200  # 세로 크기
-    box_roi3_shift_x: 170  # 화면 중앙에서 좌우 이동 (+우 / -좌)
+    box_roi3_w: 280  # 가로 크기
+    box_roi3_h: 215  # 세로 크기
+    box_roi3_shift_x: 120  # 화면 중앙에서 좌우 이동 (+우 / -좌)
     box_roi3_shift_y: -225        # 화면 중앙에서 상하 이동 (+아래 / -위)
 
     # --- 박스 위치 ROI 4 (또 하나, 파랑 사각형) ---
     box_roi4_enable: true
-    box_roi4_w: 235  # 가로 크기
+    box_roi4_w: 260  # 가로 크기
     box_roi4_h: 195              # 세로 크기
-    box_roi4_shift_x: 393  # 화면 중앙에서 좌우 이동 (+우 / -좌)
+    box_roi4_shift_x: 375  # 화면 중앙에서 좌우 이동 (+우 / -좌)
     box_roi4_shift_y: -225       # 화면 중앙에서 상하 이동 (+아래 / -위)
 
     # --- 박스 위치 ROI 5 (또 하나, 노랑 사각형) ---

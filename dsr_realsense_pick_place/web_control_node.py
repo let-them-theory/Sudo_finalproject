@@ -68,7 +68,7 @@ from sensor_msgs.msg import Image, JointState, Range
 from std_msgs.msg import Int32, String
 from std_srvs.srv import SetBool, Trigger
 from dsr_gripper_tcp_interfaces.msg import GripperState
-from dsr_realsense_pick_place.task_repository import JsonRepository, OrderStatus, ItemStatus
+from dsr_realsense_pick_place.task_repository import HybridRepository, OrderStatus, ItemStatus
 
 try:
     from cv_bridge import CvBridge
@@ -167,8 +167,7 @@ YAML_SYNC_ACTIONS = {
     'set_confidence', 'set_calibration', 'set_gripper_params',
     'set_min_safe_z', 'set_grip_strength',
 }
-# set_parameters 성공 후에만 yaml 저장 (노드 거절 시 yaml만 바뀌는 것 방지).
-DEFER_YAML_SYNC_ACTIONS = {'set_calibration'}
+
 
 class WebControlNode(Node):
     def __init__(self):
@@ -178,7 +177,6 @@ class WebControlNode(Node):
         self.declare_parameter('http_host', '0.0.0.0')
         self.declare_parameter('http_port', 8080)
         self.declare_parameter('db_path', '')   # 빈 값이면 ~/.config 아래 기본 경로 사용
-        self.declare_parameter('params_file', '')  # launch가 넘기는 pick_place_params.yaml (install share)
         self.declare_parameter('serve_image', True)
 
         # 도달 가능 영역 필터(기존 GUI와 동일) — 범위 밖 물체는 reachable=false 로 표시.
@@ -202,6 +200,7 @@ class WebControlNode(Node):
 
         # ── 상태 캐시(ROS 스레드 전용) ──────────────────────────────────────
         self.pick_place_state = 'IDLE'
+        self._pending_calib = None  # {'x', 'y', 'z'} — DETECTING 진입 시 적용 대기
         self.last_error_text = ''
         self.hw_state = -1
         self.speed_mode = 0
@@ -282,7 +281,7 @@ class WebControlNode(Node):
         # ── 유저 주문 큐 저장소(같은 패키지의 task_repository) ─────────────────
         # 관리자 웹이 유저 주문 큐를 읽기 위해 동일한 JSON DB를 공유한다(읽기 전용 위주).
         try:
-            self._order_repo = JsonRepository()
+            self._order_repo = HybridRepository()   # 영속=SQLite(store.db 공유), 휘발=JSON
         except Exception:
             self._order_repo = None
 
@@ -369,16 +368,21 @@ class WebControlNode(Node):
     def _read_yaml_calib(self):
         """config/pick_place_params.yaml 의 object_detector.absolute_calib_* 실측값을 읽는다.
 
-        편집 가능한 src/config 우선 (install share는 colcon 전까지 구버전일 수 있음).
+        반환: {'calib_x_mm': float, 'calib_y_mm': float, 'calib_z_mm': float} 또는 None.
+        DB의 플레이스홀더가 아니라 yaml이 캘리브의 진실(single source)이다.
         """
-        path = self._find_source_params_yaml()
+        path = None
+        # 1) 노드 params_file 파라미터(있다면) 우선.
+        try:
+            pf = str(self.get_parameter('params_file').value).strip()
+            if pf and Path(pf).expanduser().is_file():
+                path = Path(pf).expanduser()
+        except Exception:
+            path = None
+        # 2) 소스 트리의 yaml(인라인 저장 대상과 동일 경로).
         if path is None:
-            try:
-                pf = str(self.get_parameter('params_file').value).strip()
-                if pf and Path(pf).expanduser().is_file():
-                    path = Path(pf).expanduser()
-            except Exception:
-                path = None
+            path = self._find_source_params_yaml()
+        # 3) 패키지 share 의 yaml 폴백.
         if path is None:
             try:
                 from ament_index_python.packages import get_package_share_directory
@@ -451,58 +455,37 @@ class WebControlNode(Node):
 
     # ── config/pick_place_params.yaml 영구 저장 (기존 GUI의 yaml 저장 재현) ───
     def _find_source_params_yaml(self):
-        """pick_place_params.yaml 경로 — launch와 동일한 src/config 우선."""
-        rel_name = 'pick_place_params.yaml'
+        """config/pick_place_params.yaml 의 '소스' 경로를 찾는다.
+
+        install/share 의 yaml은 build 디렉터리로 향하는 심볼릭 링크이므로,
+        IDE에서 보는 src 트리의 원본이 갱신되도록 경로에 'src'가 포함된 후보를
+        우선한다.
+        """
+        rel = Path('config') / 'pick_place_params.yaml'
         candidates = []
-        seen = set()
-
-        def add(path):
-            try:
-                rp = Path(path).expanduser().resolve()
-            except OSError:
-                return
-            if rp.is_file() and rp not in seen:
-                seen.add(rp)
-                candidates.append(rp)
-
-        try:
-            pf = str(self.get_parameter('params_file').value).strip()
-            if pf:
-                add(pf)
-        except Exception:
-            pass
-
         here = Path(__file__).resolve()
         for parent in here.parents:
-            add(parent / 'config' / rel_name)
-            add(parent / 'src' / 'config' / rel_name)
-        add(Path.cwd() / 'src' / 'config' / rel_name)
-        add(Path.cwd() / 'config' / rel_name)
+            candidates.append(parent / rel)
+            candidates.append(parent / 'mini_project' / rel)
+            candidates.append(parent / 'src' / 'mini_project' / rel)
+        candidates.append(Path.cwd() / rel)
+        candidates.append(Path.cwd() / 'src' / 'mini_project' / rel)
 
-        try:
-            from ament_index_python.packages import get_package_share_directory
-            add(Path(get_package_share_directory('dsr_realsense_pick_place'))
-                / 'config' / rel_name)
-        except Exception:
-            pass
-
-        if not candidates:
+        existing = []
+        seen = set()
+        for c in candidates:
+            try:
+                rp = c.resolve()
+            except OSError:
+                continue
+            if rp.is_file() and rp not in seen:
+                seen.add(rp)
+                existing.append(rp)
+        if not existing:
             return None
-
-        def rank(p):
-            parts = p.parts
-            if 'src' in parts:
-                idx = parts.index('src')
-                if idx + 1 < len(parts) and parts[idx + 1] == 'config':
-                    return 0
-            if p.parent.name == 'config':
-                return 1
-            if 'share' in parts:
-                return 2
-            return 5
-
-        candidates.sort(key=rank)
-        return candidates[0]
+        # 'src' 트리 우선.
+        existing.sort(key=lambda p: 0 if 'src' in p.parts else 1)
+        return existing[0]
 
     def _sync_yaml(self):
         """현재 DB 설정값을 yaml의 해당 라인만 교체해 저장(인라인 주석 보존).
@@ -584,8 +567,22 @@ class WebControlNode(Node):
         self.gripper_init_progress_t = time.monotonic()
 
     def _cb_state(self, msg: String):
+        prev = self.pick_place_state
         self.pick_place_state = msg.data
         self.last_state_time = time.monotonic()
+        if self.pick_place_state == 'DETECTING' and prev != 'DETECTING' and self._pending_calib:
+            p = self._pending_calib
+            self._pending_calib = None
+            if self.cli_object_set_parameters.service_is_ready():
+                req = SetParameters.Request()
+                req.parameters = [
+                    self._make_param('absolute_calib_x_mm', ParameterType.PARAMETER_DOUBLE, p['x']),
+                    self._make_param('absolute_calib_y_mm', ParameterType.PARAMETER_DOUBLE, p['y']),
+                    self._make_param('absolute_calib_z_mm', ParameterType.PARAMETER_DOUBLE, p['z']),
+                ]
+                self.cli_object_set_parameters.call_async(req)
+                self.get_logger().info(
+                    f'pending calib 적용: x={p["x"]} y={p["y"]} z={p["z"]}mm')
 
     def _cb_error(self, msg: String):
         self.last_error_text = msg.data
@@ -610,9 +607,9 @@ class WebControlNode(Node):
             pass
 
     def _cb_ultrasonic(self, msg: Range):
-        if msg.range is not None:
-            self.last_ultrasonic_time = time.monotonic()
+        if msg.range is not None and msg.range > 0.0:
             self.ultrasonic_range_m = float(msg.range)
+            self.last_ultrasonic_time = time.monotonic()
 
     def _cb_objects(self, msg: String):
         try:
@@ -704,14 +701,10 @@ class WebControlNode(Node):
         self._put_state('gripper_position_raw', round(float(self.gripper_present_position), 1))
         self._put_state('gripper_init_progress', self.gripper_init_progress)
         self._put_state('ultrasonic_mm',
-                        None if self.ultrasonic_range_m is None
-                        else round(self.ultrasonic_range_m * 1000.0, 1))
+                        None if self.ultrasonic_range_m is None else round(self.ultrasonic_range_m * 1000.0, 1))
         self._put_state('system_status', system_status)
         self._put_state('system_reset_phase', self._system_reset_phase)
         self._put_state('current_model_path', self.current_model_path)
-        self._put_state('calib_x_mm', self._get_setting('calib_x_mm'))
-        self._put_state('calib_y_mm', self._get_setting('calib_y_mm'))
-        self._put_state('calib_z_mm', self._get_setting('calib_z_mm'))
 
         # 검출 물체 테이블 교체(매 갱신마다 비우고 다시 채움).
         self.db.execute('DELETE FROM detected_objects')
@@ -796,11 +789,10 @@ class WebControlNode(Node):
             # 설정 변경 명령은 DB뿐 아니라 yaml에도 영구 반영(기존 GUI의 yaml 저장 재현).
             # 부팅 시 DB→노드 재적용 명령(_startup)은 yaml을 건드리지 않는다.
             if action in YAML_SYNC_ACTIONS and not payload.get('_startup'):
-                if action not in DEFER_YAML_SYNC_ACTIONS:
-                    try:
-                        self._sync_yaml()
-                    except Exception as e:
-                        self.get_logger().warn(f'yaml 동기화 경고: {e}')
+                try:
+                    self._sync_yaml()
+                except Exception as e:
+                    self.get_logger().warn(f'yaml 동기화 경고: {e}')
 
     def _mark_command(self, cmd_id, status, result):
         done_ts = time.time() if status in ('done', 'failed') else None
@@ -848,23 +840,17 @@ class WebControlNode(Node):
             return
 
         if action == 'set_calibration':
-            def _f(v, key, default=0.0):
-                if v is None or v == '':
-                    cur = self._get_setting(key)
-                    return float(cur if cur is not None else default)
-                return float(v)
-
-            x = _f(payload.get('x'), 'calib_x_mm')
-            y = _f(payload.get('y'), 'calib_y_mm')
-            z = _f(payload.get('z'), 'calib_z_mm')
-            self._set_setting('calib_x_mm', x)
-            self._set_setting('calib_y_mm', y)
-            self._set_setting('calib_z_mm', z)
-            self._set_params(cmd_id, self.cli_object_set_parameters, [
-                ('absolute_calib_x_mm', ParameterType.PARAMETER_DOUBLE, x),
-                ('absolute_calib_y_mm', ParameterType.PARAMETER_DOUBLE, y),
-                ('absolute_calib_z_mm', ParameterType.PARAMETER_DOUBLE, z),
-            ], sync_yaml_on_success=True)
+            x = float(payload.get('x', 0.0)); y = float(payload.get('y', 0.0)); z = float(payload.get('z', 0.0))
+            self._set_setting('calib_x_mm', x); self._set_setting('calib_y_mm', y); self._set_setting('calib_z_mm', z)
+            if self.pick_place_state == 'IDLE':
+                self._set_params(cmd_id, self.cli_object_set_parameters, [
+                    ('absolute_calib_x_mm', ParameterType.PARAMETER_DOUBLE, x),
+                    ('absolute_calib_y_mm', ParameterType.PARAMETER_DOUBLE, y),
+                    ('absolute_calib_z_mm', ParameterType.PARAMETER_DOUBLE, z),
+                ])
+            else:
+                self._pending_calib = {'x': x, 'y': y, 'z': z, 'cmd_id': cmd_id}
+                self._mark_command(cmd_id, 'done', f'다음 DETECTING 시 적용 예약 (현재 {self.pick_place_state})')
             return
 
         if action == 'set_model':
@@ -1025,7 +1011,7 @@ class WebControlNode(Node):
             return
         self._mark_command(cmd_id, 'done' if res.success else 'failed', res.message)
 
-    def _set_params(self, cmd_id, client, params, sync_yaml_on_success=False):
+    def _set_params(self, cmd_id, client, params):
         """params: [(name, ParameterType, value), ...] 를 set_parameters 로 호출."""
         if not client.service_is_ready():
             self._mark_command(cmd_id, 'failed', 'set_parameters 서비스 미연결')
@@ -1042,22 +1028,7 @@ class WebControlNode(Node):
                 self._mark_command(cmd_id, 'failed', str(e))
                 return
             if ok:
-                msg = '적용 완료'
-                if sync_yaml_on_success:
-                    try:
-                        path, missing = self._sync_yaml()
-                        if path:
-                            msg += f' · yaml 저장 ({path.name})'
-                        if missing:
-                            msg += f' · 누락: {missing}'
-                    except Exception as e:
-                        msg += f' · yaml 경고: {e}'
-                calib = self._get_setting('calib_z_mm')
-                if calib is not None:
-                    self._put_state('calib_z_mm', calib)
-                    self._put_state('calib_x_mm', self._get_setting('calib_x_mm'))
-                    self._put_state('calib_y_mm', self._get_setting('calib_y_mm'))
-                self._mark_command(cmd_id, 'done', msg)
+                self._mark_command(cmd_id, 'done', '적용 완료')
             else:
                 reason = next((r.reason for r in results if not r.successful), '거절')
                 self._mark_command(cmd_id, 'failed', f'거절: {reason}')
@@ -1197,6 +1168,9 @@ class WebControlNode(Node):
                     show_all = 'all=1' in qs
                     self._send_json(self._read_orders(show_all=show_all))
                     return
+                if path == '/api/lockers':
+                    self._send_json(self._read_lockers())
+                    return
                 if path == '/api/log':
                     self._send_json(self._read_log())
                     return
@@ -1217,7 +1191,8 @@ class WebControlNode(Node):
             def do_POST(self):
                 path = self.path.split('?', 1)[0]
                 if path not in ('/api/command', '/api/orders/cancel', '/api/orders/pause',
-                                '/api/orders/cancel_item'):
+                                '/api/orders/cancel_item', '/api/lockers/release',
+                                '/api/lockers/reset', '/api/lockers/pickup'):
                     self._send_json({'error': 'not found'}, 404)
                     return
                 length = int(self.headers.get('Content-Length', 0))
@@ -1255,6 +1230,32 @@ class WebControlNode(Node):
                             paused = not node._order_repo.is_queue_paused()
                         node._order_repo.set_queue_paused(paused)
                         self._send_json({'ok': True, 'paused': paused})
+                    except Exception as e:
+                        self._send_json({'ok': False, 'error': str(e)}, 500)
+                    return
+                # 락커 관리(강제해제 / 전체리셋 / 대리수령).
+                if path in ('/api/lockers/release', '/api/lockers/reset',
+                            '/api/lockers/pickup'):
+                    if node._order_repo is None:
+                        self._send_json({'ok': False, 'error': 'DB 없음'}, 503)
+                        return
+                    try:
+                        node._order_repo.reload()
+                        if path == '/api/lockers/release':
+                            try:
+                                lid = int(body.get('id', 0))
+                            except (TypeError, ValueError):
+                                self._send_json({'ok': False, 'error': 'id는 정수여야 함'}, 400)
+                                return
+                            self._send_json({'ok': bool(node._order_repo.release_locker(lid))})
+                        elif path == '/api/lockers/reset':
+                            node._order_repo.reset_lockers()
+                            self._send_json({'ok': True})
+                        else:
+                            res = node._order_repo.confirm_pickup(
+                                str(body.get('token', '') or ''))
+                            self._send_json(
+                                {'ok': bool(res and res.get('ok')), 'detail': res})
                     except Exception as e:
                         self._send_json({'ok': False, 'error': str(e)}, 500)
                     return
@@ -1338,7 +1339,9 @@ class WebControlNode(Node):
                         statuses = {OrderStatus.QUEUED, OrderStatus.RUNNING, OrderStatus.PAUSED,
                                     OrderStatus.DONE, OrderStatus.FAILED, OrderStatus.CANCELED}
                     else:
-                        statuses = {OrderStatus.QUEUED, OrderStatus.RUNNING, OrderStatus.PAUSED}
+                        # DONE(배달완료=수령대기) 포함 — 락커별 수령 상태 표시용.
+                        statuses = {OrderStatus.QUEUED, OrderStatus.RUNNING,
+                                    OrderStatus.PAUSED, OrderStatus.DONE}
                     orders = []
                     for o in repo.list_orders(statuses):
                         items = []
@@ -1357,10 +1360,22 @@ class WebControlNode(Node):
                             'status': o.status,
                             'items': items,
                             'created_at': o.created_at,
+                            'locker_id': o.locker_id,
+                            'qr_token': o.qr_token,
                         })
                     return {'orders': orders, 'paused': bool(repo.is_queue_paused())}
                 except Exception as e:
                     return {'orders': [], 'paused': False, 'error': str(e)}
+
+            def _read_lockers(self):
+                repo = node._order_repo
+                if repo is None:
+                    return {'lockers': [], 'error': 'DB 없음'}
+                try:
+                    repo.reload()
+                    return {'lockers': repo.list_lockers()}
+                except Exception as e:
+                    return {'lockers': [], 'error': str(e)}
 
             def _read_command(self, cid):
                 conn = self._db()
@@ -1500,7 +1515,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .obj-info{background:#2a2a2a;border-radius:5px;padding:5px 7px;margin:3px 0;font-size:12px;border-left:3px solid #555;}
   .obj-info.reach{border-left-color:#2a6a2a;}
   .obj-info.unreach{opacity:.5;}
-  #obj-sel-row{display:flex;flex-wrap:wrap;gap:4px;margin:6px 0 2px;}
+  .obj-row-wrap{display:flex;align-items:center;gap:4px;margin:6px 0 2px;height:34px;}
+  .obj-row-label{font-size:10px;color:#666;min-width:44px;text-align:right;flex-shrink:0;}
+  .obj-row-btns{display:flex;gap:4px;overflow-x:auto;overflow-y:hidden;flex:1;height:34px;align-items:center;}
+  .obj-row-btns::-webkit-scrollbar{height:3px;}.obj-row-btns::-webkit-scrollbar-thumb{background:#444;}
   /* orders */
   .order{border-radius:7px;padding:7px 9px;margin:5px 0;border-left:5px solid #555;background:#2a2a2a;}
   .order.running,.order.run{border-left-color:#1a8a1a;background:#1a2e1a;}
@@ -1514,6 +1532,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .badge.run,.badge.running{background:#1a7a1a;}
   .badge.pause{background:#c89000;color:#111;}
   .badge.queued{background:#555;}
+  .locker-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;}
+  .lk{border-radius:6px;padding:6px;font-size:11px;background:#2a2a2a;border-left:5px solid #555;}
+  .lk.free{border-left-color:#555;opacity:.55;}
+  .lk.occupied{border-left-color:#c89000;background:#2a2610;}
+  .lk.ready{border-left-color:#1a8a1a;background:#1a2e1a;}
+  .lk .lkid{font-weight:bold;font-size:13px;}
+  .lk .lkcode{font-family:monospace;font-size:14px;font-weight:bold;letter-spacing:2px;color:#ffd24d;margin-top:2px;}
+  .lk button{font-size:10px;padding:2px 5px;margin:3px 2px 0 0;}
   .badge.done{background:#2255aa;}
   .badge.failed{background:#993300;}
   .badge.canceled{background:#553300;}
@@ -1581,15 +1607,23 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <div id="orders"><small>불러오는 중...</small></div>
     </div>
     <div class="card">
+      <h3>락커 현황 <button onclick="resetLockers()" style="float:right;font-size:11px;padding:2px 8px">전체 리셋</button></h3>
+      <div id="lockers" class="locker-grid"><small>불러오는 중...</small></div>
+    </div>
+    <div class="card">
       <h3>카메라 / 검출 &nbsp;<small id="sel-label" style="color:#9fd0ff;">선택: 자동</small></h3>
       <div id="cam-wrap">
         <img id="cam" alt="카메라 영상" src="">
         <div id="cam-no">NO CAMERA</div>
       </div>
-      <div id="obj-sel-row">
-        <button id="sel-auto" class="active-sel" onclick="selectObject('')">🎯 자동</button>
+      <div class="obj-row-wrap">
+        <span class="obj-row-label">Known</span>
+        <div id="known-row" class="obj-row-btns"></div>
       </div>
-      <div id="objects" style="margin-top:4px;"></div>
+      <div class="obj-row-wrap">
+        <span class="obj-row-label">Unknown</span>
+        <div id="unknown-row" class="obj-row-btns"></div>
+      </div>
     </div>
   </div>
 
@@ -1600,6 +1634,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <button id="estop-btn" class="danger" style="width:100%;padding:14px;font-size:15px;font-weight:bold;margin-bottom:6px;" onclick="toggleEStop()">⛔ 긴급정지</button>
       <button class="warn" onclick="cmd('cancel')">🚫 태스크 중단</button>
       <button onclick="cmd('clear_error')">🔄 에러 해제</button>
+      <button onclick="cmd('go_home')">🏠 홈 복귀</button>
     </div>
     <div class="card">
       <h3>로봇 동작</h3>
@@ -1607,8 +1642,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <button onclick="cmd('run_once')">▶ 한번실행</button>
         <button class="go" onclick="cmd('sort_all')">🗂 자동 분류</button>
         <button onclick="cmd('run_once_package')">📦 패키지 픽</button>
-        <button onclick="cmd('go_home')">🏠 HOME</button>
-        <button onclick="cmd('recover_to_home')">🔧 에러복구&HOME</button>
         <button onclick="cmd('speed_normal')">🟢 정상속도</button>
         <button onclick="cmd('speed_reduced')">🟡 저속</button>
         <span></span>
@@ -1629,18 +1662,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <button onclick="cmd('set_camera_exposure',{value:+v('exp')})">적용</button></div>
     </div>
     <div class="card">
-      <h3>캘리브레이션 (mm)</h3>
+      <h3>캘리브레이션 (mm, IDLE 전용)</h3>
       <div class="row">
         X<input id="cx" type="number" step="1" style="width:65px">
         Y<input id="cy" type="number" step="1" style="width:65px">
         Z<input id="cz" type="number" step="1" style="width:65px">
       </div>
-      <div class="row" style="margin-top:4px;">
-        <button onclick="loadCalibration()">불러오기</button>
-        <button class="go" onclick="applyCalibration()">적용</button>
-        <button onclick="applyCalibZ()">Z만 적용</button>
-      </div>
-      <small id="calib-status" style="color:#9fd0ff;display:block;margin-top:6px;">적용 시 object_detector에 즉시 반영 + yaml 저장</small>
+      <button onclick="cmd('load_calibration')">불러오기</button>
+      <button onclick="cmd('set_calibration',{x:+v('cx'),y:+v('cy'),z:+v('cz')})">적용</button>
     </div>
   </div>
 
@@ -1769,19 +1798,6 @@ function showTab(t){
 }
 
 // ── cmd() ────────────────────────────────────────────────────────────────────
-async function waitCommandResult(cmdId, timeoutMs=8000){
-  const t0=Date.now();
-  while(Date.now()-t0<timeoutMs){
-    await new Promise(r=>setTimeout(r,200));
-    try{
-      const j=await(await fetch('/api/command/'+cmdId)).json();
-      if(j.status==='done') return {ok:true, msg:j.result||'완료'};
-      if(j.status==='failed') return {ok:false, msg:j.result||'실패'};
-    }catch(e){}
-  }
-  return {ok:false, msg:'타임아웃'};
-}
-
 async function cmd(action, payload={}){
   try{
     const r = await fetch('/api/command',{method:'POST',
@@ -1796,48 +1812,6 @@ async function cmd(action, payload={}){
   }
 }
 
-function calibPayload(){
-  const cx=v('cx'), cy=v('cy'), cz=v('cz');
-  const p={};
-  if(cx!=='') p.x=+cx;
-  if(cy!=='') p.y=+cy;
-  if(cz!=='') p.z=+cz;
-  return p;
-}
-
-async function applyCalibration(){
-  const st=$('calib-status');
-  const p=calibPayload();
-  if(p.x==null&&p.y==null&&p.z==null){
-    if(st) st.textContent='X/Y/Z 중 하나 이상 입력하세요';
-    return;
-  }
-  if(st) st.textContent='적용 중...';
-  const j=await cmd('set_calibration', p);
-  if(!j.id){ if(st) st.textContent='명령 전송 실패'; return; }
-  const res=await waitCommandResult(j.id);
-  if(st) st.textContent=res.ok?('✅ '+res.msg):('❌ '+res.msg);
-  if(res.ok) loadSettings(true);
-}
-
-async function applyCalibZ(){
-  const cz=v('cz');
-  if(cz===''){ const st=$('calib-status'); if(st) st.textContent='Z 값을 입력하세요'; return; }
-  await applyCalibration();
-}
-
-async function loadCalibration(){
-  const st=$('calib-status');
-  if(st) st.textContent='노드에서 불러오는 중...';
-  const j=await cmd('load_calibration');
-  if(!j.id){ if(st) st.textContent='불러오기 실패'; return; }
-  const res=await waitCommandResult(j.id);
-  if(res.ok){
-    await loadSettings(true);
-    if(st) st.textContent='✅ 노드 파라미터에서 불러옴';
-  }else if(st) st.textContent='❌ '+res.msg;
-}
-
 function applyGripper(){
   cmd('set_gripper_params',{
     open_current:+v('goc'),close_current:+v('gcc'),transport_current:+v('gtc'),
@@ -1846,10 +1820,10 @@ function applyGripper(){
 
 // ── 설정 로드 ────────────────────────────────────────────────────────────────
 let settingsLoaded=false, gripNames=[], gripCurrents=[];
-async function loadSettings(force=false){
+async function loadSettings(){
   try{
     const s=await(await fetch('/api/settings')).json();
-    const set=(id,k)=>{if($(id)&&s[k]!=null&&(force||$(id).value===''))$(id).value=s[k];};
+    const set=(id,k)=>{if($(id)&&s[k]!=null&&$(id).value==='')$(id).value=s[k];};
     set('conf','confidence_threshold'); set('exp','camera_exposure');
     set('cx','calib_x_mm'); set('cy','calib_y_mm'); set('cz','calib_z_mm');
     set('goc','gripper_open_current'); set('gcc','gripper_close_current');
@@ -1984,7 +1958,7 @@ function usColor(mm){
 }
 function updateUs(mm){
   const fill=$('us-fill'),lbl=$('us-lbl'),mark=$('us-mark');
-  if(mm==null){
+  if(mm==null||mm<0){
     if(fill)fill.style.width='0%';
     if(lbl)lbl.textContent='- mm';
     return;
@@ -2007,30 +1981,23 @@ function updateSelLabel(){
   if(el)el.textContent='선택: '+(selectedLabel||'자동');
 }
 function renderObjArea(objects){
-  const row=$('obj-sel-row');
-  if(row){
-    const selBtns=objects.filter(o=>o.label!=='box'&&o.reachable);
-    const seen={},labels=[];
-    selBtns.forEach(o=>{if(!seen[o.label]){seen[o.label]=1;labels.push(o.label);}});
-    const auto=`<button id="sel-auto" class="${selectedLabel===''?'active-sel':''}" onclick="selectObject('')">🎯 자동</button>`;
-    const btns=labels.map(lb=>{
-      const act=lb===selectedLabel?'active-sel':'';
-      return `<button class="${act}" onclick="selectObject('${lb}')">${lb}</button>`;
-    }).join('');
-    row.innerHTML=auto+btns;
-  }
-  const objDiv=$('objects');
-  if(objDiv){
-    objDiv.innerHTML=objects.map(o=>{
-      const isBox=o.label==='box';
-      const p=o.pose||{};
-      const cls='obj-info'+(o.reachable&&!isBox?' reach':' unreach');
-      return `<div class="${cls}">${o.label}`+
-        `<small style="margin-left:8px;">conf ${(o.confidence||0).toFixed(2)}`+
-        ` · [${(p.x||0).toFixed(2)},${(p.y||0).toFixed(2)},${(p.z||0).toFixed(2)}]m`+
-        `${isBox?' · 이동불가(box)':(o.reachable?'':' · 도달불가')}</small></div>`;
-    }).join('')||'<small>검출된 물체 없음</small>';
-  }
+  const selBtns=objects.filter(o=>o.label!=='box'&&o.label!=='source_zone'&&o.reachable);
+  const seen={},knownLabels=[],unknownLabels=[];
+  selBtns.forEach(o=>{
+    if(!seen[o.label]){
+      seen[o.label]=1;
+      if(o.label.startsWith('unknown')) unknownLabels.push(o.label);
+      else knownLabels.push(o.label);
+    }
+  });
+  const mkBtn=lb=>{
+    const act=lb===selectedLabel?'active-sel':'';
+    return `<button class="${act}" onclick="selectObject('${lb}')">${lb}</button>`;
+  };
+  const kRow=$('known-row');
+  if(kRow) kRow.innerHTML=knownLabels.map(mkBtn).join('');
+  const uRow=$('unknown-row');
+  if(uRow) uRow.innerHTML=unknownLabels.map(mkBtn).join('');
   updateSelLabel();
 }
 
@@ -2065,10 +2032,6 @@ async function poll(){
     updateUs(s.ultrasonic_mm);
     const mp=s.current_model_path||'';
     if(mp&&$('model-path'))$('model-path').textContent=mp;
-    const cs=$('calib-status');
-    if(cs&&s.calib_z_mm!=null&&!cs.textContent.startsWith('✅')&&!cs.textContent.startsWith('❌')){
-      cs.textContent=`적용값 X=${s.calib_x_mm} Y=${s.calib_y_mm} Z=${s.calib_z_mm} mm · 물체 pose Z에 반영`;
-    }
   }catch(e){$('activity').textContent='연결 끊김: '+e;}
   if(!settingsLoaded)loadSettings();
 }
@@ -2106,13 +2069,16 @@ function renderOrderCard(o){
            `<span class="badge ${ic}" style="font-size:9px;">${statusKo(it.status)}</span>${cb}</div>`;
   }).join('');
   const isDone=o.status==='DONE'||o.status==='CANCELED'||o.status==='FAILED';
-  const cancelBtn=isDone?'':
-    `<button class="item-cancel" style="margin-left:auto;" onclick="cancelOrder('${o.order_id}')">취소</button>`;
+  const lk=o.locker_id?`<span class="badge done" style="margin-left:6px;">🔒${o.locker_id}번</span>`:'';
+  // 수령대기(DONE)는 대리수령, 진행 중이면 취소.
+  const actBtn = o.status==='DONE' && o.qr_token
+    ? `<button class="item-cancel" style="margin-left:auto;background:#1a7a1a;" onclick="pickupLocker('${o.qr_token}')">수령</button>`
+    : (isDone?'':`<button class="item-cancel" style="margin-left:auto;" onclick="cancelOrder('${o.order_id}')">취소</button>`);
   return `<div class="order ${cls}">`+
     `<div style="display:flex;align-items:center;margin-bottom:4px;">`+
     `<span class="tk">${o.ticket_no||o.order_id}</span>`+
     `<span class="badge ${cls}" style="margin-left:6px;">${statusKo(o.status)}</span>`+
-    cancelBtn+`</div>`+
+    lk+actBtn+`</div>`+
     `${items||'<small>품목 없음</small>'}`+
     `<div style="margin-top:3px;"><small>${o.created_at||''}</small></div></div>`;
 }
@@ -2131,6 +2097,40 @@ async function pollOrders(){
   }catch(e){const el=$('orders');if(el)el.innerHTML='<small>큐 로드 실패: '+e+'</small>';}
 }
 setInterval(pollOrders,1500); pollOrders();
+
+// ── 락커 현황 ───────────────────────────────────────────────────────────────
+const LK_KO={free:'비어있음',occupied:'배달중',ready:'수령대기'};
+async function releaseLocker(id){
+  if(!confirm(id+'번 락커를 강제 해제할까요?'))return;
+  await fetch('/api/lockers/release',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
+  pollLockers(); pollOrders();
+}
+async function pickupLocker(token){
+  if(!confirm('대리 수령 처리할까요? (락커 해제)'))return;
+  const j=await(await fetch('/api/lockers/pickup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token})})).json();
+  if(!j.ok)alert('수령 처리 실패: '+(j.error||(j.detail&&j.detail.status)||'아직 준비 안 됨'));
+  pollLockers(); pollOrders();
+}
+async function resetLockers(){
+  if(!confirm('모든 락커를 초기화할까요?'))return;
+  await fetch('/api/lockers/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+  pollLockers(); pollOrders();
+}
+async function pollLockers(){
+  try{
+    const d=await(await fetch('/api/lockers')).json();
+    const el=$('lockers'); if(!el)return;
+    el.innerHTML=(d.lockers||[]).map(l=>{
+      const st=l.status||'free', tk=l.ticket_no?(' '+l.ticket_no):'';
+      // 수령 번호(qr_token) — 점유 칸만. 관리자 확인/대리수령용.
+      const code=(st!=='free'&&l.qr_token)?`<div class="lkcode">🔑 ${l.qr_token}</div>`:'';
+      let b=''; if(st==='ready')b+=`<button onclick="pickupLocker('${l.qr_token}')">수령처리</button>`;
+      if(st!=='free')b+=`<button onclick="releaseLocker(${l.id})">해제</button>`;
+      return `<div class="lk ${st}"><div class="lkid">#${l.id}</div><div>${LK_KO[st]||st}${tk}</div>${code}${b}</div>`;
+    }).join('')||'<small>락커 없음</small>';
+  }catch(e){const el=$('lockers');if(el)el.innerHTML='<small>락커 로드 실패: '+e+'</small>';}
+}
+setInterval(pollLockers,1500); pollLockers();
 
 // ── 유저 큐 탭 전체 관리 ─────────────────────────────────────────────────────
 async function pollUser(){

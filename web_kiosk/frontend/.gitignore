@@ -8,7 +8,7 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
-dist
+# dist 는 키오스크 빌드물 — 재현성 위해 추적(clone 시 바로 뜸). colcon이 share로 install.
 dist-ssr
 *.local
 

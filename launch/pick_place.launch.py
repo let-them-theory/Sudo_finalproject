@@ -114,6 +114,16 @@ def generate_launch_description():
             'align_depth.enable': 'true',
             'pointcloud.enable':  'false',
             'serial_no':          LaunchConfiguration('camera_serial'),
+            # 자동 연결 — serial_no 비우면 첫 장치 자동 선택.
+            # initial_reset: 시작 시 USB 하드웨어 리셋(이전 세션 wedge·USB 충돌 복구).
+            'initial_reset':            'true',
+            # 장치가 늦게 떠도 무한 대기(USB 재인식 시간 확보).
+            'wait_for_device_timeout':  '-1.0',
+            # 런타임 분리/재연결 시 자동 재연결.
+            'reconnect_timeout':        '6.0',
+            # 컬러/depth 해상도 640x480@30 고정 (형식: 'W,H,FPS'). ROI·면적 필터가 이 해상도 기준.
+            'rgb_camera.color_profile':   '640,480,30',
+            'depth_module.depth_profile': '640,480,30',
         }.items(),
         condition=IfCondition(LaunchConfiguration('use_realsense')),
     )
