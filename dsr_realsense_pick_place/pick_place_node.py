@@ -9,7 +9,8 @@ Doosan E0509 Pick & Place 상태머신 노드.
   → ERROR : 예외 발생 시 수동 복구 대기
 
 구독:
-  /selected_object_pose  (geometry_msgs/PoseStamped)
+  /selected_object  (std_msgs/String, JSON) — pick 타겟 통합: 좌표+class+place_zone+grasp_width
+                    (별도 토픽 도착순서 race 제거용으로 object_detector가 한 메시지로 묶어 발행)
 
 발행:
   /pick_place_state        (std_msgs/String)
@@ -31,7 +32,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import JointState, Range
-from std_msgs.msg import Int32, String, Bool, Float32
+from std_msgs.msg import Int32, String, Bool
 from dsr_gripper_tcp_interfaces.msg import GripperState
 from rcl_interfaces.srv import SetParameters
 from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType, SetParametersResult
@@ -198,6 +199,9 @@ class PickPlaceNode(Node):
         self.declare_parameter('sort_roi_zone_place_j4', [0.0, 0.0, 0.0, 0.0, 0.0])
         self.declare_parameter('sort_roi_zone_place_j5', [0.0, 0.0, 0.0, 0.0, 0.0])
         self.declare_parameter('sort_roi_zone_place_j6', [0.0, 0.0, 0.0, 0.0, 0.0])
+        # use_joints 구역의 place 마무리: 슬롯 cartesian 대신 그 자리에서 J6만 이 각도(deg)만큼
+        # 회전 후 그리퍼 open(먼 슬롯 movel 1206 회피). 0=회전 없이 바로 open.
+        self.declare_parameter('sort_roi_zone_place_j6_rotate_deg', [0.0, 0.0, 0.0, 0.0, 0.0])
         # 구역별 MOVE_TO_PLACE ② 중간 waypoint(movel, grasp_rpy·approach_z 유지). 0=없음, 1~2=wp1(,wp2).
         self.declare_parameter('sort_roi_zone_transit_wp_count', [0, 0, 0, 0, 0])
         self.declare_parameter('sort_roi_zone_transit_wp1_x', [0.0, 0.0, 0.0, 0.0, 0.0])
@@ -282,13 +286,19 @@ class PickPlaceNode(Node):
         self._rebuild_grip_current_map(
             list(self.get_parameter('grip_class_names').value),
             list(self.get_parameter('grip_class_currents').value))
-        # 파지 직전 갱신되는 현재 대상 물체 클래스 (/selected_object_class 구독)
+        # 현재 대상 물체 클래스 — /selected_object 메시지 수락 시 좌표와 함께 설정
         self._target_object_class = ''
-        # object_detector가 결정한 배치 box_roi 구역(1~5). 0=미지정.
+        # object_detector가 결정한 배치 box_roi 구역(1~5). 0=미지정. /selected_object와 함께 설정.
         self._target_place_zone = 0
         self._target_z_surface: float | None = None  # 카메라 원본 Z(초음파 z_floor용)
-        # 현재 대상 물체의 PCA 단축 폭(mm, /selected_object_grasp_width 구독). 동적 초음파 파지거리용.
+        # 현재 대상 물체의 PCA 단축 폭(mm) — /selected_object와 함께 설정. 동적 초음파 파지거리용.
         self._target_grasp_width_mm: float | None = None
+        # pose 수락 시점에 고정 — 사이클 중 detector 갱신·이전 사이클 잔존과 분리.
+        self._latched_object_class = ''
+        self._latched_place_zone = 0
+        self._latched_grasp_width_mm: float | None = None
+        # True면 이번 물체 사이클 완료 전까지 detector/콜백이 타겟을 바꿀 수 없음.
+        self._target_locked = False
         # 현재 사이클의 Place 목표 좌표. 파지 확정 시 box_roi 구역으로 결정(폴백: place_position).
         self._active_place_pos = list(self.place_pos)
         self._active_place_zone_idx = None
@@ -335,6 +345,7 @@ class PickPlaceNode(Node):
         _zj4 = list(self.get_parameter('sort_roi_zone_place_j4').value)
         _zj5 = list(self.get_parameter('sort_roi_zone_place_j5').value)
         _zj6 = list(self.get_parameter('sort_roi_zone_place_j6').value)
+        _zj6r = list(self.get_parameter('sort_roi_zone_place_j6_rotate_deg').value)
         _zwc = list(self.get_parameter('sort_roi_zone_transit_wp_count').value)
         _zw1x = list(self.get_parameter('sort_roi_zone_transit_wp1_x').value)
         _zw1y = list(self.get_parameter('sort_roi_zone_transit_wp1_y').value)
@@ -356,6 +367,10 @@ class PickPlaceNode(Node):
         self.sort_zone_joints: list = [
             [float(_zj1[i]), float(_zj2[i]), float(_zj3[i]),
              float(_zj4[i]), float(_zj5[i]), float(_zj6[i])]
+            for i in range(_nz)
+        ]
+        self.sort_zone_j6_rotate: list = [
+            float(_zj6r[i]) if i < len(_zj6r) else 0.0
             for i in range(_nz)
         ]
         self.sort_zone_transit_wp_count: list = [int(_zwc[i]) for i in range(_nz)]
@@ -492,6 +507,8 @@ class PickPlaceNode(Node):
         self.pub_sorted_class = self.create_publisher(String,         '/pick_place/sorted_class', 10)
         # 자동 분류(sort_all) 중 object_detector 자동선택을 ws(박스밖) 물체로만 제한.
         self.pub_sort_ws_only = self.create_publisher(Bool,           '/sort_ws_only', 10)
+        # True 동안 object_detector가 새 pick 타겟(pose/class/zone) 발행 금지.
+        self.pub_target_locked = self.create_publisher(Bool,          '/pick_place/target_locked', 10)
         self.pub_motion_active = self.create_publisher(Bool, '/gripper_service/motion_active', 10)
         self.pub_hw_state    = self.create_publisher(Int32,           '/robot_hw_state', 10)
         self.pub_speed_mode  = self.create_publisher(Int32,           '/robot_speed_mode', 10)
@@ -503,19 +520,12 @@ class PickPlaceNode(Node):
         )
         self.pub_heartbeat = self.create_publisher(String, '/system/heartbeat', 10)
         self.create_timer(1.0, self._publish_heartbeat)
-        self.create_subscription(
-            PoseStamped,
-            self.get_parameter('target_pose_topic').value,
-            self._cb_pose, 10)
+        # pick 타겟 통합 메시지 — 좌표+class+place_zone+grasp_width를 한 메시지에서 원자적으로 latch.
+        # object_detector가 /selected_object(JSON) 발행. 별도 토픽 도착순서 race(class 누락→오배치·DB누락) 제거.
+        self.create_subscription(String, '/selected_object', self._cb_selected_object, 10)
         self.create_subscription(JointState, '/gripper/state', self._cb_gripper_state, 10)
         # GripperState 직접 구독 — status 필드(STATUS_IO_ERROR=3 등)를 낙하 판정 게이트로 활용.
         self.create_subscription(GripperState, '/gripper_service/state', self._cb_gripper_status, 10)
-        # 선택된 물체의 클래스명 — 파지 강도 결정에 사용 (object_detector가 좌표와 함께 발행)
-        self.create_subscription(String, '/selected_object_class', self._cb_selected_class, 10)
-        self.create_subscription(
-            Float32, '/selected_object_grasp_width', self._cb_grasp_width, 10)
-        self.create_subscription(
-            Int32, '/selected_object_place_zone', self._cb_selected_place_zone, 10)
         self.create_subscription(
             String, '/zone_dynamic_place_targets',
             self._cb_zone_dynamic_place_targets, 10)
@@ -642,74 +652,92 @@ class PickPlaceNode(Node):
     # ────────────────────────────────────────────────────────────────────
     # 콜백: 검출 포즈 수신
     # ────────────────────────────────────────────────────────────────────
-    def _cb_pose(self, msg: PoseStamped):
+    def _cb_selected_object(self, msg: String):
+        # object_detector가 발행하는 pick 타겟 통합 메시지(JSON):
+        #   {class_name, place_zone, grasp_width_mm, frame_id, x,y,z, ox,oy,oz,ow}
+        # 좌표+메타를 한 메시지에서 함께 latch → 별도 토픽 도착순서 race(class 누락→오배치·DB누락) 제거.
+        try:
+            d = json.loads(msg.data)
+        except (json.JSONDecodeError, TypeError):
+            return
         with self.state_lock:
+            if self._target_locked:
+                return
             # DETECTING 상태일 때만 새 타겟을 수신해 다음 단계로 넘어간다
-            if self.state == State.DETECTING and self.pick_requested:
-                frame_id = msg.header.frame_id.strip()
-                if not frame_id or frame_id != self.robot_base_frame:
-                    self.get_logger().warn(
-                        f'프레임 불일치 무시: expected={self.robot_base_frame}, '
-                        f'got={frame_id}'
-                    )
+            if not (self.state == State.DETECTING and self.pick_requested):
+                return
+            frame_id = str(d.get('frame_id', '')).strip()
+            if not frame_id or frame_id != self.robot_base_frame:
+                self.get_logger().warn(
+                    f'프레임 불일치 무시: expected={self.robot_base_frame}, got={frame_id}')
+                return
+
+            cls = str(d.get('class_name', '')).strip()
+            # ─── Race 방지: 사용자 선택과 발행 class가 일관되는지 확인 ───
+            # 시나리오: 사용자가 GUI에서 "doll_2" 클릭 직후 run_once →
+            # detector가 옛 "pack_1" 타겟을 발행 중이면 pick_place가 그걸 채택 위험.
+            # 라벨 "doll_2"의 prefix "doll"과 메시지의 class를 비교. (auto는 빈 문자열이라 skip)
+            sel_label = self._selected_object_label
+            if sel_label:
+                sel_prefix = sel_label.rsplit('_', 1)[0]
+                # known(doll/pack 등)이면 prefix가 class와 같아야, unknown_N이면 prefix="unknown"
+                expected_class = 'object' if sel_prefix == 'unknown' else sel_prefix
+                if cls and cls != expected_class:
+                    self.get_logger().info(
+                        f'race 무시: 선택={sel_label}(class={expected_class}) '
+                        f'≠ 발행class={cls}. 새 타겟 대기...')
                     return
 
-                # ─── Race 방지: 사용자 선택과 발행된 pose의 class가 일관되는지 확인 ───
-                # 시나리오: 사용자가 GUI에서 "doll_2" 클릭 직후 run_once →
-                # detector가 옛 "pack_1" pose를 발행 중이면 pick_place가 그걸 채택 위험.
-                # 라벨 "doll_2"의 prefix "doll"과 /selected_object_class로 받은 class를 비교.
-                sel_label = self._selected_object_label
-                cur_class = self._target_object_class
-                if sel_label:  # 명시 선택 모드 (auto는 빈 문자열)
-                    sel_prefix = sel_label.rsplit('_', 1)[0]
-                    # known(doll/pack 등)이면 prefix가 class와 같아야, unknown_N이면 prefix="unknown"
-                    expected_class = 'object' if sel_prefix == 'unknown' else sel_prefix
-                    if cur_class and cur_class != expected_class:
-                        self.get_logger().info(
-                            f'race 무시: 선택={sel_label}(class={expected_class}) '
-                            f'≠ 발행class={cur_class}. 새 pose 대기...'
-                        )
-                        return
+            # JSON → PoseStamped 재구성 (orientation = grasp yaw 보존)
+            pose = PoseStamped()
+            pose.header.frame_id = frame_id
+            pose.header.stamp = self.get_clock().now().to_msg()
+            pose.pose.position.x = float(d.get('x', 0.0))
+            pose.pose.position.y = float(d.get('y', 0.0))
+            pose.pose.position.z = float(d.get('z', 0.0))
+            pose.pose.orientation.x = float(d.get('ox', 0.0))
+            pose.pose.orientation.y = float(d.get('oy', 0.0))
+            pose.pose.orientation.z = float(d.get('oz', 0.0))
+            pose.pose.orientation.w = float(d.get('ow', 1.0))
 
-                pos = msg.pose.position
-                self._target_z_surface = float(pos.z)
-                if pos.z < self.min_pick_pose_z:
-                    self.get_logger().warn(
-                        f'Pick Z 접근높이 보정: {pos.z:.3f}→{self.min_pick_pose_z:.3f}m '
-                        f'(초음파 z_floor는 원본 {self._target_z_surface:.3f}m 유지)')
-                    pos.z = self.min_pick_pose_z
-                if self._in_workspace(pos.x, pos.y, pos.z):
-                    self.target_pose = msg
-                    self.state = State.PRE_PICK
-                    self.get_logger().info(
-                        f'목표 설정: x={pos.x:.3f} y={pos.y:.3f} z={pos.z:.3f}')
-                else:
-                    self.get_logger().warn(
-                        f'작업 공간 밖 무시: x={pos.x:.3f} y={pos.y:.3f} z={pos.z:.3f}')
+            pos = pose.pose.position
+            self._target_z_surface = float(pos.z)
+            if pos.z < self.min_pick_pose_z:
+                self.get_logger().warn(
+                    f'Pick Z 접근높이 보정: {pos.z:.3f}→{self.min_pick_pose_z:.3f}m '
+                    f'(초음파 z_floor는 원본 {self._target_z_surface:.3f}m 유지)')
+                pos.z = self.min_pick_pose_z
+            if not self._in_workspace(pos.x, pos.y, pos.z):
+                self.get_logger().warn(
+                    f'작업 공간 밖 무시: x={pos.x:.3f} y={pos.y:.3f} z={pos.z:.3f}')
+                return
+
+            # 메타를 좌표와 함께 원자적으로 설정 → latch가 일관된 값을 고정(빈 class 오배치 차단).
+            self._target_object_class = cls
+            self._target_place_zone = int(d.get('place_zone', 0) or 0)
+            _gw = float(d.get('grasp_width_mm', 0.0) or 0.0)
+            self._target_grasp_width_mm = _gw if _gw > 0.0 else None
+
+            self.target_pose = pose
+            self._latch_pick_metadata()
+            self.state = State.PRE_PICK
+            self.get_logger().info(
+                f'목표 설정: x={pos.x:.3f} y={pos.y:.3f} z={pos.z:.3f} '
+                f'class={self._latched_object_class!r} '
+                f'zone=box_roi{self._latched_place_zone or "(default)"}')
 
     def _pick_busy(self) -> bool:
-        # 픽 사이클 진행 중(PRE_PICK~POST_PLACE)이면 True. 이 동안 detector가 매 프레임
-        # 발행하는 새 타겟(class/zone/width/label)을 무시해 "가는 중 타겟 변경"(섞임) 차단.
+        # 타겟 락 또는 픽 사이클 진행 중이면 detector/콜백 갱신 차단.
+        if self._target_locked:
+            return True
         return self.state in (State.PRE_PICK, State.PICK, State.LIFT,
                               State.MOVE_TO_PLACE, State.PLACE, State.POST_PLACE)
 
     def _cb_selected_label(self, msg: String):
-        # 사용자가 GUI에서 클릭한 라벨 추적. _cb_pose의 race 검증에 사용.
+        # 사용자가 GUI에서 클릭한 라벨 추적. _cb_selected_object의 race 검증에 사용.
         if self._pick_busy():
             return
         self._selected_object_label = msg.data.strip()
-
-    def _cb_selected_class(self, msg: String):
-        # object_detector가 선택된 물체 좌표와 함께 발행하는 클래스명. 파지 강도 룩업에 쓴다.
-        if self._pick_busy():   # 픽 진행 중 class 갱신 차단(can↔ramen 섞임 방지)
-            return
-        self._target_object_class = msg.data.strip()
-
-    def _cb_grasp_width(self, msg: Float32):
-        # object_detector가 좌표와 함께 발행하는 PCA 단축 폭(mm). <=0이면 미상(고정거리 폴백).
-        if self._pick_busy():
-            return
-        self._target_grasp_width_mm = float(msg.data) if msg.data > 0.0 else None
 
     def _grasp_dist_m_for_width(self, width_mm) -> float:
         """물체 단축 폭(mm) → 그리퍼 위치값(pulse) → 최적 초음파 파지거리(m).
@@ -732,11 +760,36 @@ class PickPlaceNode(Node):
             throttle_duration_sec=1.0)
         return d_mm / 1000.0
 
-    def _cb_selected_place_zone(self, msg: Int32):
-        # object_detector가 결정한 배치 box_roi 구역(1~5). 카메라 box_roi와 1:1 대응.
-        if self._pick_busy():   # 픽 진행 중 zone 갱신 차단(place 위치 변경 방지)
-            return
-        self._target_place_zone = int(msg.data)
+    def _latch_pick_metadata(self):
+        """pose 수락 직후 class/zone/width를 이번 사이클용으로 고정한다.
+
+        detector는 class→zone→pose 순으로 발행하지만 ROS 콜백 순서·이전 사이클
+        잔존값 때문에 좌표와 메타가 어긋날 수 있다. sort_all/FSM은 고정값만 쓴다.
+        """
+        self._latched_object_class = (self._target_object_class or '').strip()
+        self._latched_place_zone = int(self._target_place_zone or 0)
+        gw = self._target_grasp_width_mm
+        self._latched_grasp_width_mm = float(gw) if gw and gw > 0.0 else None
+        self._target_locked = True
+        lock_msg = Bool()
+        lock_msg.data = True
+        self.pub_target_locked.publish(lock_msg)
+
+    def _is_grasp_success(self, grasp_pos: float) -> bool:
+        return (grasp_pos > self.grasp_min_pos and grasp_pos <= self.max_grip_pos)
+
+    def _cycle_object_class(self) -> str:
+        return self._latched_object_class or self._target_object_class or ''
+
+    def _cycle_place_zone(self) -> int:
+        if self._latched_object_class:
+            return int(self._latched_place_zone or 0)
+        return int(self._target_place_zone or 0)
+
+    def _cycle_grasp_width_mm(self):
+        if self._latched_object_class:
+            return self._latched_grasp_width_mm
+        return self._target_grasp_width_mm
 
     def _cb_zone_dynamic_place_targets(self, msg: String):
         try:
@@ -890,9 +943,10 @@ class PickPlaceNode(Node):
             use_j = self._place_use_joints_for_zone(zone_idx)
             wps = self._place_transit_waypoints_for_zone(zone_idx)
             if use_j:
+                rot = self._place_j6_rotate_for_zone(zone_idx)
                 self.get_logger().info(
                     f'배치 구역 결정: box_roi{zone_idx + 1} '
-                    f'transit movej={joints} → cartesian place')
+                    f'movej={joints} → J6 {rot:+.1f}° 회전 후 open (슬롯 cartesian 생략)')
             elif wps:
                 self.get_logger().info(
                     f'배치 구역 결정: box_roi{zone_idx + 1} '
@@ -921,6 +975,11 @@ class PickPlaceNode(Node):
         return (zone_idx is not None
                 and 0 <= zone_idx < len(self.sort_zone_use_joints)
                 and self.sort_zone_use_joints[zone_idx])
+
+    def _place_j6_rotate_for_zone(self, zone_idx: int | None) -> float:
+        if zone_idx is not None and 0 <= zone_idx < len(self.sort_zone_j6_rotate):
+            return float(self.sort_zone_j6_rotate[zone_idx])
+        return 0.0
 
     def _place_approach_dz_for_zone(self, zone_idx: int | None) -> float:
         if zone_idx is not None and 0 <= zone_idx < len(self.sort_zone_approach_dz):
@@ -1318,14 +1377,14 @@ class PickPlaceNode(Node):
                     else:
                         # 초음파 우선: 노이즈 큰 카메라 z 대신 고정 안전바닥까지 하강 → 초음파가 멈춤
                         z_floor = self.ultrasonic_descend_floor_z
-                        grasp_dist = self._grasp_dist_m_for_width(self._target_grasp_width_mm)
+                        grasp_dist = self._grasp_dist_m_for_width(self._cycle_grasp_width_mm())
                         if not self._ultrasonic_descend(
                                 x, y, pose.pose.position.z + self.pre_pick_dz, z_floor, rpy,
                                 grasp_dist_m=grasp_dist):
                             self._log_failure(
                                 'PICK',
                                 f'초음파 {self.grasp_distance_m * 1000:.0f}mm 미감지 — 파지 중단',
-                                obj=self._target_object_class, dest=self._dest_str())
+                                obj=self._cycle_object_class(), dest=self._dest_str())
                             self._set_state(State.HOME)
                             continue
 
@@ -1344,21 +1403,20 @@ class PickPlaceNode(Node):
                     # 파지 확정 판정 — 들어올린 후(중력 테스트)에 위치로 판단.
                     # close 순간의 지터·통신노이즈를 피해 안정된 시점에 판정한다.
                     grasp_pos = self._gripper_last_pos
-                    if grasp_pos <= self.grasp_min_pos:
+                    if not self._is_grasp_success(grasp_pos):
+                        if grasp_pos <= self.grasp_min_pos:
+                            reason = f'그리퍼 안 닫힘 (pos={grasp_pos:.0f} ≤ {self.grasp_min_pos})'
+                        else:
+                            reason = f'빈손 완전닫힘 (pos={grasp_pos:.0f} > {self.max_grip_pos})'
                         self._log_failure(
-                            'LIFT', f'그리퍼 안 닫힘 (pos={grasp_pos:.0f} ≤ {self.grasp_min_pos})',
-                            obj=self._target_object_class, dest=self._dest_str())
-                        self._set_state(State.HOME)
-                    elif grasp_pos > self.max_grip_pos:
-                        self._log_failure(
-                            'LIFT', f'빈손 완전닫힘 (pos={grasp_pos:.0f} > {self.max_grip_pos})',
-                            obj=self._target_object_class, dest=self._dest_str())
+                            'LIFT', reason,
+                            obj=self._cycle_object_class(), dest=self._dest_str())
                         self._set_state(State.HOME)
                     else:
                         self.get_logger().info(f'파지 확정 (pos={grasp_pos:.0f}).')
                         # 파지 확정 시점에 box_roi 구역으로 Place 좌표·자세를 확정한다.
                         self._active_place_pos, self._active_place_zone_idx = self._resolve_place(
-                            self._target_object_class, self._target_place_zone)
+                            self._cycle_object_class(), self._cycle_place_zone())
                         self._active_place_rpy = self._place_rpy_for_zone(
                             self._active_place_zone_idx)
                         # 파지 확정 → 이송 전류로 낮춰 들고 이동 (발열·과압착 완화, self-locking이 유지)
@@ -1371,7 +1429,7 @@ class PickPlaceNode(Node):
                         self._wait_dynamic_zone_targets()
                         self._active_place_pos, self._active_place_zone_idx = (
                             self._resolve_place(
-                                self._target_object_class, self._target_place_zone))
+                                self._cycle_object_class(), self._cycle_place_zone()))
                         self._active_place_rpy = self._place_rpy_for_zone(
                             self._active_place_zone_idx)
                     px, py, pz = self._active_place_pos
@@ -1387,18 +1445,28 @@ class PickPlaceNode(Node):
                     self._set_state(State.PLACE)
 
                 elif current == State.PLACE:
-                    px, py, pz = self._active_place_pos
-                    self.get_logger().info('물체 내려놓기')
-                    self._move_to_cart(
-                        px, py, pz, self._active_place_rpy, vel=50.0, acc=100.0)
-                    self._gripper_open()
+                    if self._place_use_joints_for_zone(self._active_place_zone_idx):
+                        # 조인트 place: 슬롯 cartesian(먼 movel→1206) 생략. transit movej로 이미
+                        # 도달한 그 자리에서 J6만 회전 후 그리퍼 open.
+                        j = list(self._place_joints_for_zone(self._active_place_zone_idx))
+                        rot = self._place_j6_rotate_for_zone(self._active_place_zone_idx)
+                        j[5] = j[5] + rot
+                        self.get_logger().info(
+                            f'조인트 place: J6 {rot:+.1f}° 회전 후 내려놓기 → {j}')
+                        self._move_to_joints(j, 'place_j6_rotate')
+                        self._gripper_open()
+                    else:
+                        px, py, pz = self._active_place_pos
+                        self.get_logger().info('물체 내려놓기')
+                        self._move_to_cart(
+                            px, py, pz, self._active_place_rpy, vel=50.0, acc=100.0)
+                        self._gripper_open()
                     self._advance_zone_slot(self._active_place_zone_idx)
                     self._set_state(State.POST_PLACE)
 
                 elif current == State.POST_PLACE:
-                    px, py, pz = self._active_place_pos
-                    self._move_to_cart(
-                        px, py, pz + self.pre_place_dz, self._active_place_rpy)
+                    # 그리퍼 open(배치 완료) 후 retreat(위로 빼는 movel) 제거 — 먼 place 위치에서
+                    # straight-up movel이 특이점/도달불가(1206)를 유발한다. HOME(movej)로 바로 복귀.
                     self._cycle_result = 'success'   # place 완료 — 여기 도달해야만 성공
                     self.get_logger().info('Pick & Place 완료!')
                     self._set_state(State.HOME)
@@ -1451,7 +1519,7 @@ class PickPlaceNode(Node):
                     st = self.state
                 # 파지 후면 ERR(물체 든 채 마비급), 잡기 전이면 WAR(스킵 가능).
                 _post_grasp = st in (State.LIFT, State.MOVE_TO_PLACE, State.PLACE)
-                self._log_failure('도달불가', str(ue), obj=self._target_object_class,
+                self._log_failure('도달불가', str(ue), obj=self._cycle_object_class(),
                                   dest=self._dest_str(),
                                   severity='ERR' if _post_grasp else 'WAR')
                 if _post_grasp:
@@ -1596,8 +1664,9 @@ class PickPlaceNode(Node):
                 continue
 
             empty_cycles = 0
-            object_class = self._target_object_class or ''
-            place, place_zone_idx = self._resolve_place(object_class, self._target_place_zone)
+            object_class = self._cycle_object_class()
+            place_zone = self._cycle_place_zone()
+            place, place_zone_idx = self._resolve_place(object_class, place_zone)
             place_rpy = self._place_rpy_for_zone(place_zone_idx)
 
             rpy = self._grasp_rpy_for_pose(pose)
@@ -1622,17 +1691,11 @@ class PickPlaceNode(Node):
             elif not self._ultrasonic_descend(
                     px_obj, py_obj, pz_obj + self.pre_pick_dz,
                     self.ultrasonic_descend_floor_z, rpy,
-                    grasp_dist_m=self._grasp_dist_m_for_width(self._target_grasp_width_mm)):
-                self._log_failure(
+                    grasp_dist_m=self._grasp_dist_m_for_width(self._cycle_grasp_width_mm())):
+                self._sort_all_abort_item(
                     'PICK(sort)',
                     f'초음파 {self.grasp_distance_m * 1000:.0f}mm 미감지 — 파지 중단',
-                    obj=object_class,
-                    dest=f'box_roi{(place_zone_idx or 0) + 1}'
-                    if place_zone_idx is not None else '')
-                with self.state_lock:
-                    self.pick_requested = False
-                self._set_state(State.HOME)
-                self._go_home()
+                    object_class, place_zone_idx)
                 continue
             self._gripper_close()
 
@@ -1641,14 +1704,10 @@ class PickPlaceNode(Node):
             self._move_to_cart(px_obj, py_obj, pz_obj + self.pre_pick_dz, rpy)
 
             grasp_pos = self._gripper_last_pos
-            if grasp_pos <= self.grasp_min_pos or grasp_pos > self.max_grip_pos:
-                self._log_failure('LIFT(sort)', f'파지 실패 pos={grasp_pos:.0f}',
-                                  obj=object_class, dest=f'box_roi{(place_zone_idx or 0) + 1}'
-                                  if place_zone_idx is not None else '')
-                with self.state_lock:
-                    self.pick_requested = False
-                self._set_state(State.HOME)
-                self._go_home()
+            if not self._is_grasp_success(grasp_pos):
+                self._sort_all_abort_item(
+                    'LIFT(sort)', f'파지 실패 pos={grasp_pos:.0f}',
+                    object_class, place_zone_idx)
                 continue
 
             self._call_service(self.cli_gripper_hold_transport, Trigger.Request(),
@@ -1659,7 +1718,7 @@ class PickPlaceNode(Node):
             if self.place_slot_mode == 'camera':
                 self._wait_dynamic_zone_targets()
                 place, place_zone_idx = self._resolve_place(
-                    object_class, self._target_place_zone)
+                    object_class, place_zone)
                 place_rpy = self._place_rpy_for_zone(place_zone_idx)
             px, py, pz = place
             lift_z = pz_obj + self.pre_pick_dz
@@ -1667,23 +1726,48 @@ class PickPlaceNode(Node):
                 px, py, pz, place_rpy, place_zone_idx,
                 px_obj, py_obj, lift_z, rpy)
 
+            # 이송 중 낙하 재확인 — sort_all은 연속 낙하 모니터(object_lost)를 꺼서 LIFT 이후엔
+            # 안 본다. 그래서 place 직전 파지 유지 여부를 직접 확인: 빠졌으면(빈손/낙하) place도
+            # 재고+1도 하지 않고 중단하고 다음 물체로. (통신 장애 status≠0면 위치 못 믿으니 보류.)
+            if (self._gripper_last_status == 0
+                    and not self._is_grasp_success(self._gripper_last_pos)):
+                self._sort_all_abort_item(
+                    'PLACE(sort)',
+                    f'이송 중 낙하/빈손 pos={self._gripper_last_pos:.0f}',
+                    object_class, place_zone_idx)
+                continue
+
             # ── 7. PLACE ──────────────────────────────────────────────────
             self._set_state(State.PLACE)
-            self._move_to_cart(px, py, pz, place_rpy, vel=50.0, acc=100.0)
-            self._gripper_open()
+            if self._place_use_joints_for_zone(place_zone_idx):
+                # 조인트 place: 슬롯 cartesian(먼 movel→1206) 생략. transit movej로 도달한
+                # 그 자리에서 J6만 회전 후 그리퍼 open.
+                jp = list(self._place_joints_for_zone(place_zone_idx))
+                rot = self._place_j6_rotate_for_zone(place_zone_idx)
+                jp[5] = jp[5] + rot
+                self.get_logger().info(
+                    f'조인트 place: J6 {rot:+.1f}° 회전 후 내려놓기 → {jp}')
+                self._move_to_joints(jp, 'place_j6_rotate')
+                self._gripper_open()
+            else:
+                self._move_to_cart(px, py, pz, place_rpy, vel=50.0, acc=100.0)
+                self._gripper_open()
             self._advance_zone_slot(place_zone_idx)
 
             # ── 8. POST_PLACE ─────────────────────────────────────────────
+            # retreat(위로 빼는 movel) 제거 — open(배치 완료) 후 먼 위치 straight-up movel이
+            # 특이점/도달불가(1206)를 유발. 바로 아래 HOME(movej)로 복귀하면 충분.
             self._set_state(State.POST_PLACE)
-            self._move_to_cart(px, py, pz + self.pre_place_dz, place_rpy)
 
-            picked_count += 1
-            # 분류 완료 클래스 발행 → 키오스크 재고 +1(place 완료한 실제 클래스, race 없음).
-            if object_class:
-                self.pub_sorted_class.publish(String(data=object_class))
-            self.get_logger().info(
-                f'정렬 완료: {object_class!r} → ({px:.3f}, {py:.3f}, {pz:.3f}). '
-                f'누적 {picked_count}개')
+            picked_count = self._sort_all_complete_item(
+                object_class, px, py, pz, picked_count)
+
+            # 다음 물체로 바로 가지 않고 HOME 복귀 후 진행 — far place 자세(zone3/4 구석 등)에서
+            # 곧장 다음 pick으로 가면 IK 특이점/도달불가(1206)가 잦다. 매 물체마다 알려진
+            # HOME 관절자세로 리셋해 다음 접근을 깨끗하게 한다. (속도↓, 안정성↑)
+            self.get_logger().info('정렬: 다음 물체 전 HOME 복귀')
+            self._set_state(State.HOME)
+            self._go_home()
 
         # ── 9. HOME ───────────────────────────────────────────────────────
         self._set_state(State.HOME)
@@ -1711,7 +1795,47 @@ class PickPlaceNode(Node):
     def _clear_target(self):
         with self.state_lock:
             self.target_pose = None
+        self._target_object_class = ''
         self._target_place_zone = 0
+        self._target_z_surface = None
+        self._target_grasp_width_mm = None
+        self._latched_object_class = ''
+        self._latched_place_zone = 0
+        self._latched_grasp_width_mm = None
+        if self._target_locked:
+            self._target_locked = False
+            lock_msg = Bool()
+            lock_msg.data = False
+            self.pub_target_locked.publish(lock_msg)
+
+    def _sort_all_abort_item(self, stage: str, reason: str,
+                             object_class: str, place_zone_idx: int | None):
+        """sort_all 한 물체 실패 — 재고 미반영, 타겟 락 해제 후 HOME."""
+        dest = (f'box_roi{(place_zone_idx or 0) + 1}'
+                if place_zone_idx is not None else '')
+        self._log_failure(stage, reason, obj=object_class, dest=dest)
+        self.get_logger().warn(
+            f'sort_all 실패 — 재고 미반영 (class={object_class!r}, {reason})')
+        with self.state_lock:
+            self.pick_requested = False
+        self._clear_target()
+        self._set_state(State.HOME)
+        self._go_home()
+
+    def _sort_all_complete_item(self, object_class: str, px: float, py: float, pz: float,
+                                picked_count: int) -> int:
+        """sort_all 한 물체 place 완료 — 파지·이송 성공 확인 후에만 재고 +1."""
+        picked_count += 1
+        if object_class:
+            self.pub_sorted_class.publish(String(data=object_class))
+            self.get_logger().info(
+                f'sort_all 분류·재고 +1: {object_class!r} → '
+                f'({px:.3f}, {py:.3f}, {pz:.3f})')
+        self.get_logger().info(
+            f'정렬 완료: {object_class!r} → ({px:.3f}, {py:.3f}, {pz:.3f}). '
+            f'누적 {picked_count}개')
+        self._clear_target()
+        return picked_count
 
     def _finish_cycle(self):
         self.pick_requested = False
@@ -2381,8 +2505,9 @@ class PickPlaceNode(Node):
         zi = self._active_place_zone_idx
         if zi is not None:
             return f'box_roi{zi + 1}'
-        if self._target_place_zone:
-            return f'box_roi{self._target_place_zone}'
+        z = self._cycle_place_zone()
+        if z:
+            return f'box_roi{z}'
         return ''
 
     def _set_motion_active(self, active: bool):
@@ -2679,7 +2804,7 @@ class PickPlaceNode(Node):
         """선택된 물체 클래스에 맞는 close_current를 gripper_node에 설정한다.
         맵에 없으면 기본값(미인식 물체)을 쓰고, 안전 범위로 clamp한다.
         파라미터 설정 실패는 치명적이지 않으므로 경고만 남기고 진행(직전 전류 사용)."""
-        cls = self._target_object_class
+        cls = self._cycle_object_class()
         current = self.grip_current_map.get(cls, self.grip_current_default)
         current = max(self.grip_current_min, min(self.grip_current_max, int(current)))
         src = '맵' if cls in self.grip_current_map else '기본값(미인식)'

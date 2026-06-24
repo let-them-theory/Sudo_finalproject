@@ -27,9 +27,10 @@ robot = env.unwrapped.scene["robot"]
 
 
 def gripper_pos() -> dict[str, float]:
+    """All gripper joints (incl. mimic r2/l1/l2) so we can see if they couple."""
     names = robot.data.joint_names
     pos = robot.data.joint_pos[0]
-    return {n: pos[names.index(n)].item() for n in GRIPPER_JOINTS if n in names}
+    return {n: round(pos[i].item(), 4) for i, n in enumerate(names) if "gripper" in n}
 
 
 print("[OPEN] start", gripper_pos(), flush=True)

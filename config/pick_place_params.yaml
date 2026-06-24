@@ -16,8 +16,8 @@ object_detector:
     # --- YOLO 설정 ---
     use_yolo: true
     # 런치 실행 시 launch가 패키지 내장 models/proto_v3.pt 절대경로로 override한다(이 값보다 우선).
-    yolo_model: "proto_v3.pt"
-    confidence_threshold: 0.500
+    yolo_model: "/home/user/sudo_ws/src/models/proto_v3.pt"
+    confidence_threshold: 0.350
 
 
     # 인식할 클래스 목록 — proto_v3.pt 학습 클래스와 일치해야 함 (wafers 포함, unknown 제외).
@@ -31,8 +31,8 @@ object_detector:
 
     # 클래스 → 배치 box_roi 구역(1~5). pick_place_node.sort_class_* 와 동일하게 유지.
     # box_roi1=zone1, box_roi2=zone2, ..., box_roi5=zone5
-    sort_class_names: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "can", "boxsnack", "wafers", "unknown"]
-    sort_class_zones: [1,       2,      2,        3,        4,       1,       4,     5,          5,       5]
+    sort_class_names: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "can", "boxsnack", "wafers"]
+    sort_class_zones: [1,       2,      2,        3,        4,       1,       4,     3,          3]
 
     # --- 동적 place (box_roi 그리드 빈 칸 탐색) ---
     # true: 카메라 depth+검출로 빈 칸 → /zone_dynamic_place_targets 발행. pick_place가 우선 사용.
@@ -44,13 +44,15 @@ object_detector:
     place_slot_min_valid_pixels: 40
     place_slot_mark_from_detections: true    # YOLO 검출 중심이 칸 안이면 점유
     # 빈 크레이트가 'box'로 검출되면 빈 칸이 빨강 → box/unknown 제외, 상품만 점유
-    place_slot_occupy_classes: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "can", "boxsnack"]
-    place_slot_use_depth_occupancy: false    # 크레이트 벽·격자 무늬 depth 오판 방지
+    place_slot_occupy_classes: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "can", "boxsnack", "wafers"]
+    place_slot_use_depth_occupancy: false   # 크레이트 벽·격자 무늬 depth 오판 방지(끔 — YOLO 검출 점유만)
+    # 옆 칸은 물체 bbox가 칸 면적의 이 비율 이상 덮을 때만 점유(중심 든 칸은 항상 점유). 살짝 삐져나온 옆 칸 오점유 방지.
+    place_slot_occupy_cell_coverage: 0.35
     place_slot_z_offset_m: 0.03              # (카메라 xyz 모드용) pick_place 앵커 모드에서는 pick_place_node 값 사용
     # 비전 박스 모드: zone ROI 안 검출된 'box' bbox를 격자 영역으로 사용(박스 옮겨도 따라감).
     place_slot_use_detected_box: true
     # 빈 칸 3D는 망사 depth 대신 zone별 고정 박스높이로 역투영. [zone1..5] 낮은박스/높은박스
-    place_slot_zone_heights: [0.24, 0.24, 0.31, 0.31, 0.24]
+    place_slot_zone_heights: [0.22, 0.22, 0.28, 0.28, 0.24]
     # 박스 bbox는 처음 N프레임만 per-ROI로 찾아 캐시 → 이후 full-frame(빠름). 박스 고정 가정, 옮기면 재시작.
     box_cache_max_frames: 8
 
@@ -65,13 +67,16 @@ object_detector:
     fastsam_imgsz: 640           # FastSAM 입력 크기. 낮추면(416/320) 더 빠름
     fastsam_every_n: 3           # N프레임마다 FastSAM 실행(부하 1/N). 1=매프레임, 키울수록 FPS↑
     unknown_match_iou: 0.15      # YOLO bbox와 이 IoU 이상 겹친 마스크는 known으로 보고 제외
+    # YOLO가 순간 놓쳐도(모델 풀림) grace로 유지 중인 known 물체 자리엔 unknown을 안 만든다.
+    # 이 픽셀 이내면 같은 물체로 보고 unknown 억제 → 알던 물체가 unknown으로 뒤바뀜 방지. 0=비활성.
+    unknown_grace_dedup_px: 40
     unknown_min_area: 500        # unknown 마스크 최소 픽셀 면적 (ROI 360x240 기준)
     unknown_max_area: 10000      # unknown 마스크 최대 픽셀 면적 (ROI 360x240 기준)
     # unknown 검출 ROI (realsense_fastsam_segment.py와 동일). 이 영역 안에서만 FastSAM 동작.
     unknown_roi_enable: true
-    unknown_roi_w: 600           #가로 크기 키우기/줄이기
+    unknown_roi_w: 300           #가로 크기 키우기/줄이기
     unknown_roi_h: 300           # 세로 크기
-    unknown_roi_shift_x: 120      # 화면 중앙에서 좌우으로
+    unknown_roi_shift_x: 57      # 화면 중앙에서 좌우으로
     unknown_roi_shift_y: 160      # 화면 중앙에서 아래위로
 
     # true면 각 ROI마다 YOLO를 따로 실행(masking 방식 — 스케일 유지). FastSAM도 ROI별로 실행.
@@ -79,38 +84,38 @@ object_detector:
     # --- 박스 위치 ROI (unknown_roi와 동일 방식. 검출이 이 영역 안에서도 허용됨, 합집합) ---
     # 화면에 주황 사각형으로 그려짐. 박스 위치에 맞게 조정.
     box_roi_enable: true
-    box_roi_w: 240               # 가로 크기
-    box_roi_h: 185               # 세로 크기
-    box_roi_shift_x: 110  # 화면 중앙에서 좌우 이동 (+우 / -좌)
-    box_roi_shift_y: -55          # 화면 중앙에서 상하 이동 (+아래 / -위)
+    box_roi_w: 140               # 가로 크기
+    box_roi_h: 100               # 세로 크기
+    box_roi_shift_x: 60  # 화면 중앙에서 좌우 이동 (+우 / -좌)
+    box_roi_shift_y: -40          # 화면 중앙에서 상하 이동 (+아래 / -위)
 
     # --- 박스 위치 ROI 2 (또 하나, 초록 사각형) ---
     box_roi2_enable: true
-    box_roi2_w: 240  # 가로 크기
-    box_roi2_h: 185  # 세로 크기
-    box_roi2_shift_x: 320  # 화면 중앙에서 좌우 이동 (+우 / -좌)
-    box_roi2_shift_y: -55        # 화면 중앙에서 상하 이동 (+아래 / -위)
+    box_roi2_w: 130  # 가로 크기
+    box_roi2_h: 92  # 세로 크기
+    box_roi2_shift_x: 203  # 화면 중앙에서 좌우 이동 (+우 / -좌)
+    box_roi2_shift_y: -35        # 화면 중앙에서 상하 이동 (+아래 / -위)
 
     # --- 박스 위치 ROI 3 (또 하나, 분홍 사각형) ---
     box_roi3_enable: true
-    box_roi3_w: 280  # 가로 크기
-    box_roi3_h: 215  # 세로 크기
-    box_roi3_shift_x: 120  # 화면 중앙에서 좌우 이동 (+우 / -좌)
-    box_roi3_shift_y: -225        # 화면 중앙에서 상하 이동 (+아래 / -위)
+    box_roi3_w: 135  # 가로 크기
+    box_roi3_h: 110  # 세로 크기
+    box_roi3_shift_x: 75  # 화면 중앙에서 좌우 이동 (+우 / -좌)
+    box_roi3_shift_y: -150        # 화면 중앙에서 상하 이동 (+아래 / -위)
 
     # --- 박스 위치 ROI 4 (또 하나, 파랑 사각형) ---
     box_roi4_enable: true
-    box_roi4_w: 260  # 가로 크기
-    box_roi4_h: 195              # 세로 크기
-    box_roi4_shift_x: 375  # 화면 중앙에서 좌우 이동 (+우 / -좌)
-    box_roi4_shift_y: -225       # 화면 중앙에서 상하 이동 (+아래 / -위)
+    box_roi4_w: 140  # 가로 크기
+    box_roi4_h: 110              # 세로 크기
+    box_roi4_shift_x: 220  # 화면 중앙에서 좌우 이동 (+우 / -좌)
+    box_roi4_shift_y: -140       # 화면 중앙에서 상하 이동 (+아래 / -위)
 
-    # --- 박스 위치 ROI 5 (또 하나, 노랑 사각형) ---
-    box_roi5_enable: true
-    box_roi5_w: 185              # 가로 크기
-    box_roi5_h: 240              # 세로 크기
-    box_roi5_shift_x: -100       # 화면 중앙에서 좌우 이동 (+우 / -좌)
-    box_roi5_shift_y: -109       # 화면 중앙에서 상하 이동 (+아래 / -위)
+    # --- 박스 위치 ROI 5 (제거됨 — zone5 미사용) ---
+    box_roi5_enable: false
+    box_roi5_w: 90              # 가로 크기
+    box_roi5_h: 120              # 세로 크기
+    box_roi5_shift_x: -50       # 화면 중앙에서 좌우 이동 (+우 / -좌)
+    box_roi5_shift_y: -88       # 화면 중앙에서 상하 이동 (+아래 / -위)
 
     # 각 박스 ROI에서 unknown(FastSAM) 표시 허용 여부. false면 그 ROI엔 box만 보임.
     box_roi_allow_unknown: false    # BOX(주황) — unknown 금지
@@ -132,8 +137,8 @@ object_detector:
     min_depth_m: 0.15               # 최소 유효 깊이 (m)
     max_depth_m: 1.5                # 최대 유효 깊이 (m)
     # 로봇 base 기준 pick Z 하한(m). box_roi depth 오류로 z≈0.05처럼 튀면 이 값으로 보정.
-    min_pick_pose_z: 0.05
-    box_roi_min_pick_pose_z: 0.05   # sort box 안 물체 — workspace_z_min 과 동일
+    min_pick_pose_z: 0.15
+    box_roi_min_pick_pose_z: 0.22   # sort box 안 물체 — workspace_z_min 과 동일
     workspace_x_min: 0.15
     workspace_x_max: 1.20
     workspace_y_min: -1.20
@@ -167,9 +172,9 @@ object_detector:
     absolute_origin_in_camera_z_m: -0.96
 
     # --- 보정값 (mm) ---  (카메라 이동 후 로봇 TCP 기준 1점 재캘리브레이션 값)
-    absolute_calib_x_mm: -70.0
+    absolute_calib_x_mm: -110.0
     absolute_calib_y_mm: -173.0
-    absolute_calib_z_mm: 100.0
+    absolute_calib_z_mm: 125.0
     use_realsense: true # RealSense 카메라 사용 여부
 
     # --- 비활성 PCA/Segmentation 참조 설정 ---
@@ -208,7 +213,7 @@ rh_p12_rna_gripper:
     stroke_close: 1000
     # --- 파지 감지 위치 범위 ---
     min_grip_pos: 500           # 이 위치부터 파지 전류 감지 시작
-    max_grip_pos: 735           # 이 이상 = 물체 없음(완전 닫힘)
+    max_grip_pos: 730           # 이 이상 = 물체 없음(완전 닫힘)
     # --- 파지 감지 임계 전류 (mA) — close_current(전류 한계)와 분리 ---
     # present_current가 이 값 이상이면 접촉(파지)으로 판단. close_current보다 낮게 둬
     # 포화 전에 접촉 감지 → 빨리 위치 락. free-run/노이즈(~68mA)보단 충분히 높게.
@@ -306,7 +311,7 @@ pick_place_node:
     # 강성 기준 추정 시작값. 봉지/웨하스 등 잘 찌그러지는 것은 낮게, 캔/병/박스 등 단단한 것은 높게.
     grip_current_default: 200
     grip_class_names: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "box", "can", "boxsnack", "wafers"]
-    grip_class_currents: [150, 150, 150, 120, 180, 200, 180, 200, 170, 150]
+    grip_class_currents: [80, 150, 150, 120, 180, 200, 180, 200, 80, 80]
     grip_current_min: 100           # 안전 clamp 하한
     grip_current_max: 500           # 안전 clamp 상한
 
@@ -330,7 +335,7 @@ pick_place_node:
 
     # --- Place 파라미터 ---
     # Place 위치 (로봇 베이스 기준, m)
-    place_position: [0.4, -0.3, 0.2]
+    place_position: [0.30, 0.40, 0.25]
     # user 주문 전용 place(=package 영역). run_once_package 호출 시 zone 무시하고 여기로.
     # box zone(-Y)의 반대 +Y쪽. z는 package 표면 실측 후 조정.
     package_position: [0.40, 0.40, 0.25]
@@ -365,19 +370,22 @@ pick_place_node:
     #                                 z1      z2          z3          z4          z5
 
     # box_roi1~5 Place 자세(rx,ry,rz deg). teach pendant flange 기준. 미설정 구역은 place_rpy와 동일.
-    sort_roi_zone_place_rx: [0.0,   0.0,   0.0,   30.94,  0.0]
-    sort_roi_zone_place_ry: [179.9, 179.9, 179.9, -177.61, 179.9]
-    sort_roi_zone_place_rz: [0.0,   0.0,   0.0,   34.65,  0.0]
+    sort_roi_zone_place_rx: [0.0,   0.0,   150.32,  30.94,  0.0]
+    sort_roi_zone_place_ry: [179.9, 179.9, -175.11, -177.61, 179.9]
+    sort_roi_zone_place_rz: [0.0,   0.0,   -158.24, 34.65,  0.0]
     #                              z1    z2    z3    z4티치  z5
 
     # true = ②수평을 movej(관절각 티치). waypoint와 동시 true면 movej 우선.
-    sort_roi_zone_place_use_joints: [false, false, false, false, false]
-    sort_roi_zone_place_j1: [0.0,   0.0,   0.0,   -74.3,  0.0]
-    sort_roi_zone_place_j2: [0.0,   0.0,   0.0,   30.5,   0.0]
-    sort_roi_zone_place_j3: [0.0,   0.0,   0.0,   65.4,   0.0]
-    sort_roi_zone_place_j4: [0.0,   0.0,   0.0,   -2.3,   0.0]
-    sort_roi_zone_place_j5: [0.0,   0.0,   0.0,   83.5,   0.0]
-    sort_roi_zone_place_j6: [0.0,   0.0,   0.0,   -70.4,  0.0]
+    sort_roi_zone_place_use_joints: [false, false, true,  false, false]
+    sort_roi_zone_place_j1: [0.0,   0.0,   -47.57, -74.3,  0.0]
+    sort_roi_zone_place_j2: [0.0,   0.0,   43.23,  30.5,   0.0]
+    sort_roi_zone_place_j3: [0.0,   0.0,   43.26,  65.4,   0.0]
+    sort_roi_zone_place_j4: [0.0,   0.0,   1.50,   -2.3,   0.0]
+    sort_roi_zone_place_j5: [0.0,   0.0,   88.85,  83.5,   0.0]
+    sort_roi_zone_place_j6: [0.0,   0.0,   3.90,   -70.4,  0.0]
+    # use_joints 구역: 슬롯 cartesian 대신 그 자리에서 J6만 이 각도(deg) 회전 후 open. 0=회전 없음.
+    # 부호/각도는 펜던트로 확인 후 조정. (zone3=30°)
+    sort_roi_zone_place_j6_rotate_deg: [0.0, 0.0, -40.0, 0.0, 0.0]
 
     # A안: ② 중간 waypoint movel (grasp_rpy·approach_z 유지). wp_count 0=직선, 1~2=경유점 수.
     # zone4 시험 — 1206 나오면 xy 조정 또는 wp_count=2 로 wp2 추가.
@@ -389,9 +397,10 @@ pick_place_node:
 
     # 클래스명별 배치 구역 번호(1~5). 0 또는 미등록이면 place_position(기본값)으로 폴백.
     # box_roi1=zone1, box_roi2=zone2, box_roi3=zone3, box_roi4=zone4, box_roi5=zone5
-    sort_class_names: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "can", "boxsnack", "wafers", "unknown"]
-    sort_class_zones: [1,       2,      2,        3,        4,       1,       4,     5,          5,       5]
-    #                  ^roi1     ^roi2   ^roi2     ^roi3     ^roi4    ^roi1    ^roi4  ^roi5       ^roi5
+    sort_class_names: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "can", "boxsnack", "wafers"]
+    sort_class_zones: [1,       2,      2,        3,        4,       1,       4,     3,          3]
+    #                  ^roi1     ^roi2   ^roi2     ^roi3     ^roi4    ^roi1    ^roi4  ^roi3       ^roi3
+    # unknown은 sort에서 제거 → 기본 place_position으로 감. box_roi5(zone5) 미사용.
 
     sort_max_empty_cycles:     2         # 연속 검출 실패 N회 시 정렬 종료
     sort_detect_timeout_sec:   5.0       # 물체 검출 대기 최대 시간(초)

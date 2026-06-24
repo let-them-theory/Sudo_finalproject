@@ -18,9 +18,9 @@ RealSense RGB-D + YOLOv8 기반 객체 검출 노드.
   /selected_object_label                     (std_msgs/String)        - GUI 선택 라벨
 
 발행:
-  /detected_object_pose         (geometry_msgs/PoseStamped) - 최종 선택된 물체의 베이스 좌표
-  /selected_object_pose         (geometry_msgs/PoseStamped) - pick_place_node가 구독하는 타겟 좌표
-  /selected_object_place_zone   (std_msgs/Int32)          - 배치 대상 box_roi 구역(1~5, 0=기본값)
+  /detected_object_pose         (geometry_msgs/PoseStamped) - 최종 선택된 물체의 베이스 좌표(GUI 오버레이용)
+  /selected_object              (std_msgs/String, JSON)     - pick 타겟 통합: 좌표+class+place_zone+grasp_width
+                                                              (pick_place_node가 한 번에 latch — 토픽 race 제거)
   /detected_objects             (std_msgs/String)           - 검출 물체 전체 목록 (JSON 문자열)
   /detection_debug_image   (sensor_msgs/Image)         - bbox / 깊이 정보가 그려진 디버그 이미지
 """
@@ -43,7 +43,7 @@ import pyrealsense2 as rs
 
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PoseStamped, Vector3Stamped
-from std_msgs.msg import Bool, Float32, Int32, String
+from std_msgs.msg import Bool, String
 from cv_bridge import CvBridge, CvBridgeError
 import message_filters
 import tf2_ros
@@ -465,6 +465,9 @@ class ObjectDetectorNode(Node):
         self.declare_parameter('fastsam_every_n', 3)
         # FastSAM 마스크가 YOLO bbox와 이 IoU 이상 겹치면 known(이미 잡힘)으로 보고 제외.
         self.declare_parameter('unknown_match_iou', 0.15)
+        # YOLO가 이번 프레임 놓쳤지만 grace로 유지 중인 known 물체 중심에서 이 픽셀 이내의
+        # FastSAM 마스크는 unknown으로 만들지 않는다(인식 흔들림→unknown 뒤바뀜 방지). 0=비활성.
+        self.declare_parameter('unknown_grace_dedup_px', 40)
         # unknown 마스크 픽셀 면적 필터. ROI(360x240=86400px) 기준 값 (realsense_fastsam_segment.py와 동일).
         self.declare_parameter('unknown_min_area', 500)
         self.declare_parameter('unknown_max_area', 10000)
@@ -533,6 +536,9 @@ class ObjectDetectorNode(Node):
             'ramen', 'pack', 'ssnack', 'bsnack', 'water', 'jelly', 'can', 'boxsnack'])
         # false: depth 점유 끔(크레이트 벽·격자 무늬 오판 방지). YOLO만으로 점유 판정.
         self.declare_parameter('place_slot_use_depth_occupancy', False)
+        # 옆 칸 점유 임계: 물체 bbox가 칸 면적의 이 비율 이상 덮을 때만 그 칸을 점유로 본다.
+        # (물체 중심이 든 칸은 비율 무관 항상 점유 — 충돌 방지.) 살짝 삐져나온 옆 칸 오점유 방지.
+        self.declare_parameter('place_slot_occupy_cell_coverage', 0.35)
         self.declare_parameter('place_slot_z_offset_m', 0.0)
         # 비전 박스: zone ROI 안에서 검출된 'box' bbox를 격자 영역으로 사용(박스 옮겨도 따라감).
         self.declare_parameter('place_slot_use_detected_box', True)
@@ -624,6 +630,8 @@ class ObjectDetectorNode(Node):
             c.strip() for c in _raw_occ if c and c.strip()}
         self.place_slot_use_depth_occupancy = bool(
             p('place_slot_use_depth_occupancy').value)
+        self.place_slot_occupy_cell_coverage = float(
+            p('place_slot_occupy_cell_coverage').value)
         self.place_slot_z_offset_m = float(p('place_slot_z_offset_m').value)
         self.place_slot_use_detected_box = bool(p('place_slot_use_detected_box').value)
         self.place_slot_zone_heights = [
@@ -641,6 +649,8 @@ class ObjectDetectorNode(Node):
 
         # pick_place 상태 구독 — LIFT/MOVE_TO_PLACE 중에는 "검출되지 않음" WARN을 억제한다.
         self._pick_place_state = ''
+        # pick_place가 pose 수락 후 사이클 완료 전까지 True — 새 타겟 발행 금지.
+        self._target_locked = False
         # 자동 분류(sort_all) 중 True — 자동선택을 ws(박스밖) 물체로만 제한. pick_place가 토글.
         self._sort_ws_only = False
 
@@ -663,6 +673,7 @@ class ObjectDetectorNode(Node):
         self._fastsam_counter = 0
         self._sam_masks_cache = []   # 직전 FastSAM 마스크(ROI-local) 캐시 — 스킵 프레임 재사용
         self.unknown_match_iou = float(p('unknown_match_iou').value)
+        self.unknown_grace_dedup_px = int(p('unknown_grace_dedup_px').value)
         self.unknown_min_area = int(p('unknown_min_area').value)
         self.unknown_max_area = int(p('unknown_max_area').value)
         self.unknown_roi_enable = bool(p('unknown_roi_enable').value)
@@ -761,6 +772,8 @@ class ObjectDetectorNode(Node):
         # 자동 분류 중 ws-only 자동선택 토글 (pick_place sort_all이 발행).
         self.create_subscription(Bool, '/sort_ws_only',
                                  self._cb_sort_ws_only, 10)
+        self.create_subscription(Bool, '/pick_place/target_locked',
+                                 self._cb_target_locked, 10)
 
         # ── 검출 워커 스레드 ─────────────────────────────────────────────
         # 카메라 콜백은 프레임을 큐에 넣고 즉시 반환 → ApproximateTimeSynchronizer 드랍 방지
@@ -779,16 +792,10 @@ class ObjectDetectorNode(Node):
         # ── 발행 ────────────────────────────────────────────────────────
         self.pub_pose = self.create_publisher(PoseStamped,
                                               '/detected_object_pose', 10)
-        self.pub_selected_pose = self.create_publisher(PoseStamped,
-                                                       '/selected_object_pose', 10)
-        # 선택된 물체의 클래스명 — pick_place가 물체별 그리퍼 강도를 정할 때 사용한다.
-        # 좌표(pub_selected_pose)와 함께 발행해 자동/수동 선택 모두에서 라벨을 알 수 있게 한다.
-        self.pub_selected_class = self.create_publisher(String, '/selected_object_class', 10)
-        # 선택 물체의 PCA 단축 폭(mm) — pick_place가 동적 초음파 파지거리 계산에 사용. <=0이면 미상.
-        self.pub_grasp_width = self.create_publisher(Float32, '/selected_object_grasp_width', 10)
-        # 배치 대상 box_roi 구역(1~5). 0=미지정(기본 place_position 폴백).
-        self.pub_selected_place_zone = self.create_publisher(
-            Int32, '/selected_object_place_zone', 10)
+        # pick 타겟 통합 메시지(JSON) — 좌표+class+place_zone+grasp_width를 한 번에 발행.
+        # 별도 토픽이면 도착 순서 race(좌표는 왔는데 class는 직전 값)로 "can인데 class=''" 오배치·
+        # DB 누락이 생긴다. 한 메시지로 묶어 pick_place가 원자적으로 latch하게 해 원천 차단. pick_place만 구독.
+        self.pub_selected_object = self.create_publisher(String, '/selected_object', 10)
         self.pub_objects = self.create_publisher(String, '/detected_objects', 10)
         self.pub_zone_place_targets = self.create_publisher(
             String, '/zone_dynamic_place_targets', 10)
@@ -1126,8 +1133,9 @@ class ObjectDetectorNode(Node):
                 r = min(rows - 1, max(0, (v - y1) * rows // bh))
                 occupied.add((r, c))
 
-        # YOLO 검출: centroid 점이 아니라 bbox(footprint) 전체가 걸치는 칸을 모두 점유로 본다.
-        # 큰 물체가 두 칸에 걸쳐도 옆 칸까지 점유 처리 → 그 위에 또 놓는 겹침 방지.
+        # YOLO 검출 점유: 물체 중심이 든 칸은 항상 점유(주 위치 → 충돌 방지),
+        # 옆으로 걸친 칸은 bbox가 칸 면적의 cov 이상 덮을 때만 점유(살짝 삐져나온 것 무시).
+        cov = self.place_slot_occupy_cell_coverage
         for det in detections:
             label = det[4] if len(det) > 4 else ''
             if not self._class_counts_for_slot_occupancy(label):
@@ -1140,13 +1148,24 @@ class ObjectDetectorNode(Node):
             if w <= 0 or h <= 0 or ix1 >= ix2 or iy1 >= iy2:
                 _mark_cell(cx, cy)   # bbox 정보 없으면 중심점만
                 continue
+            _mark_cell(cx, cy)       # 중심 칸은 비율 무관 항상 점유
             c_lo = max(0, (ix1 - x1) * cols // bw)
             c_hi = min(cols - 1, (ix2 - 1 - x1) * cols // bw)
             r_lo = max(0, (iy1 - y1) * rows // bh)
             r_hi = min(rows - 1, (iy2 - 1 - y1) * rows // bh)
             for rr in range(r_lo, r_hi + 1):
                 for cc in range(c_lo, c_hi + 1):
-                    occupied.add((rr, cc))
+                    if (rr, cc) in occupied:
+                        continue
+                    ex1 = x1 + cc * (x2 - x1) // cols
+                    ex2 = (x1 + (cc + 1) * (x2 - x1) // cols) if cc < cols - 1 else x2
+                    ey1 = y1 + rr * (y2 - y1) // rows
+                    ey2 = (y1 + (rr + 1) * (y2 - y1) // rows) if rr < rows - 1 else y2
+                    cell_area = max(1, (ex2 - ex1) * (ey2 - ey1))
+                    inter = (max(0, min(ix2, ex2) - max(ix1, ex1))
+                             * max(0, min(iy2, ey2) - max(iy1, ey1)))
+                    if inter / cell_area >= cov:
+                        occupied.add((rr, cc))
         # candidate(보조)는 bbox 없으니 중심점만.
         if self.place_slot_mark_from_detections:
             for item in candidates:
@@ -1257,6 +1276,19 @@ class ObjectDetectorNode(Node):
     def _draw_place_slot_grid(self, vis: np.ndarray, frame_w: int, frame_h: int):
         if not self.use_dynamic_place_pose:
             return
+        # 1) 점유 칸을 옅은 빨강으로 채움(반투명) — 외곽선만으론 잘 안 보여서 채워서 강조.
+        occ_rects = [
+            (c['x1'], c['y1'], c['x2'] - 1, c['y2'] - 1)
+            for cells in self._zone_slot_debug.values()
+            for c in cells if c.get('occupied')
+        ]
+        if occ_rects:
+            overlay = vis.copy()
+            for (rx1, ry1, rx2, ry2) in occ_rects:
+                cv2.rectangle(overlay, (rx1, ry1), (rx2, ry2), (0, 0, 255), -1)
+            alpha = 0.30   # 채움 투명도(0=안보임 ~ 1=불투명). 옅게.
+            cv2.addWeighted(overlay, alpha, vis, 1.0 - alpha, 0.0, vis)
+        # 2) 격자 외곽선 + 선택 슬롯 표시(채움 위에 또렷하게).
         for zone_id, cells in self._zone_slot_debug.items():
             pick = self._zone_dynamic_targets.get(str(zone_id))
             pick_rc = None
@@ -1358,7 +1390,7 @@ class ObjectDetectorNode(Node):
                 best = c
         return best
 
-    def _render_scene(self, color_img, depth_img, yolo_dets, candidates):
+    def _render_scene(self, color_img, depth_img, yolo_dets, candidates, grace_known_pts=None):
         """GUI 카메라 화면(debug 이미지)을 realsense_fastsam_segment.py 스타일로 구성.
 
         - ROI 밖은 어둡게(0.35), ROI 안만 오버레이
@@ -1478,6 +1510,13 @@ class ObjectDetectorNode(Node):
                     _dup_known = True
                     break
             if _dup_known:
+                continue
+            # (D) YOLO가 이번 프레임 놓쳤지만 grace로 유지 중인 known 물체와 같은 자리면
+            # unknown으로 만들지 않는다 — 알던 물체(can 등)가 인식 흔들림에 unknown으로 뒤바뀌는 것 방지.
+            if grace_known_pts and self.unknown_grace_dedup_px > 0 and any(
+                    abs(_fu - gu) <= self.unknown_grace_dedup_px
+                    and abs(_fv - gv) <= self.unknown_grace_dedup_px
+                    for gu, gv in grace_known_pts):
                 continue
             unknown_masks.append(seg)
 
@@ -1847,6 +1886,16 @@ class ObjectDetectorNode(Node):
         # 자동 분류 중 자동선택을 ws(박스밖) 물체로만 제한.
         self._sort_ws_only = bool(msg.data)
 
+    def _cb_target_locked(self, msg: Bool):
+        self._target_locked = bool(msg.data)
+
+    def _pick_target_frozen(self) -> bool:
+        """pick_place가 이번 물체 작업 중이면 새 pose/class/zone 발행 금지."""
+        if self._target_locked:
+            return True
+        return self._pick_place_state in (
+            'PRE_PICK', 'PICK', 'LIFT', 'MOVE_TO_PLACE', 'PLACE', 'POST_PLACE', 'HOME')
+
     # ────────────────────────────────────────────────────────────────────
     # 메인 검출 루프
     # ────────────────────────────────────────────────────────────────────
@@ -1960,8 +2009,18 @@ class ObjectDetectorNode(Node):
 
         # ── 화면 구성 (realsense_fastsam_segment.py 스타일) ───────────────
         # ROI 밖은 어둡게, ROI 안은 known(초록 마스크)+unknown(컬러 마스크)을
+        # grace로 유지 중인 known 트랙 중심(픽셀) — YOLO가 순간 놓쳐도(모델 풀림) 그 자리에
+        # FastSAM unknown이 새로 안 생기게 unknown 억제에 함께 넘긴다.
+        grace_known_pts = [
+            (gp.get('pixel_u'), gp.get('pixel_v'))
+            for _gtid, _gentry in self._track_manager.visible_lost_tracks(now=now_t)
+            if (gp := _gentry.get('payload')) is not None
+            and (gp.get('class_name') or '') != 'object'
+            and gp.get('pixel_u') is not None and gp.get('pixel_v') is not None
+        ]
         # FastSAM 세그로 그린다. unknown 후보도 여기서 candidates에 추가된다.
-        debug_img = self._render_scene(color_img, depth_img, detections, candidates)
+        debug_img = self._render_scene(color_img, depth_img, detections, candidates,
+                                       grace_known_pts)
 
         # 이번 프레임에 검출 안 됐지만 grace 안이라 GUI엔 유지해야 하는 트랙들을 추가 발행.
         # _choose_target에도 같이 넘겨, 사용자가 그 사이 클릭해도 마지막 좌표로 처리 가능.
@@ -2018,6 +2077,10 @@ class ObjectDetectorNode(Node):
         if selected is None:
             return
 
+        # pick_place가 이번 물체 작업 완료 전까지는 다른 객체가 끼어들 수 없게 발행 차단.
+        if self._pick_target_frozen():
+            return
+
         # 선택 결과는 "일반 검출 결과"와 "실제 pick 대상으로 쓸 결과"를 둘 다 발행한다.
         pose_base = selected['pose']
         pos = pose_base.pose.position
@@ -2029,11 +2092,22 @@ class ObjectDetectorNode(Node):
                 f'x={pos.x:.3f} y={pos.y:.3f} z={pos.z:.3f}',
                 throttle_duration_sec=2.0)
             return
-        # ⚠️ 발행 순서: class/place_zone/grasp_width를 pose보다 먼저 발행한다.
-        # pose를 먼저 내면 pick_place가 pose 콜백서 잡으러 가는데 class/zone는 직전 값이라
-        # "can 좌표인데 ramen으로 처리"되는 race가 난다(클래스↔좌표 섞임).
-        # 그리퍼 강도 룩업용 — 표시 라벨([1]) 아닌 원본 클래스 이름을 발행
-        self.pub_selected_class.publish(String(data=selected.get('class_name', selected['label'])))
+        # 좌표+메타(class/place_zone/grasp_width)를 단일 JSON 메시지로 묶어 발행한다.
+        # 별도 토픽이면 도착 순서 race(좌표는 왔는데 class는 직전 값)로 "can인데 class=''"
+        # 오배치·DB 누락이 났다. 한 메시지로 묶어 pick_place가 원자적으로 latch → race 원천 차단.
+        # orientation(쿼터니언)도 함께 — pick_place가 grasp yaw를 여기서 추출한다.
+        place_zone = int(selected.get('place_zone', 0))
+        _gw = selected.get('grasp_width_mm')
+        _p = pose_base.pose.position
+        _o = pose_base.pose.orientation
+        self.pub_selected_object.publish(String(data=json.dumps({
+            'class_name': selected.get('class_name', selected['label']),
+            'place_zone': place_zone,
+            'grasp_width_mm': float(_gw) if _gw and _gw > 0 else 0.0,
+            'frame_id': pose_base.header.frame_id,
+            'x': _p.x, 'y': _p.y, 'z': _p.z,
+            'ox': _o.x, 'oy': _o.y, 'oz': _o.z, 'ow': _o.w,
+        })))
         # 카메라 좌하단 표시용 — 현재 pick 대상 인스턴스 라벨(예: ramen, unknown_3).
         # pick 진행 중(PRE_PICK~POST_PLACE)엔 표시 유지 — 그 물체 완료 후 다음 타겟(DETECTING)에서만
         # 갱신해 "잡는 중 다음 물체로 바뀜" 헷갈림 방지.
@@ -2041,14 +2115,8 @@ class ObjectDetectorNode(Node):
                 'PRE_PICK', 'PICK', 'LIFT', 'MOVE_TO_PLACE', 'PLACE', 'POST_PLACE'):
             self._render_selected_label = str(
                 selected.get('label', selected.get('class_name', '')))
-        # 단축 폭(mm) 발행 — pick_place가 동적 초음파 파지거리 산출. 미상이면 0.0(폴백 신호).
-        _gw = selected.get('grasp_width_mm')
-        self.pub_grasp_width.publish(Float32(data=float(_gw) if _gw and _gw > 0 else 0.0))
-        place_zone = int(selected.get('place_zone', 0))
-        self.pub_selected_place_zone.publish(Int32(data=place_zone))
-        # 좌표는 맨 마지막 — 위 메타(class/zone/width)가 먼저 도착하도록.
+        # GUI 카메라 오버레이용 검출 pose (pick 타겟 메타는 위 /selected_object로 통합).
         self.pub_pose.publish(pose_base)
-        self.pub_selected_pose.publish(pose_base)
         self.get_logger().info(
             f'[{selected["label"]}] 절대좌표: '
             f'x={pos.x:.3f} y={pos.y:.3f} z={pos.z:.3f} m '

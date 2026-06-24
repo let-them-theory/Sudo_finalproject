@@ -1,6 +1,25 @@
 #!/usr/bin/env python3
 """Smoke test: E0509 + dex cube lift env."""
 
+from __future__ import annotations
+
+import os
+
+
+def _strip_stale_colcon_overlay() -> None:
+    """ROS colcon install can shadow the editable Isaac Lab extension."""
+    paths = [
+        p for p in os.environ.get("PYTHONPATH", "").split(":")
+        if p and "/install/isaac_e0509_pick_place/" not in p
+    ]
+    if paths:
+        os.environ["PYTHONPATH"] = ":".join(paths)
+    else:
+        os.environ.pop("PYTHONPATH", None)
+
+
+_strip_stale_colcon_overlay()
+
 from isaaclab.app import AppLauncher
 
 import argparse

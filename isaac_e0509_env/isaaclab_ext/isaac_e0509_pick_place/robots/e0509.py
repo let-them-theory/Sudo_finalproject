@@ -46,7 +46,10 @@ E0509_GRIPPER_CFG = ArticulationCfg(
             damping=40.0,
         ),
         "gripper": ImplicitActuatorCfg(
-            joint_names_expr=["gripper_rh_r1"],
+            # Drive all four finger joints directly: Isaac's URDF import drops the
+            # <mimic> coupling, so r2/l1/l2 stay limp unless actuated. multiplier=1
+            # in the URDF means identical targets reproduce the intended motion.
+            joint_names_expr=["gripper_rh_r1", "gripper_rh_r2", "gripper_rh_l1", "gripper_rh_l2"],
             effort_limit_sim=50.0,
             stiffness=400.0,
             damping=40.0,

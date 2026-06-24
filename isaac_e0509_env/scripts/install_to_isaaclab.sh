@@ -34,8 +34,7 @@ cd "${HOME}/IsaacLab"
 
 if [[ -f "${HOME}/miniconda3/etc/profile.d/conda.sh" ]]; then
   # shellcheck disable=SC1091
-  source "${HOME}/miniconda3/etc/profile.d/conda.sh"
-  conda activate env_isaaclab
+  source "${SCRIPT_DIR}/isaaclab_env.sh"
   pip install -e "${EXT_LINK}"
   echo "[OK] Installed via conda env_isaaclab"
 else

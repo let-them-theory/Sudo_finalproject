@@ -11,9 +11,9 @@ if [[ ! -f "${SCENE}" ]]; then
   exit 1
 fi
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
-source "${HOME}/miniconda3/etc/profile.d/conda.sh"
-conda activate env_isaaclab
+source "${SCRIPT_DIR}/isaaclab_env.sh"
 
 cd "${ISAACLAB}"
 export TERM=xterm

@@ -6,6 +6,9 @@ models/*.pt
 !models/proto_v3.pt
 !models/FastSAM-s.pt
 *.egg-info/
+*.egg
+# 파이썬 패키지 빌드 찌꺼기(setup.py 산출물). web_kiosk/frontend/dist 와 무관.
+mini_project/dist/
 build/
 install/
 log/

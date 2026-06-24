@@ -8,8 +8,15 @@ import isaaclab_tasks.manager_based.manipulation.reach.mdp as mdp
 from isaaclab_tasks.manager_based.manipulation.reach.reach_env_cfg import ReachEnvCfg
 
 from isaac_e0509_pick_place.robots import E0509_GRIPPER_CFG
+from isaac_e0509_pick_place.robots.home_pose import GRIPPER_JOINTS
+from isaac_e0509_pick_place.robots.home_reset import EXACT_HOME_JOINT_RANGE
 
 EE_BODY = "link_6"  # gripper base merges into link_6 (UrdfFileCfg merge_fixed_joints)
+
+# Multi-angle EE command ranges (radians) — Phase 1 grasp curriculum.
+EE_ROLL_RANGE = (-math.pi / 2, math.pi / 2)
+EE_PITCH_RANGE = (math.pi / 4, math.pi)
+EE_YAW_RANGE = (-math.pi, math.pi)
 
 # SeattleLabTable tabletop ~1.524 m along local Z (maps to world Y via table rot).
 TABLE_LOCAL_Z_EXTENT_M = 1.524
@@ -51,7 +58,7 @@ class E0509ReachEnvCfg(ReachEnvCfg):
         )
         self.actions.gripper_action = mdp.JointPositionActionCfg(
             asset_name="robot",
-            joint_names=["gripper_rh_r1"],
+            joint_names=list(GRIPPER_JOINTS),
             scale=0.5,
             use_default_offset=True,
         )
@@ -60,8 +67,9 @@ class E0509ReachEnvCfg(ReachEnvCfg):
         self.commands.ee_pose.ranges.pos_x = (0.25, 0.55)
         self.commands.ee_pose.ranges.pos_y = (-0.25, 0.25)
         self.commands.ee_pose.ranges.pos_z = (0.40, 0.55)
-        # EE points downward (tune after smoke test if needed)
-        self.commands.ee_pose.ranges.pitch = (math.pi, math.pi)
+        self.commands.ee_pose.ranges.roll = EE_ROLL_RANGE
+        self.commands.ee_pose.ranges.pitch = EE_PITCH_RANGE
+        self.commands.ee_pose.ranges.yaw = EE_YAW_RANGE
 
         self.events.reset_robot_joints.params["position_range"] = (0.85, 1.15)
 
@@ -73,3 +81,5 @@ class E0509ReachEnvCfg_PLAY(E0509ReachEnvCfg):
         self.scene.num_envs = 16
         self.scene.env_spacing = 2.5
         self.observations.policy.enable_corruption = False
+        # Exact pick_place home — no joint randomization in play / scene view.
+        self.events.reset_robot_joints.params["position_range"] = EXACT_HOME_JOINT_RANGE

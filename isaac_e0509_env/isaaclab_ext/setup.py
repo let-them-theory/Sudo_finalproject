@@ -1,10 +1,10 @@
 """Installation script for the isaac_e0509_pick_place Isaac Lab extension."""
 
-from setuptools import setup
+from setuptools import find_packages, setup
 
 setup(
     name="isaac_e0509_pick_place",
-    packages=["isaac_e0509_pick_place"],
+    packages=find_packages(),
     author="sudo_ws",
     maintainer="sudo_ws",
     url="https://github.com/isaac-sim/IsaacLab",
